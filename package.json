@@ -14,11 +14,14 @@
     "migrate": "tsx src/db/migrate.ts up",
     "migrate:status": "tsx src/db/migrate.ts status",
     "health": "tsx src/health/check.ts",
+    "bot": "tsx src/bot/start.ts",
+    "admin:debug": "tsx src/admin/cli.ts",
     "test": "node --import tsx --test tests/*.test.ts"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "grammy": "^1.30.0",
     "pg": "^8.13.0",
     "redis": "^4.7.0",
     "zod": "^3.23.8"
