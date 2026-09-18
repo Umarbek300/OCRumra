@@ -1,6 +1,8 @@
 import { findAgentByTelegramUserId } from '../db/repositories/agents.repo.js';
 import { findGroupByTelegramChatId } from '../db/repositories/groups.repo.js';
+import { createPassportProcessingRecord } from '../db/repositories/passportProcessing.repo.js';
 import { recordPhotoMessage } from '../db/repositories/telegramMessages.repo.js';
+import { enqueuePassportProcessing } from '../queue/passportProcessingQueue.js';
 
 export interface PhotoMessageEvent {
   chatId: number;
@@ -15,6 +17,7 @@ export interface IngestResult {
   outcome: 'inserted' | 'duplicate';
   groupLinked: boolean;
   agentLinked: boolean;
+  processingEnqueued: boolean;
 }
 
 /**
@@ -22,12 +25,19 @@ export interface IngestResult {
  * persists the event. Never creates a Group or guesses an Agent — an
  * unregistered chat or sender is simply recorded with a null link, visible
  * via the admin/debug surface.
+ *
+ * A newly inserted, fully linked (group + agent) message gets a
+ * passport_processing record and is pushed onto the Redis queue. A
+ * duplicate Telegram update or an unlinked message never gets a
+ * processing record or a queue entry.
  */
 export async function ingestPhotoMessage(event: PhotoMessageEvent): Promise<IngestResult> {
   const [group, agent] = await Promise.all([
     findGroupByTelegramChatId(event.chatId),
     findAgentByTelegramUserId(event.senderUserId),
   ]);
+  const groupLinked = group !== null;
+  const agentLinked = agent !== null;
 
   const result = await recordPhotoMessage({
     telegramChatId: event.chatId,
@@ -40,9 +50,26 @@ export async function ingestPhotoMessage(event: PhotoMessageEvent): Promise<Inge
     agentId: agent?.id ?? null,
   });
 
-  return {
-    outcome: result.outcome,
-    groupLinked: group !== null,
-    agentLinked: agent !== null,
-  };
+  let processingEnqueued = false;
+
+  if (result.outcome === 'inserted' && groupLinked && agentLinked) {
+    const processingRecord = await createPassportProcessingRecord(result.message.id);
+    if (processingRecord) {
+      try {
+        await enqueuePassportProcessing(processingRecord.telegramMessageId);
+        processingEnqueued = true;
+      } catch (error) {
+        // The processing record already exists (status='queued') in Postgres,
+        // so the job isn't lost — it's just not on the queue yet. Don't fail
+        // ingestion over a transient Redis problem.
+        console.error(
+          `Failed to enqueue passport processing for telegram_message=${processingRecord.telegramMessageId}; ` +
+            'record remains status=queued in Postgres for later recovery',
+          error,
+        );
+      }
+    }
+  }
+
+  return { outcome: result.outcome, groupLinked, agentLinked, processingEnqueued };
 }

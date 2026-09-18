@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
-import { after, test } from 'node:test';
+import { after, before, test } from 'node:test';
+import { findPassportProcessingByTelegramMessageId } from '../src/db/repositories/passportProcessing.repo.js';
 import { pool } from '../src/db/pool.js';
 import { listLinkedMessages, listUnlinkedMessages } from '../src/db/repositories/telegramMessages.repo.js';
+import { PASSPORT_PROCESSING_QUEUE, dequeuePassportProcessing } from '../src/queue/passportProcessingQueue.js';
+import { ensureRedisConnected, redisClient } from '../src/queue/redis.js';
 import { ingestPhotoMessage } from '../src/telegram/ingestPhotoMessage.js';
 
 // Telegram chat/user ids are safe-integer numbers; generate collision-free
@@ -41,10 +44,20 @@ async function createAgent(telegramUserId: number): Promise<string> {
 }
 
 async function deleteFixtures(chatId: number, groupId: string | null, agentId: string | null): Promise<void> {
+  // ON DELETE CASCADE from telegram_messages cleans up any passport_processing row too.
   await pool.query('DELETE FROM telegram_messages WHERE telegram_chat_id = $1', [chatId]);
   if (groupId) await pool.query('DELETE FROM groups WHERE id = $1', [groupId]);
   if (agentId) await pool.query('DELETE FROM agents WHERE id = $1', [agentId]);
+  // Every test in this file shares one real Redis queue; drain anything a
+  // test enqueued but didn't explicitly consume so later tests never race
+  // against another test's leftover job (Redis lists are FIFO here).
+  await redisClient.del(PASSPORT_PROCESSING_QUEUE);
 }
+
+before(async () => {
+  await ensureRedisConnected();
+  await redisClient.del(PASSPORT_PROCESSING_QUEUE);
+});
 
 test('links a photo message when the chat and sender are both registered', async () => {
   const chatId = uniqueChatId();
@@ -60,7 +73,12 @@ test('links a photo message when the chat and sender are both registered', async
       timestamp: new Date(),
       photoFileId: 'FILE_LINKED',
     });
-    assert.deepEqual(result, { outcome: 'inserted', groupLinked: true, agentLinked: true });
+    assert.deepEqual(result, {
+      outcome: 'inserted',
+      groupLinked: true,
+      agentLinked: true,
+      processingEnqueued: true,
+    });
   } finally {
     await deleteFixtures(chatId, groupId, agentId);
   }
@@ -80,7 +98,12 @@ test('records an unlinked message when the chat is not a registered Group', asyn
       timestamp: new Date(),
       photoFileId: 'FILE_UNKNOWN_GROUP',
     });
-    assert.deepEqual(result, { outcome: 'inserted', groupLinked: false, agentLinked: true });
+    assert.deepEqual(result, {
+      outcome: 'inserted',
+      groupLinked: false,
+      agentLinked: true,
+      processingEnqueued: false,
+    });
 
     const unlinked = await listUnlinkedMessages();
     const match = unlinked.find(
@@ -108,7 +131,12 @@ test('records an unlinked message when the sender is not a registered Agent', as
       timestamp: new Date(),
       photoFileId: 'FILE_UNKNOWN_AGENT',
     });
-    assert.deepEqual(result, { outcome: 'inserted', groupLinked: true, agentLinked: false });
+    assert.deepEqual(result, {
+      outcome: 'inserted',
+      groupLinked: true,
+      agentLinked: false,
+      processingEnqueued: false,
+    });
 
     const unlinked = await listUnlinkedMessages();
     const match = unlinked.find(
@@ -150,7 +178,9 @@ test('the same (chat, message) id is never processed into a duplicate row', asyn
     });
 
     assert.equal(first.outcome, 'inserted');
+    assert.equal(first.processingEnqueued, true);
     assert.equal(second.outcome, 'duplicate');
+    assert.equal(second.processingEnqueued, false);
 
     const { rows } = await pool.query<{ count: string }>(
       `SELECT count(*) FROM telegram_messages WHERE telegram_chat_id = $1 AND telegram_message_id = $2`,
@@ -201,6 +231,77 @@ test('listLinkedMessages and listUnlinkedMessages partition messages correctly',
   }
 });
 
+test('a fully linked new message gets a passport_processing record and is pushed onto the queue', async () => {
+  const chatId = uniqueChatId();
+  const senderId = uniqueUserId();
+  const groupId = await createGroup(chatId);
+  const agentId = await createAgent(senderId);
+  try {
+    const result = await ingestPhotoMessage({
+      chatId,
+      messageId: uniqueMessageId(),
+      senderUserId: senderId,
+      senderDisplayName: 'Test Sender',
+      timestamp: new Date(),
+      photoFileId: 'FILE_QUEUED',
+    });
+    assert.equal(result.processingEnqueued, true);
+
+    const { rows } = await pool.query<{ id: string }>(
+      `SELECT id FROM telegram_messages WHERE telegram_chat_id = $1`,
+      [chatId],
+    );
+    const telegramMessageId = rows[0]?.id;
+    assert.ok(telegramMessageId);
+
+    const processingRecord = await findPassportProcessingByTelegramMessageId(telegramMessageId);
+    assert.ok(processingRecord, 'expected a passport_processing record to exist');
+    assert.equal(processingRecord?.status, 'queued');
+    assert.equal(processingRecord?.attempts, 0);
+
+    const job = await dequeuePassportProcessing(5);
+    assert.ok(job, 'expected the message id to have been pushed onto the Redis queue');
+    assert.equal(job?.telegramMessageId, telegramMessageId);
+  } finally {
+    await deleteFixtures(chatId, groupId, agentId);
+  }
+});
+
+test('an unlinked message does not get a passport_processing record or a queue entry', async () => {
+  const chatId = uniqueChatId();
+  const senderId = uniqueUserId();
+  // No group registered for this chatId — the message stays unlinked.
+  const agentId = await createAgent(senderId);
+  try {
+    const result = await ingestPhotoMessage({
+      chatId,
+      messageId: uniqueMessageId(),
+      senderUserId: senderId,
+      senderDisplayName: 'Test Sender',
+      timestamp: new Date(),
+      photoFileId: 'FILE_NOT_QUEUED',
+    });
+    assert.equal(result.processingEnqueued, false);
+
+    const { rows } = await pool.query<{ id: string }>(
+      `SELECT id FROM telegram_messages WHERE telegram_chat_id = $1`,
+      [chatId],
+    );
+    const telegramMessageId = rows[0]?.id;
+    assert.ok(telegramMessageId);
+
+    const processingRecord = await findPassportProcessingByTelegramMessageId(telegramMessageId);
+    assert.equal(processingRecord, null);
+
+    const job = await dequeuePassportProcessing(1);
+    assert.equal(job, null, 'expected nothing to have been pushed onto the Redis queue');
+  } finally {
+    await deleteFixtures(chatId, null, agentId);
+  }
+});
+
 after(async () => {
+  await redisClient.del(PASSPORT_PROCESSING_QUEUE);
+  await redisClient.quit();
   await pool.end();
 });

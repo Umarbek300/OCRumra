@@ -18,7 +18,8 @@
     "admin:debug": "tsx src/admin/cli.ts",
     "admin:register-group": "tsx src/admin/registerGroup.ts",
     "admin:register-agent": "tsx src/admin/registerAgent.ts",
-    "test": "node --import tsx --test tests/*.test.ts"
+    "queue:worker": "tsx src/worker/start.ts",
+    "test": "node --import tsx --test --test-concurrency=1 tests/*.test.ts"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

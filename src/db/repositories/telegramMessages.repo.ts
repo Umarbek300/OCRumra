@@ -92,6 +92,15 @@ export async function recordPhotoMessage(
   return row ? { outcome: 'inserted', message: mapRow(row) } : { outcome: 'duplicate' };
 }
 
+export async function findTelegramMessageById(id: string): Promise<TelegramMessageRecord | null> {
+  const { rows } = await pool.query<TelegramMessageRow>(
+    `SELECT ${SELECT_COLUMNS} FROM telegram_messages WHERE id = $1`,
+    [id],
+  );
+  const row = rows[0];
+  return row ? mapRow(row) : null;
+}
+
 export async function listUnlinkedMessages(): Promise<TelegramMessageRecord[]> {
   const { rows } = await pool.query<TelegramMessageRow>(
     `SELECT ${SELECT_COLUMNS} FROM telegram_messages
