@@ -16,6 +16,8 @@
     "health": "tsx src/health/check.ts",
     "bot": "tsx src/bot/start.ts",
     "admin:debug": "tsx src/admin/cli.ts",
+    "admin:register-group": "tsx src/admin/registerGroup.ts",
+    "admin:register-agent": "tsx src/admin/registerAgent.ts",
     "test": "node --import tsx --test tests/*.test.ts"
   },
   "dependencies": {

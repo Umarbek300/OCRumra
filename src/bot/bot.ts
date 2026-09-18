@@ -9,6 +9,23 @@ function getSenderDisplayName(from: { first_name: string; last_name?: string; us
   return fullName || from.username || null;
 }
 
+// Debug helper only — commands are always delivered to bots regardless of
+// privacy mode, so this works to discover ids before privacy mode is
+// disabled. Not part of the passport-photo pipeline.
+bot.command('whoami', async (ctx) => {
+  const chatId = ctx.chat.id;
+  const senderId = ctx.from?.id ?? null;
+  const displayName = ctx.from ? getSenderDisplayName(ctx.from) : null;
+
+  await ctx.reply(
+    [
+      `Chat ID: ${chatId} (${ctx.chat.type})`,
+      `Your Telegram user ID: ${senderId ?? 'unknown'}`,
+      `Display name: ${displayName ?? 'unknown'}`,
+    ].join('\n'),
+  );
+});
+
 bot.on('message:photo', async (ctx) => {
   // Only group/supergroup chats map to a customer Group; ignore DMs and channels.
   if (ctx.chat.type !== 'group' && ctx.chat.type !== 'supergroup') {
