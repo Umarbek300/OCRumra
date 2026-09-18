@@ -22,7 +22,11 @@ async function main(): Promise<void> {
 try {
   await main();
 } catch (error) {
-  console.error('[passport-worker] fatal error', error);
+  // Sanitized like every other log in the OCR pipeline — an unexpected
+  // top-level failure must not dump a raw error object that could carry
+  // more than a message (stack traces are fine; arbitrary properties are not).
+  const message = error instanceof Error ? error.message : 'unknown error';
+  console.error(`[passport-worker] fatal error: ${message}`);
   process.exitCode = 1;
 } finally {
   await redisClient.quit().catch(() => undefined);
