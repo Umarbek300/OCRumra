@@ -94,8 +94,14 @@ test('processPassportProcessingJob marks a queued job completed on success', asy
     const record = await createPassportProcessingRecord(fixture.telegramMessageId);
     assert.ok(record);
 
-    await processPassportProcessingJob(fixture.telegramMessageId);
+    let callCount = 0;
+    // Mocked OCR step — this test is about the lifecycle state machine, not
+    // Claude/Telegram themselves (those are covered in their own test files).
+    await processPassportProcessingJob(fixture.telegramMessageId, async () => {
+      callCount += 1;
+    });
 
+    assert.equal(callCount, 1);
     const updated = await findPassportProcessingById(record.id);
     assert.equal(updated?.status, 'completed');
     assert.equal(updated?.attempts, 1);
@@ -124,6 +130,37 @@ test('processPassportProcessingJob marks a job failed and records the error with
     assert.equal(updated?.lastError, 'simulated OCR failure');
     assert.equal(updated?.attempts, 1);
     assert.equal(updated?.completedAt, null);
+  } finally {
+    await cleanup(fixture);
+  }
+});
+
+test('a duplicate queue item for an already-completed job is skipped and never re-runs OCR', async () => {
+  const fixture = await createLinkedTelegramMessage();
+  try {
+    const record = await createPassportProcessingRecord(fixture.telegramMessageId);
+    assert.ok(record);
+
+    let callCount = 0;
+    const mockOcr = async () => {
+      callCount += 1;
+    };
+
+    // First delivery: processes normally.
+    await processPassportProcessingJob(fixture.telegramMessageId, mockOcr);
+    assert.equal(callCount, 1);
+
+    const afterFirst = await findPassportProcessingById(record.id);
+    assert.equal(afterFirst?.status, 'completed');
+
+    // Telegram/Redis redelivers the same job id — the atomic queued-state
+    // claim guard means the OCR step must not run a second time.
+    await processPassportProcessingJob(fixture.telegramMessageId, mockOcr);
+    assert.equal(callCount, 1, 'OCR must not be invoked again for an already-completed job');
+
+    const afterSecond = await findPassportProcessingById(record.id);
+    assert.equal(afterSecond?.status, 'completed');
+    assert.equal(afterSecond?.attempts, 1);
   } finally {
     await cleanup(fixture);
   }

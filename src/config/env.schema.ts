@@ -6,6 +6,11 @@ export const envSchema = z.object({
   DATABASE_URL: z.string().url(),
   REDIS_URL: z.string().url(),
   TELEGRAM_BOT_TOKEN: z.string().min(1, 'TELEGRAM_BOT_TOKEN is required'),
+  // Optional here so admin/migrate/health/etc. scripts never need it. The
+  // OCR service (src/ocr/anthropicClient.ts) enforces its presence itself,
+  // only at the point real Claude Vision processing actually starts.
+  ANTHROPIC_API_KEY: z.string().min(1).optional(),
+  ANTHROPIC_MODEL: z.string().min(1).default('claude-opus-5'),
 });
 
 export type Env = z.infer<typeof envSchema>;

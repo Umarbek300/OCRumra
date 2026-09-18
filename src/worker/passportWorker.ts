@@ -1,42 +1,27 @@
-import { findTelegramMessageById } from '../db/repositories/telegramMessages.repo.js';
 import {
   findPassportProcessingByTelegramMessageId,
   markPassportProcessingCompleted,
   markPassportProcessingFailed,
   markPassportProcessingStarted,
 } from '../db/repositories/passportProcessing.repo.js';
+import { findTelegramMessageById } from '../db/repositories/telegramMessages.repo.js';
 import { dequeuePassportProcessing } from '../queue/passportProcessingQueue.js';
+import { performPassportOcr, type OcrProcessingContext } from './performPassportOcr.js';
 
 const POLL_TIMEOUT_SECONDS = 5;
 
-export interface SimulateProcessingContext {
-  telegramMessageId: string;
-  groupId: string;
-  agentId: string;
-}
-
-export type SimulateProcessing = (context: SimulateProcessingContext) => Promise<void>;
-
-/**
- * PLACEHOLDER for the future OCR/AI extraction step. This stage only
- * proves the queue -> worker -> status pipeline; no OCR is performed here.
- */
-const defaultSimulateProcessing: SimulateProcessing = async (context) => {
-  console.log(
-    `[passport-worker] PLACEHOLDER processing step (no OCR performed) for ` +
-      `telegram_message=${context.telegramMessageId} group=${context.groupId} agent=${context.agentId}`,
-  );
-};
+export type PerformPassportOcr = (context: OcrProcessingContext) => Promise<void>;
 
 /**
  * Processes a single job by telegram_message id. Exported separately from
  * the Redis polling loop so it can be tested directly (including the
- * failure path, via an injected simulateProcessing) without a live queue.
+ * failure path, via an injected performPassportOcr) without a live queue.
  * Never throws — a failure is recorded on the processing row, not raised.
+ * Never logs passport data — only the message id and coarse status.
  */
 export async function processPassportProcessingJob(
   telegramMessageId: string,
-  simulateProcessing: SimulateProcessing = defaultSimulateProcessing,
+  performOcr: PerformPassportOcr = performPassportOcr,
 ): Promise<void> {
   const processingRecord = await findPassportProcessingByTelegramMessageId(telegramMessageId);
   if (!processingRecord) {
@@ -59,6 +44,9 @@ export async function processPassportProcessingJob(
     return;
   }
 
+  // Atomic queued -> processing claim: also the guard against a duplicate
+  // queue item being processed twice, and against retrying a 'failed' job
+  // (out of scope until the reliability stage — it simply won't be 'queued').
   const claimed = await markPassportProcessingStarted(processingRecord.id);
   if (!claimed) {
     console.log(
@@ -74,16 +62,17 @@ export async function processPassportProcessingJob(
   );
 
   try {
-    await simulateProcessing({
+    await performOcr({
       telegramMessageId,
+      telegramPhotoFileId: telegramMessage.telegramPhotoFileId,
       groupId: telegramMessage.groupId,
       agentId: telegramMessage.agentId,
     });
     await markPassportProcessingCompleted(claimed.id);
-    console.log(`[passport-worker] completed telegram_message=${telegramMessageId}`);
+    console.log(`[passport-worker] OCR processing completed for message ${telegramMessageId}`);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error(`[passport-worker] failed telegram_message=${telegramMessageId}: ${message}`);
+    const message = error instanceof Error ? error.message : 'unknown error';
+    console.error(`[passport-worker] OCR processing failed for message ${telegramMessageId}: ${message}`);
     await markPassportProcessingFailed(claimed.id, message);
   }
 }
@@ -104,7 +93,8 @@ export async function runWorkerLoop(shouldContinue: () => boolean = () => true):
     } catch (error) {
       // processPassportProcessingJob already handles its own failures; this
       // is a last-resort guard so one unexpected bug can't kill the worker.
-      console.error('[passport-worker] unexpected error handling job', job, error);
+      const message = error instanceof Error ? error.message : 'unknown error';
+      console.error(`[passport-worker] unexpected error handling job ${job.telegramMessageId}: ${message}`);
     }
   }
 }
