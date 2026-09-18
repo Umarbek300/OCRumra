@@ -40,12 +40,36 @@ ALTER TABLE passport_processing ALTER COLUMN created_at SET NOT NULL;
 --    cast fails loudly (rolling back this whole migration, since the
 --    runner wraps each file in a transaction) rather than corrupting data
 --    if some row somehow holds a value outside the four known statuses.
+--
+--    A text-typed status column may carry a CHECK constraint enforcing
+--    the same four values (e.g. CHECK (status IN (...)), stored by
+--    Postgres as status = ANY (ARRAY['queued'::text, ...])). That stored
+--    expression hardcodes ::text, so once the column becomes an enum,
+--    Postgres can no longer re-validate it — ALTER COLUMN TYPE fails with
+--    "operator does not exist: passport_processing_status = text". Any
+--    such constraint is dropped first; it becomes strictly redundant once
+--    status is a real enum, since the type itself only ever admits those
+--    four values, so nothing is lost by not recreating it.
 DO $$
+DECLARE
+  check_constraint RECORD;
 BEGIN
   IF (
     SELECT data_type FROM information_schema.columns
     WHERE table_schema = 'public' AND table_name = 'passport_processing' AND column_name = 'status'
   ) = 'text' THEN
+    FOR check_constraint IN
+      SELECT con.conname
+      FROM pg_constraint con
+      JOIN pg_attribute att
+        ON att.attrelid = con.conrelid AND att.attnum = ANY (con.conkey)
+      WHERE con.contype = 'c'
+        AND con.conrelid = 'passport_processing'::regclass
+        AND att.attname = 'status'
+    LOOP
+      EXECUTE format('ALTER TABLE passport_processing DROP CONSTRAINT %I', check_constraint.conname);
+    END LOOP;
+
     ALTER TABLE passport_processing ALTER COLUMN status DROP DEFAULT;
     ALTER TABLE passport_processing
       ALTER COLUMN status TYPE passport_processing_status
