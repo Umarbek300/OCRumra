@@ -161,6 +161,41 @@ test('extractPassportData truncates an overly long BadRequestError detail', asyn
   });
 });
 
+test('extractPassportData reports a bounded raw-shape snapshot when the error body has no nested message', async () => {
+  // Reproduces what production actually saw: a BadRequestError whose .error
+  // field doesn't match the expected { error: { message } } envelope.
+  const badRequestError = new Anthropic.BadRequestError(400, { type: 'error', foo: 'bar' }, 'Bad request', new Headers());
+  const client = mockClientThatThrows(badRequestError);
+
+  await assert.rejects(async () => {
+    try {
+      await extractPassportData(SAMPLE_BUFFER, 'image/jpeg', client);
+    } catch (error) {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /no further detail from Claude \(raw shape: /);
+      assert.match(error.message, /errorFieldType=object/);
+      assert.match(error.message, /errorFieldKeys=\[type,foo\]/);
+      assert.match(error.message, /errorFieldPreview=\{"type":"error","foo":"bar"\}/);
+      throw error;
+    }
+  });
+});
+
+test('extractPassportData reports a bounded raw-shape snapshot when the error body is missing entirely', async () => {
+  const badRequestError = new Anthropic.BadRequestError(400, undefined, 'Bad request', new Headers());
+  const client = mockClientThatThrows(badRequestError);
+
+  await assert.rejects(async () => {
+    try {
+      await extractPassportData(SAMPLE_BUFFER, 'image/jpeg', client);
+    } catch (error) {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /no further detail from Claude \(raw shape: sdkType=null errorFieldType=undefined/);
+      throw error;
+    }
+  });
+});
+
 test('extractPassportData rejects an unsupported image mime type before calling Claude', async () => {
   let called = false;
   const client: Anthropic = {

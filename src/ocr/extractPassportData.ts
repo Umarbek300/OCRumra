@@ -101,13 +101,39 @@ function describeAnthropicError(error: unknown): string {
 }
 
 const MAX_BAD_REQUEST_DETAIL_LENGTH = 200;
+const MAX_RAW_SHAPE_PREVIEW_LENGTH = 300;
 
 function extractBadRequestDetail(error: BadRequestError): string {
-  // error.error is the raw API response body, shaped
+  // error.error is expected to be the raw API response body, shaped
   // { type: 'error', error: { type: 'invalid_request_error', message: '...' } }
-  // — the message is nested one level under the outer "error" key.
+  // — the message nested one level under the outer "error" key. Production
+  // has shown this expected shape isn't always what's actually there, so the
+  // fallback below reports a bounded, structural-only snapshot of whatever
+  // shape *is* there instead of silently giving up — this can only ever
+  // describe an HTTP error body/SDK error object, never document content.
   const body = error.error as { error?: { message?: unknown } } | null | undefined;
   const message = typeof body?.error?.message === 'string' ? body.error.message : undefined;
-  if (!message) return 'no further detail from Claude';
-  return message.length > MAX_BAD_REQUEST_DETAIL_LENGTH ? `${message.slice(0, MAX_BAD_REQUEST_DETAIL_LENGTH)}…` : message;
+  if (message) {
+    return message.length > MAX_BAD_REQUEST_DETAIL_LENGTH ? `${message.slice(0, MAX_BAD_REQUEST_DETAIL_LENGTH)}…` : message;
+  }
+  return `no further detail from Claude (raw shape: ${describeRawBadRequestShape(error)})`;
+}
+
+function describeRawBadRequestShape(error: BadRequestError): string {
+  const parts = [`sdkType=${error.type ?? 'null'}`, `errorFieldType=${typeof error.error}`];
+  if (error.error && typeof error.error === 'object') {
+    parts.push(`errorFieldKeys=[${Object.keys(error.error).join(',')}]`);
+  }
+  parts.push(`errorFieldPreview=${safeStringifyBounded(error.error, MAX_RAW_SHAPE_PREVIEW_LENGTH)}`);
+  return parts.join(' ');
+}
+
+function safeStringifyBounded(value: unknown, maxLength: number): string {
+  let json: string;
+  try {
+    json = JSON.stringify(value) ?? String(value);
+  } catch {
+    return '(unstringifiable)';
+  }
+  return json.length > maxLength ? `${json.slice(0, maxLength)}…` : json;
 }
