@@ -1,8 +1,7 @@
+import { env } from '../config/env.js';
 import { createPassportOcrResult, findPassportOcrResultByTelegramMessageId } from '../db/repositories/passportOcrResult.repo.js';
-import { extractPassportData } from '../ocr/extractPassportData.js';
+import { selectProvider, type OcrProvider } from '../ocr/providers/index.js';
 import { downloadTelegramPhoto } from '../telegram/downloadTelegramPhoto.js';
-
-const OCR_PROVIDER = 'anthropic';
 
 export interface OcrProcessingContext {
   telegramMessageId: string;
@@ -14,22 +13,25 @@ export interface OcrProcessingContext {
 export interface PerformPassportOcrDependencies {
   findExistingResult: typeof findPassportOcrResultByTelegramMessageId;
   downloadPhoto: typeof downloadTelegramPhoto;
-  extract: typeof extractPassportData;
+  extract: OcrProvider['extract'];
   saveResult: typeof createPassportOcrResult;
 }
+
+const defaultProvider = selectProvider(env.OCR_PROVIDER);
 
 const defaultDependencies: PerformPassportOcrDependencies = {
   findExistingResult: findPassportOcrResultByTelegramMessageId,
   downloadPhoto: downloadTelegramPhoto,
-  extract: extractPassportData,
+  extract: defaultProvider.extract,
   saveResult: createPassportOcrResult,
 };
 
 /**
  * The real "processing step" the worker runs for a queued job:
- * skip (idempotent) -> download from Telegram -> extract via Claude Vision
- * -> store the result. Dependencies are injectable so tests never touch a
- * real Telegram or Anthropic API. Logs are sanitized — only the message id
+ * skip (idempotent) -> download from Telegram -> extract via the configured
+ * OCR provider (env.OCR_PROVIDER: anthropic/local/compare) -> store the
+ * result. Dependencies are injectable so tests never touch a real
+ * Telegram/Anthropic/subprocess. Logs are sanitized — only the message id
  * and coarse status, never passport data.
  */
 export async function performPassportOcr(
@@ -38,7 +40,7 @@ export async function performPassportOcr(
 ): Promise<void> {
   const existing = await deps.findExistingResult(context.telegramMessageId);
   if (existing) {
-    console.log(`[passport-ocr] result already exists for message ${context.telegramMessageId}; skipping Claude call`);
+    console.log(`[passport-ocr] result already exists for message ${context.telegramMessageId}; skipping OCR call`);
     return;
   }
 
@@ -61,7 +63,7 @@ export async function performPassportOcr(
     mrz: extraction.mrz,
     overallConfidence: extraction.overallConfidence,
     rawResponse: extraction,
-    provider: OCR_PROVIDER,
+    provider: selectProvider(env.OCR_PROVIDER).name,
     model: extraction.model,
   });
 

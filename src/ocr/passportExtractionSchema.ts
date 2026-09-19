@@ -15,7 +15,7 @@ export type GenderValue = z.infer<typeof GenderValueSchema>;
 
 const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
-function isRealCalendarDate(value: string): boolean {
+export function isRealCalendarDate(value: string): boolean {
   const [year, month, day] = value.split('-').map(Number);
   if (!year || !month || !day) return false;
   const date = new Date(Date.UTC(year, month - 1, day));
@@ -59,7 +59,7 @@ export interface PassportExtractionResult extends ClaudePassportResponse {
   model: string;
 }
 
-const CRITICAL_FIELDS = [
+export const CRITICAL_FIELDS = [
   'firstName',
   'surname',
   'passportNumber',
@@ -73,12 +73,20 @@ const CONFIDENCE_RANK: Record<ConfidenceLevel, number> = { low: 0, medium: 1, hi
 /**
  * Deterministic rollup, not an invented score: a document is only as
  * reliable as its least-confident critical field, and a missing critical
- * field (passport number, surname, first name, or any of the three dates)
- * forces "low" outright, regardless of what other fields look like.
+ * field forces "low" outright, regardless of what other fields look like.
+ *
+ * `criticalFields` defaults to CRITICAL_FIELDS (the full set Claude Vision
+ * can see) but is overridable — the local MRZ provider passes a reduced set
+ * that excludes fields MRZ structurally cannot encode (passportIssueDate,
+ * placeOfBirth, issuingAuthority), since always-null-there isn't a quality
+ * problem to penalize the way a missing field from a full-page read is.
  */
-export function computeOverallConfidence(response: ClaudePassportResponse): ConfidenceLevel {
+export function computeOverallConfidence(
+  response: ClaudePassportResponse,
+  criticalFields: readonly (keyof ClaudePassportResponse)[] = CRITICAL_FIELDS,
+): ConfidenceLevel {
   let worst: ConfidenceLevel = 'high';
-  for (const field of CRITICAL_FIELDS) {
+  for (const field of criticalFields) {
     const { value, confidence } = response[field];
     const effective: ConfidenceLevel = value === null ? 'low' : (confidence ?? 'low');
     if (CONFIDENCE_RANK[effective] < CONFIDENCE_RANK[worst]) {

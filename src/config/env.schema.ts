@@ -11,6 +11,11 @@ export const envSchema = z.object({
   // only at the point real Claude Vision processing actually starts.
   ANTHROPIC_API_KEY: z.string().min(1).optional(),
   ANTHROPIC_MODEL: z.string().min(1).default('claude-opus-5'),
+  // 'anthropic' (default, unchanged behavior) | 'local' (free, on-server MRZ
+  // OCR, no API key needed) | 'compare' (runs local always; only also runs
+  // Anthropic if OCR_COMPARE_WITH_ANTHROPIC=true, never by default).
+  OCR_PROVIDER: z.enum(['anthropic', 'local', 'compare']).default('anthropic'),
+  OCR_COMPARE_WITH_ANTHROPIC: z.coerce.boolean().default(false),
 });
 
 export type Env = z.infer<typeof envSchema>;
