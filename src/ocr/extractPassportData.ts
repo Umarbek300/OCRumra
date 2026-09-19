@@ -103,11 +103,11 @@ function describeAnthropicError(error: unknown): string {
 const MAX_BAD_REQUEST_DETAIL_LENGTH = 200;
 
 function extractBadRequestDetail(error: BadRequestError): string {
-  const body = error.error;
-  const message =
-    body && typeof body === 'object' && 'message' in body && typeof (body as { message: unknown }).message === 'string'
-      ? (body as { message: string }).message
-      : undefined;
+  // error.error is the raw API response body, shaped
+  // { type: 'error', error: { type: 'invalid_request_error', message: '...' } }
+  // — the message is nested one level under the outer "error" key.
+  const body = error.error as { error?: { message?: unknown } } | null | undefined;
+  const message = typeof body?.error?.message === 'string' ? body.error.message : undefined;
   if (!message) return 'no further detail from Claude';
   return message.length > MAX_BAD_REQUEST_DETAIL_LENGTH ? `${message.slice(0, MAX_BAD_REQUEST_DETAIL_LENGTH)}…` : message;
 }

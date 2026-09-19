@@ -122,7 +122,7 @@ test('extractPassportData maps a typed Anthropic AuthenticationError to a saniti
 test('extractPassportData surfaces a bounded, structural detail for a BadRequestError', async () => {
   const badRequestError = new Anthropic.BadRequestError(
     400,
-    { type: 'invalid_request_error', message: 'messages.0.content.0.image.source.base64.data: image exceeds 5 MB maximum' },
+    { type: 'error', error: { type: 'invalid_request_error', message: 'messages.0.content.0.image.source.base64.data: image exceeds 5 MB maximum' } },
     'Bad request',
     new Headers(),
   );
@@ -143,7 +143,7 @@ test('extractPassportData truncates an overly long BadRequestError detail', asyn
   const longMessage = 'x'.repeat(500);
   const badRequestError = new Anthropic.BadRequestError(
     400,
-    { type: 'invalid_request_error', message: longMessage },
+    { type: 'error', error: { type: 'invalid_request_error', message: longMessage } },
     'Bad request',
     new Headers(),
   );
