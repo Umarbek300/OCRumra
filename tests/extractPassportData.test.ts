@@ -119,6 +119,48 @@ test('extractPassportData maps a typed Anthropic AuthenticationError to a saniti
   });
 });
 
+test('extractPassportData surfaces a bounded, structural detail for a BadRequestError', async () => {
+  const badRequestError = new Anthropic.BadRequestError(
+    400,
+    { type: 'invalid_request_error', message: 'messages.0.content.0.image.source.base64.data: image exceeds 5 MB maximum' },
+    'Bad request',
+    new Headers(),
+  );
+  const client = mockClientThatThrows(badRequestError);
+
+  await assert.rejects(async () => {
+    try {
+      await extractPassportData(SAMPLE_BUFFER, 'image/jpeg', client);
+    } catch (error) {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /bad request: messages\.0\.content\.0\.image\.source\.base64\.data: image exceeds 5 MB maximum/);
+      throw error;
+    }
+  });
+});
+
+test('extractPassportData truncates an overly long BadRequestError detail', async () => {
+  const longMessage = 'x'.repeat(500);
+  const badRequestError = new Anthropic.BadRequestError(
+    400,
+    { type: 'invalid_request_error', message: longMessage },
+    'Bad request',
+    new Headers(),
+  );
+  const client = mockClientThatThrows(badRequestError);
+
+  await assert.rejects(async () => {
+    try {
+      await extractPassportData(SAMPLE_BUFFER, 'image/jpeg', client);
+    } catch (error) {
+      assert.ok(error instanceof Error);
+      assert.ok(error.message.includes('x'.repeat(200)));
+      assert.ok(!error.message.includes('x'.repeat(201)));
+      throw error;
+    }
+  });
+});
+
 test('extractPassportData rejects an unsupported image mime type before calling Claude', async () => {
   let called = false;
   const client: Anthropic = {

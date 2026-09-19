@@ -1,4 +1,4 @@
-import Anthropic from '@anthropic-ai/sdk';
+import Anthropic, { BadRequestError } from '@anthropic-ai/sdk';
 import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod';
 import { env } from '../config/env.js';
 import { getAnthropicClient } from './anthropicClient.js';
@@ -81,17 +81,33 @@ export async function extractPassportData(
 }
 
 /**
- * Deliberately returns only a short category, never `error.message` or the
- * request/response bodies — those can carry sensitive document content.
+ * Deliberately returns only a short category, never the raw request/response
+ * bodies — those can carry sensitive document content. The one exception is
+ * BadRequestError: Anthropic's 400 body only ever describes a structural
+ * problem with the request itself (bad parameter, unsupported media type,
+ * payload too large, etc.) — it never echoes back message content — so a
+ * bounded excerpt of it is safe and needed to diagnose 400s in production.
  */
 function describeAnthropicError(error: unknown): string {
   if (error instanceof Anthropic.AuthenticationError) return 'authentication failed (check ANTHROPIC_API_KEY)';
   if (error instanceof Anthropic.PermissionDeniedError) return 'permission denied';
   if (error instanceof Anthropic.NotFoundError) return 'model or resource not found';
   if (error instanceof Anthropic.RateLimitError) return 'rate limited';
-  if (error instanceof Anthropic.BadRequestError) return 'bad request';
+  if (error instanceof Anthropic.BadRequestError) return `bad request: ${extractBadRequestDetail(error)}`;
   if (error instanceof Anthropic.APIConnectionTimeoutError) return 'request timed out';
   if (error instanceof Anthropic.APIConnectionError) return 'connection error';
   if (error instanceof Anthropic.APIError) return `API error (status ${error.status ?? 'unknown'})`;
   return 'unknown error';
+}
+
+const MAX_BAD_REQUEST_DETAIL_LENGTH = 200;
+
+function extractBadRequestDetail(error: BadRequestError): string {
+  const body = error.error;
+  const message =
+    body && typeof body === 'object' && 'message' in body && typeof (body as { message: unknown }).message === 'string'
+      ? (body as { message: string }).message
+      : undefined;
+  if (!message) return 'no further detail from Claude';
+  return message.length > MAX_BAD_REQUEST_DETAIL_LENGTH ? `${message.slice(0, MAX_BAD_REQUEST_DETAIL_LENGTH)}…` : message;
 }
