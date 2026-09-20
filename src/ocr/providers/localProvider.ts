@@ -33,6 +33,11 @@ export function createLocalProvider(deps: LocalProviderDependencies = defaultDep
       const rawOcrText = await deps.runTesseractOcr(mrzRegion);
       const mrzLines = extractMrzLines(rawOcrText);
 
+      // Diagnostic only: line count and each line's character length — a
+      // valid TD3 MRZ is exactly 2 lines of 44 characters each. Never logs
+      // the OCR'd text itself, which could carry passport content.
+      console.log(`[passport-ocr-local] OCR line count=${mrzLines.length} lengths=[${mrzLines.map((line) => line.length).join(',')}]`);
+
       const parsed = parseAndValidateMrz(mrzLines);
       if (!parsed) {
         return buildUnreadableMrzResult(mrzLines);
