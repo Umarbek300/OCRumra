@@ -18,9 +18,13 @@ export async function locateMrzRegion(imageBuffer: Buffer): Promise<Buffer> {
   }
 
   // TD3 MRZ (2 lines) sits in roughly the bottom 15-18% of a standard
-  // passport photo page crop; 24% gives headroom for imprecise framing
-  // without pulling in enough of the photo/visual page to confuse OCR.
-  const cropTop = Math.round(height * 0.76);
+  // passport photo page crop. A real production photo (537x420, far
+  // smaller than typical) showed bottom-24% only fully captured one of
+  // the two lines — at low resolution there's less margin for imprecise
+  // framing, so bottom 40% gives real headroom for both lines to land
+  // fully inside the crop, still well short of pulling in the visual
+  // page above the MRZ block.
+  const cropTop = Math.round(height * 0.6);
   const cropHeight = height - cropTop;
 
   // Diagnostic only: pure geometry (pixel dimensions), never image content.
