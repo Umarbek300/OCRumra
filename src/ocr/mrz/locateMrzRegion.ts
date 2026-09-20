@@ -23,6 +23,11 @@ export async function locateMrzRegion(imageBuffer: Buffer): Promise<Buffer> {
   const cropTop = Math.round(height * 0.76);
   const cropHeight = height - cropTop;
 
+  // Diagnostic only: pure geometry (pixel dimensions), never image content.
+  console.log(
+    `[mrz-crop] original=${width}x${height} cropTop=${cropTop} cropHeight=${cropHeight} cropRegion=${width}x${cropHeight}`,
+  );
+
   return sharp(imageBuffer)
     .extract({ left: 0, top: cropTop, width, height: cropHeight })
     .grayscale()
