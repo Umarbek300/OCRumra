@@ -1,4 +1,5 @@
 import { cropRegion } from '../mrz/cropRegion.js';
+import { ENHANCED_FALLBACK_ATTEMPTS } from '../mrz/enhancedFallbackAttempts.js';
 import { extractMrzLines } from '../mrz/extractMrzLines.js';
 import { getImageDimensions } from '../mrz/getImageDimensions.js';
 import { FALLBACK_CROP_BOTTOM_FRACTION, locateMrzRegion } from '../mrz/locateMrzRegion.js';
@@ -29,7 +30,7 @@ const defaultDependencies: LocalProviderDependencies = {
   runVisualFieldOcr,
 };
 
-type MrzStageName = 'search' | 'fallback-plain' | 'fallback-binarized' | 'fallback-split';
+type MrzStageName = 'search' | 'fallback-plain' | 'fallback-binarized' | 'fallback-split' | 'enhanced';
 
 /**
  * Diagnostic-only: structural shape of one fallback stage's OCR attempt
@@ -47,6 +48,23 @@ function logMrzStageAttempt(stage: MrzStageName, attempt: number, lines: readonl
 /** Diagnostic-only: which stage (if any) ultimately produced the result. */
 function logMrzPipelineWinner(stage: MrzStageName | 'none'): void {
   console.log(`[mrz-pipeline] winner=${stage}`);
+}
+
+/**
+ * Diagnostic-only: same shape as logMrzStageAttempt, plus the scale/
+ * threshold this enhanced attempt used — both plain numbers, never OCR'd
+ * text or a passport value.
+ */
+function logEnhancedAttempt(
+  attempt: number,
+  scale: number,
+  threshold: number | undefined,
+  lines: readonly string[],
+  parseSuccess: boolean,
+): void {
+  console.log(
+    `[mrz-pipeline] stage=enhanced attempt=${attempt} scale=${scale} threshold=${threshold ?? 'none'} lineCount=${lines.length} lengths=[${lines.map((line) => line.length).join(',')}] parseSuccess=${parseSuccess}`,
+  );
 }
 
 /**
@@ -98,8 +116,13 @@ async function enrichWithVisualIssueDate(
  *      uneven lighting plain contrast-stretching doesn't fix.
  *   4. The same fallback region, with its two lines OCR'd *separately*
  *      (single-line PSM) — avoids multi-line block segmentation errors.
- * Stages 2-4 share one crop region, so this stays bounded: at most 3
- * search attempts + 4 fallback OCR calls, not an unbounded search.
+ *   5. The same region again, through a bounded, fixed set of stronger
+ *      preprocessing variants (larger upscale, alternate binarization
+ *      thresholds — see enhancedFallbackAttempts.ts) for images where 2x/
+ *      150 genuinely isn't enough resolution/contrast for Tesseract.
+ * Stages 2-5 share one crop region, so this stays bounded: at most 3
+ * search attempts + 4 fallback OCR calls + ENHANCED_FALLBACK_ATTEMPTS.length
+ * enhanced OCR calls — a fixed, enumerable total, not an unbounded search.
  */
 export function createLocalProvider(deps: LocalProviderDependencies = defaultDependencies): OcrProvider {
   return {
@@ -156,8 +179,33 @@ export function createLocalProvider(deps: LocalProviderDependencies = defaultDep
         return enrichWithVisualIssueDate(mapMrzToExtractionResult(parsed, splitLines), imageBuffer, deps.runVisualFieldOcr);
       }
 
+      // Enhanced fallback: the same region as stages 2-4, but with
+      // stronger preprocessing (larger upscale, alternate binarization
+      // thresholds) than the original 2x/150 pipeline. A bounded, fixed
+      // list (ENHANCED_FALLBACK_ATTEMPTS) — not a dynamic cross-product —
+      // tried only after every original stage has already failed.
+      for (const [index, attempt] of ENHANCED_FALLBACK_ATTEMPTS.entries()) {
+        const enhancedCrop = await deps.cropRegion(imageBuffer, fallbackTop, fallbackHeight, {
+          binarize: attempt.threshold !== undefined,
+          scale: attempt.scale,
+          threshold: attempt.threshold,
+        });
+        const enhancedText = await deps.runTesseractOcr(enhancedCrop, { psm: 6, oem: 1 });
+        const enhancedLines = extractMrzLines(enhancedText);
+        parsed = parseAndValidateMrz(enhancedLines);
+        logEnhancedAttempt(5 + index, attempt.scale, attempt.threshold, enhancedLines, parsed !== null);
+        if (parsed) {
+          logMrzPipelineWinner('enhanced');
+          return enrichWithVisualIssueDate(mapMrzToExtractionResult(parsed, enhancedLines), imageBuffer, deps.runVisualFieldOcr);
+        }
+      }
+
       // Nothing worked — never guess. Keep whichever attempt's raw text
       // for human review (structurally, not content — see buildUnreadableMrzResult).
+      // Unchanged from before the enhanced stage was added: still prefers
+      // the binarized (stage 3) or plain (stage 2) attempt, not an
+      // enhanced one — this is only about which raw text is kept for
+      // human review, not part of the parsing/confidence logic.
       logMrzPipelineWinner('none');
       return buildUnreadableMrzResult(binarizedLines.length > 0 ? binarizedLines : fallbackLines);
     },
