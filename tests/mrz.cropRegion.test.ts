@@ -127,3 +127,91 @@ test('cropRegion combines a custom scale with a custom threshold', async () => {
   }
   assert.ok(distinctValues.size <= 2, 'still strictly two-tone when binarized at a non-default scale');
 });
+
+async function makeImageWithBlankMargin(): Promise<Buffer> {
+  // 200x100, all white, except a black content block at x:[50,150) y:[20,80) —
+  // simulates real ink surrounded by blank crop margin, for trim() to find.
+  const width = 200;
+  const height = 100;
+  const raw = Buffer.alloc(width * height * 3, 255);
+  for (let y = 20; y < 80; y++) {
+    for (let x = 50; x < 150; x++) {
+      const offset = (y * width + x) * 3;
+      raw[offset] = 0;
+      raw[offset + 1] = 0;
+      raw[offset + 2] = 0;
+    }
+  }
+  return sharp(raw, { raw: { width, height, channels: 3 } }).png().toBuffer();
+}
+
+test('cropRegion without trim keeps the full requested region (unchanged default behavior)', async () => {
+  const image = await makeImageWithBlankMargin();
+  const notTrimmed = await cropRegion(image, 0, 100);
+
+  const metadata = await sharp(notTrimmed).metadata();
+  assert.equal(metadata.width, 400); // 200 (full width) * 2 (default scale) — trim not requested
+});
+
+test('cropRegion with trim shrinks to the actual content bounding box before upscaling', async () => {
+  const image = await makeImageWithBlankMargin();
+  const trimmed = await cropRegion(image, 0, 100, { trim: true });
+
+  const metadata = await sharp(trimmed).metadata();
+  // Content block is 100x60; trim finds that bounding box, THEN the
+  // default 2x scale is applied to the trimmed (not the original) size.
+  assert.equal(metadata.width, 200); // 100 * 2
+  assert.equal(metadata.height, 120); // 60 * 2
+});
+
+test('cropRegion combines trim with binarize', async () => {
+  const image = await makeImageWithBlankMargin();
+  const trimmedBinarized = await cropRegion(image, 0, 100, { trim: true, binarize: true });
+
+  const metadata = await sharp(trimmedBinarized).metadata();
+  assert.equal(metadata.width, 200);
+  assert.equal(metadata.height, 120);
+
+  const { data, info } = await sharp(trimmedBinarized).raw().toBuffer({ resolveWithObject: true });
+  const distinctValues = new Set<number>();
+  for (let i = 0; i < data.length; i += info.channels) {
+    distinctValues.add(data[i]!);
+  }
+  assert.ok(distinctValues.size <= 2, 'still strictly two-tone when trimmed and binarized');
+});
+
+test('cropRegion without rotateDegrees keeps the untilted crop (unchanged default behavior)', async () => {
+  const image = await makeGradientImage(200, 100);
+  const notRotated = await cropRegion(image, 0, 100);
+
+  const metadata = await sharp(notRotated).metadata();
+  assert.equal(metadata.width, 400); // 200 * 2, no rotation applied
+  assert.equal(metadata.height, 200); // 100 * 2
+});
+
+test('cropRegion with rotateDegrees expands the canvas to fit the tilted rectangle before upscaling', async () => {
+  const image = await makeGradientImage(200, 100);
+
+  const rotated4 = await cropRegion(image, 0, 100, { rotateDegrees: 4 });
+  const meta4 = await sharp(rotated4).metadata();
+  assert.equal(meta4.width, 412);
+  assert.equal(meta4.height, 228);
+
+  const rotated2 = await cropRegion(image, 0, 100, { rotateDegrees: 2 });
+  const meta2 = await sharp(rotated2).metadata();
+  assert.equal(meta2.width, 406);
+  assert.equal(meta2.height, 214);
+});
+
+test('cropRegion treats a negative rotateDegrees symmetrically to its positive counterpart', async () => {
+  const image = await makeGradientImage(200, 100);
+
+  const rotatedPos4 = await cropRegion(image, 0, 100, { rotateDegrees: 4 });
+  const rotatedNeg4 = await cropRegion(image, 0, 100, { rotateDegrees: -4 });
+
+  const metaPos = await sharp(rotatedPos4).metadata();
+  const metaNeg = await sharp(rotatedNeg4).metadata();
+
+  assert.equal(metaPos.width, metaNeg.width);
+  assert.equal(metaPos.height, metaNeg.height);
+});

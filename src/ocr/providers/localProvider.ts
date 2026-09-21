@@ -1,6 +1,7 @@
 import { cropRegion } from '../mrz/cropRegion.js';
 import { ENHANCED_FALLBACK_ATTEMPTS } from '../mrz/enhancedFallbackAttempts.js';
 import { extractMrzLines } from '../mrz/extractMrzLines.js';
+import { DESKEW_FALLBACK_ATTEMPTS, TRIM_FALLBACK_ATTEMPTS } from '../mrz/geometryFallbackAttempts.js';
 import { getImageDimensions } from '../mrz/getImageDimensions.js';
 import { FALLBACK_CROP_BOTTOM_FRACTION, locateMrzRegion } from '../mrz/locateMrzRegion.js';
 import { buildUnreadableMrzResult, mapMrzToExtractionResult } from '../mrz/mapMrzToExtractionResult.js';
@@ -30,7 +31,7 @@ const defaultDependencies: LocalProviderDependencies = {
   runVisualFieldOcr,
 };
 
-type MrzStageName = 'search' | 'fallback-plain' | 'fallback-binarized' | 'fallback-split' | 'enhanced';
+type MrzStageName = 'search' | 'fallback-plain' | 'fallback-binarized' | 'fallback-split' | 'enhanced' | 'localized' | 'deskew';
 
 /**
  * Diagnostic-only: structural shape of one fallback stage's OCR attempt
@@ -64,6 +65,20 @@ function logEnhancedAttempt(
 ): void {
   console.log(
     `[mrz-pipeline] stage=enhanced attempt=${attempt} scale=${scale} threshold=${threshold ?? 'none'} lineCount=${lines.length} lengths=[${lines.map((line) => line.length).join(',')}] parseSuccess=${parseSuccess}`,
+  );
+}
+
+/** Diagnostic-only: same shape as logMrzStageAttempt, plus which trim/binarize combination this localized attempt used. */
+function logLocalizedAttempt(attempt: number, binarize: boolean, lines: readonly string[], parseSuccess: boolean): void {
+  console.log(
+    `[mrz-pipeline] stage=localized attempt=${attempt} trim=true binarize=${binarize} lineCount=${lines.length} lengths=[${lines.map((line) => line.length).join(',')}] parseSuccess=${parseSuccess}`,
+  );
+}
+
+/** Diagnostic-only: same shape as logMrzStageAttempt, plus the rotation angle this deskew attempt used. */
+function logDeskewAttempt(attempt: number, rotateDegrees: number, lines: readonly string[], parseSuccess: boolean): void {
+  console.log(
+    `[mrz-pipeline] stage=deskew attempt=${attempt} rotateDegrees=${rotateDegrees} lineCount=${lines.length} lengths=[${lines.map((line) => line.length).join(',')}] parseSuccess=${parseSuccess}`,
   );
 }
 
@@ -120,9 +135,16 @@ async function enrichWithVisualIssueDate(
  *      preprocessing variants (larger upscale, alternate binarization
  *      thresholds — see enhancedFallbackAttempts.ts) for images where 2x/
  *      150 genuinely isn't enough resolution/contrast for Tesseract.
- * Stages 2-5 share one crop region, so this stays bounded: at most 3
+ *   6. The same region, tightened to its actual ink content (trim) —
+ *      tests whether blank margin/border inside the crop was confusing
+ *      Tesseract's line segmentation (see geometryFallbackAttempts.ts).
+ *   7. The same region, rotated by a few small angles (deskew) — tests
+ *      whether a slight camera tilt was breaking line recognition
+ *      (see geometryFallbackAttempts.ts).
+ * Stages 2-7 share one crop region, so this stays bounded: at most 3
  * search attempts + 4 fallback OCR calls + ENHANCED_FALLBACK_ATTEMPTS.length
- * enhanced OCR calls — a fixed, enumerable total, not an unbounded search.
+ * + TRIM_FALLBACK_ATTEMPTS.length + DESKEW_FALLBACK_ATTEMPTS.length OCR
+ * calls — a fixed, enumerable total, not an unbounded search.
  */
 export function createLocalProvider(deps: LocalProviderDependencies = defaultDependencies): OcrProvider {
   return {
@@ -200,12 +222,56 @@ export function createLocalProvider(deps: LocalProviderDependencies = defaultDep
         }
       }
 
+      // Localized fallback: the same region, tightened to its actual ink
+      // content via trim() before OCR — tests whether blank margin/border
+      // inside the crop was confusing Tesseract's line segmentation,
+      // rather than resolution/threshold (already fully explored above
+      // with no effect). A bounded, fixed list, tried only after every
+      // prior stage has failed.
+      const localizedAttemptStart = 5 + ENHANCED_FALLBACK_ATTEMPTS.length;
+      for (const [index, attempt] of TRIM_FALLBACK_ATTEMPTS.entries()) {
+        const localizedCrop = await deps.cropRegion(imageBuffer, fallbackTop, fallbackHeight, {
+          trim: true,
+          binarize: attempt.binarize,
+        });
+        const localizedText = await deps.runTesseractOcr(localizedCrop, { psm: 6, oem: 1 });
+        const localizedLines = extractMrzLines(localizedText);
+        parsed = parseAndValidateMrz(localizedLines);
+        logLocalizedAttempt(localizedAttemptStart + index, attempt.binarize, localizedLines, parsed !== null);
+        if (parsed) {
+          logMrzPipelineWinner('localized');
+          return enrichWithVisualIssueDate(mapMrzToExtractionResult(parsed, localizedLines), imageBuffer, deps.runVisualFieldOcr);
+        }
+      }
+
+      // Deskew fallback: the same region, rotated by a few small angles —
+      // tests whether a slight camera tilt was breaking line recognition.
+      // Always binarized (plain vs. binarized already showed no effect
+      // independent of preprocessing in the enhanced stage above), so
+      // this isolates rotation alone. A bounded, fixed list of angles,
+      // tried only after every prior stage has failed.
+      const deskewAttemptStart = localizedAttemptStart + TRIM_FALLBACK_ATTEMPTS.length;
+      for (const [index, attempt] of DESKEW_FALLBACK_ATTEMPTS.entries()) {
+        const deskewedCrop = await deps.cropRegion(imageBuffer, fallbackTop, fallbackHeight, {
+          rotateDegrees: attempt.rotateDegrees,
+          binarize: true,
+        });
+        const deskewedText = await deps.runTesseractOcr(deskewedCrop, { psm: 6, oem: 1 });
+        const deskewedLines = extractMrzLines(deskewedText);
+        parsed = parseAndValidateMrz(deskewedLines);
+        logDeskewAttempt(deskewAttemptStart + index, attempt.rotateDegrees, deskewedLines, parsed !== null);
+        if (parsed) {
+          logMrzPipelineWinner('deskew');
+          return enrichWithVisualIssueDate(mapMrzToExtractionResult(parsed, deskewedLines), imageBuffer, deps.runVisualFieldOcr);
+        }
+      }
+
       // Nothing worked — never guess. Keep whichever attempt's raw text
       // for human review (structurally, not content — see buildUnreadableMrzResult).
-      // Unchanged from before the enhanced stage was added: still prefers
-      // the binarized (stage 3) or plain (stage 2) attempt, not an
-      // enhanced one — this is only about which raw text is kept for
-      // human review, not part of the parsing/confidence logic.
+      // Unchanged from before the enhanced/localized/deskew stages were
+      // added: still prefers the binarized (stage 3) or plain (stage 2)
+      // attempt — this is only about which raw text is kept for human
+      // review, not part of the parsing/confidence logic.
       logMrzPipelineWinner('none');
       return buildUnreadableMrzResult(binarizedLines.length > 0 ? binarizedLines : fallbackLines);
     },
