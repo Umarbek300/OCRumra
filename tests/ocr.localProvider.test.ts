@@ -12,6 +12,24 @@ function validSearchResult(): MrzSearchResult {
   return { lines: VALID_SPECIMEN_LINES, parsed };
 }
 
+async function captureLogs(run: () => Promise<void>): Promise<string[]> {
+  const originalLog = console.log;
+  const lines: string[] = [];
+  console.log = (...args: unknown[]) => {
+    lines.push(args.map(String).join(' '));
+  };
+  try {
+    await run();
+  } finally {
+    console.log = originalLog;
+  }
+  return lines;
+}
+
+function pipelineLogLines(lines: string[]): string[] {
+  return lines.filter((line) => line.startsWith('[mrz-pipeline]'));
+}
+
 function buildDeps(overrides: Partial<LocalProviderDependencies> = {}): {
   deps: LocalProviderDependencies;
   calls: { search: number; locate: number; crop: number; ocr: number; dims: number; visual: number };
@@ -222,4 +240,99 @@ test('local provider does not call the visual enrichment step when every MRZ sta
   await provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg');
 
   assert.equal(calls.visual, 0, 'no successful MRZ result to enrich — visual OCR must not run');
+});
+
+test('local provider logs only winner=search (no fallback-stage attempt logs) when the search stage succeeds', async () => {
+  const { deps } = buildDeps({ searchMrzLines: async () => validSearchResult() });
+  const provider = createLocalProvider(deps);
+
+  const logs = await captureLogs(() => provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg').then(() => {}));
+
+  assert.deepEqual(pipelineLogLines(logs), ['[mrz-pipeline] winner=search']);
+});
+
+test('local provider logs the fallback-plain attempt (structural fields only) and winner=fallback-plain when stage 2 succeeds', async () => {
+  const { deps } = buildDeps({
+    runTesseractOcr: async () => VALID_SPECIMEN_LINES.join('\n'),
+  });
+  const provider = createLocalProvider(deps);
+
+  const logs = await captureLogs(() => provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg').then(() => {}));
+  const expectedLengths = VALID_SPECIMEN_LINES.map((line) => line.length).join(',');
+
+  assert.deepEqual(pipelineLogLines(logs), [
+    `[mrz-pipeline] stage=fallback-plain attempt=2 lineCount=2 lengths=[${expectedLengths}] parseSuccess=true`,
+    '[mrz-pipeline] winner=fallback-plain',
+  ]);
+});
+
+test('local provider logs a failed fallback-plain attempt, then the fallback-binarized attempt and winner when stage 3 succeeds', async () => {
+  let ocrCallCount = 0;
+  const { deps } = buildDeps({
+    runTesseractOcr: async () => {
+      ocrCallCount += 1;
+      return ocrCallCount === 1 ? 'not an mrz' : VALID_SPECIMEN_LINES.join('\n');
+    },
+  });
+  const provider = createLocalProvider(deps);
+
+  const logs = await captureLogs(() => provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg').then(() => {}));
+  const expectedLengths = VALID_SPECIMEN_LINES.map((line) => line.length).join(',');
+
+  assert.deepEqual(pipelineLogLines(logs), [
+    '[mrz-pipeline] stage=fallback-plain attempt=2 lineCount=1 lengths=[8] parseSuccess=false',
+    `[mrz-pipeline] stage=fallback-binarized attempt=3 lineCount=2 lengths=[${expectedLengths}] parseSuccess=true`,
+    '[mrz-pipeline] winner=fallback-binarized',
+  ]);
+});
+
+test('local provider logs failed fallback-plain and fallback-binarized attempts, then the fallback-split attempt and winner when stage 4 succeeds', async () => {
+  let ocrCallCount = 0;
+  const { deps } = buildDeps({
+    runTesseractOcr: async () => {
+      ocrCallCount += 1;
+      if (ocrCallCount <= 2) return 'not an mrz';
+      return ocrCallCount === 3 ? VALID_SPECIMEN_LINES[0]! : VALID_SPECIMEN_LINES[1]!;
+    },
+  });
+  const provider = createLocalProvider(deps);
+
+  const logs = await captureLogs(() => provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg').then(() => {}));
+  const expectedLengths = VALID_SPECIMEN_LINES.map((line) => line.length).join(',');
+
+  assert.deepEqual(pipelineLogLines(logs), [
+    '[mrz-pipeline] stage=fallback-plain attempt=2 lineCount=1 lengths=[8] parseSuccess=false',
+    '[mrz-pipeline] stage=fallback-binarized attempt=3 lineCount=1 lengths=[8] parseSuccess=false',
+    `[mrz-pipeline] stage=fallback-split attempt=4 lineCount=2 lengths=[${expectedLengths}] parseSuccess=true`,
+    '[mrz-pipeline] winner=fallback-split',
+  ]);
+});
+
+test('local provider logs every fallback attempt as failed and winner=none when the whole pipeline fails', async () => {
+  const { deps } = buildDeps();
+  const provider = createLocalProvider(deps);
+
+  const logs = await captureLogs(() => provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg').then(() => {}));
+
+  assert.deepEqual(pipelineLogLines(logs), [
+    '[mrz-pipeline] stage=fallback-plain attempt=2 lineCount=1 lengths=[8] parseSuccess=false',
+    '[mrz-pipeline] stage=fallback-binarized attempt=3 lineCount=1 lengths=[8] parseSuccess=false',
+    '[mrz-pipeline] stage=fallback-split attempt=4 lineCount=2 lengths=[8,8] parseSuccess=false',
+    '[mrz-pipeline] winner=none',
+  ]);
+});
+
+test('local provider pipeline logs never contain OCR text or passport field values — only structural counts/booleans', async () => {
+  const { deps } = buildDeps({
+    runTesseractOcr: async () => VALID_SPECIMEN_LINES.join('\n'),
+  });
+  const provider = createLocalProvider(deps);
+
+  const logs = await captureLogs(() => provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg').then(() => {}));
+  const combined = pipelineLogLines(logs).join('\n');
+
+  assert.ok(!combined.includes('ERIKSSON'), 'pipeline log must not contain the surname');
+  assert.ok(!combined.includes('L898902C3'), 'pipeline log must not contain the passport number');
+  assert.ok(!combined.includes(VALID_SPECIMEN_LINES[0]!), 'pipeline log must not contain the raw MRZ line');
+  assert.ok(!combined.includes(VALID_SPECIMEN_LINES[1]!), 'pipeline log must not contain the raw MRZ line');
 });

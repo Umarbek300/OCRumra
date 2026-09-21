@@ -29,6 +29,26 @@ const defaultDependencies: LocalProviderDependencies = {
   runVisualFieldOcr,
 };
 
+type MrzStageName = 'search' | 'fallback-plain' | 'fallback-binarized' | 'fallback-split';
+
+/**
+ * Diagnostic-only: structural shape of one fallback stage's OCR attempt
+ * (which stage, line count, each line's length, whether it parsed) — never
+ * the OCR'd text itself. Lets a failed pipeline run be root-caused from
+ * logs alone (e.g. "line length off by 2" vs "no lines at all") without
+ * needing the source passport image.
+ */
+function logMrzStageAttempt(stage: MrzStageName, attempt: number, lines: readonly string[], parseSuccess: boolean): void {
+  console.log(
+    `[mrz-pipeline] stage=${stage} attempt=${attempt} lineCount=${lines.length} lengths=[${lines.map((line) => line.length).join(',')}] parseSuccess=${parseSuccess}`,
+  );
+}
+
+/** Diagnostic-only: which stage (if any) ultimately produced the result. */
+function logMrzPipelineWinner(stage: MrzStageName | 'none'): void {
+  console.log(`[mrz-pipeline] winner=${stage}`);
+}
+
 /**
  * Best-effort add-on stage, run only after a successful MRZ read: tries to
  * recover passport_issue_date from the passport's visual (non-MRZ) text.
@@ -90,6 +110,7 @@ export function createLocalProvider(deps: LocalProviderDependencies = defaultDep
         runTesseractOcr: deps.runTesseractOcr,
       });
       if (searchResult) {
+        logMrzPipelineWinner('search');
         return enrichWithVisualIssueDate(
           mapMrzToExtractionResult(searchResult.parsed, searchResult.lines),
           imageBuffer,
@@ -102,7 +123,9 @@ export function createLocalProvider(deps: LocalProviderDependencies = defaultDep
       const fallbackText = await deps.runTesseractOcr(fallbackCrop, { psm: 6 });
       const fallbackLines = extractMrzLines(fallbackText);
       let parsed = parseAndValidateMrz(fallbackLines);
+      logMrzStageAttempt('fallback-plain', 2, fallbackLines, parsed !== null);
       if (parsed) {
+        logMrzPipelineWinner('fallback-plain');
         return enrichWithVisualIssueDate(mapMrzToExtractionResult(parsed, fallbackLines), imageBuffer, deps.runVisualFieldOcr);
       }
 
@@ -115,7 +138,9 @@ export function createLocalProvider(deps: LocalProviderDependencies = defaultDep
       const binarizedText = await deps.runTesseractOcr(binarizedCrop, { psm: 6 });
       const binarizedLines = extractMrzLines(binarizedText);
       parsed = parseAndValidateMrz(binarizedLines);
+      logMrzStageAttempt('fallback-binarized', 3, binarizedLines, parsed !== null);
       if (parsed) {
+        logMrzPipelineWinner('fallback-binarized');
         return enrichWithVisualIssueDate(mapMrzToExtractionResult(parsed, binarizedLines), imageBuffer, deps.runVisualFieldOcr);
       }
 
@@ -125,12 +150,15 @@ export function createLocalProvider(deps: LocalProviderDependencies = defaultDep
         runTesseractOcr: deps.runTesseractOcr,
       });
       parsed = parseAndValidateMrz(splitLines);
+      logMrzStageAttempt('fallback-split', 4, splitLines, parsed !== null);
       if (parsed) {
+        logMrzPipelineWinner('fallback-split');
         return enrichWithVisualIssueDate(mapMrzToExtractionResult(parsed, splitLines), imageBuffer, deps.runVisualFieldOcr);
       }
 
       // Nothing worked — never guess. Keep whichever attempt's raw text
       // for human review (structurally, not content — see buildUnreadableMrzResult).
+      logMrzPipelineWinner('none');
       return buildUnreadableMrzResult(binarizedLines.length > 0 ? binarizedLines : fallbackLines);
     },
   };
