@@ -8,6 +8,8 @@ import { extractMrzLines } from '../src/ocr/mrz/extractMrzLines.js';
 import { locateMrzRegion } from '../src/ocr/mrz/locateMrzRegion.js';
 import { parseAndValidateMrz } from '../src/ocr/mrz/parseAndValidateMrz.js';
 import { runTesseractOcr } from '../src/ocr/mrz/runTesseractOcr.js';
+import { searchMrzLines } from '../src/ocr/mrz/searchMrzLines.js';
+import { createLocalProvider } from '../src/ocr/providers/localProvider.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE_PATH = path.join(__dirname, 'fixtures', 'synthetic-mrz-document.png');
@@ -46,5 +48,39 @@ test(
 
     const documentNumberCheck = parsed.details.find((detail) => detail.field === 'documentNumberCheckDigit');
     assert.equal(documentNumberCheck?.valid, true, 'real OCR output must pass real check-digit validation');
+  },
+);
+
+// Same real-binary coverage, but for the new primary candidate-search
+// strategy (searchMrzLines) rather than the old single fixed crop.
+test(
+  'searchMrzLines recovers a valid, checksum-verified MRZ from a synthetic document image using real Tesseract',
+  { skip: !tesseractIsAvailable() ? 'tesseract binary not found on PATH' : false },
+  async () => {
+    const imageBuffer = await readFile(FIXTURE_PATH);
+
+    const result = await searchMrzLines(imageBuffer);
+
+    assert.ok(result, 'the candidate search must find a valid MRZ in this well-framed fixture');
+    assert.equal(result.parsed.fields.documentNumber, 'L898902C3');
+    const documentNumberCheck = result.parsed.details.find((detail) => detail.field === 'documentNumberCheckDigit');
+    assert.equal(documentNumberCheck?.valid, true);
+  },
+);
+
+// Full end-to-end through the actual provider (staged pipeline), real
+// Tesseract, real fixture — the same code path production runs.
+test(
+  'the local provider recovers a valid MRZ end to end using real Tesseract',
+  { skip: !tesseractIsAvailable() ? 'tesseract binary not found on PATH' : false },
+  async () => {
+    const imageBuffer = await readFile(FIXTURE_PATH);
+    const provider = createLocalProvider();
+
+    const result = await provider.extract(imageBuffer, 'image/png');
+
+    assert.equal(result.surname.value, 'ERIKSSON');
+    assert.equal(result.passportNumber.value, 'L898902C3');
+    assert.notEqual(result.overallConfidence, 'low');
   },
 );

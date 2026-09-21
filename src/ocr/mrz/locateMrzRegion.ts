@@ -1,6 +1,14 @@
 import sharp from 'sharp';
 
 /**
+ * The original fixed-fraction crop. Kept as the final fallback (see
+ * localProvider.ts) after the candidate-search strategy in
+ * searchMrzLines.ts, which production evidence showed is needed since a
+ * single fixed fraction isn't reliable across photos framed differently.
+ */
+export const FALLBACK_CROP_BOTTOM_FRACTION = 0.6;
+
+/**
  * Crops the bottom band of a passport photo where TD3 MRZ always sits, and
  * lightly enhances it for OCR (grayscale, normalized contrast, upscaled —
  * Tesseract does much better on larger, high-contrast monospace text).
@@ -24,7 +32,7 @@ export async function locateMrzRegion(imageBuffer: Buffer): Promise<Buffer> {
   // framing, so bottom 40% gives real headroom for both lines to land
   // fully inside the crop, still well short of pulling in the visual
   // page above the MRZ block.
-  const cropTop = Math.round(height * 0.6);
+  const cropTop = Math.round(height * FALLBACK_CROP_BOTTOM_FRACTION);
   const cropHeight = height - cropTop;
 
   // Diagnostic only: pure geometry (pixel dimensions), never image content.

@@ -1,37 +1,126 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createLocalProvider, type LocalProviderDependencies } from '../src/ocr/providers/localProvider.js';
+import type { MrzSearchResult } from '../src/ocr/mrz/searchMrzLines.js';
+import { parseAndValidateMrz } from '../src/ocr/mrz/parseAndValidateMrz.js';
 
 const VALID_SPECIMEN_LINES = ['P<UTOERIKSSON<<ANNA<MARIA<<<<<<<<<<<<<<<<<<<', 'L898902C36UTO7408122F1204159ZE184226B<<<<<10'];
 
-function buildDeps(overrides: Partial<LocalProviderDependencies> = {}): LocalProviderDependencies {
-  return {
-    locateMrzRegion: async (buffer) => buffer,
-    runTesseractOcr: async () => VALID_SPECIMEN_LINES.join('\n'),
+function validSearchResult(): MrzSearchResult {
+  const parsed = parseAndValidateMrz(VALID_SPECIMEN_LINES);
+  assert.ok(parsed, 'specimen MRZ must parse for these tests to be meaningful');
+  return { lines: VALID_SPECIMEN_LINES, parsed };
+}
+
+function buildDeps(overrides: Partial<LocalProviderDependencies> = {}): {
+  deps: LocalProviderDependencies;
+  calls: { search: number; locate: number; crop: number; ocr: number; dims: number };
+} {
+  const calls = { search: 0, locate: 0, crop: 0, ocr: 0, dims: 0 };
+  const deps: LocalProviderDependencies = {
+    searchMrzLines: async () => {
+      calls.search += 1;
+      return null;
+    },
+    locateMrzRegion: async (buffer) => {
+      calls.locate += 1;
+      return buffer;
+    },
+    cropRegion: async (buffer) => {
+      calls.crop += 1;
+      return buffer;
+    },
+    runTesseractOcr: async () => {
+      calls.ocr += 1;
+      return 'not an mrz';
+    },
+    getImageDimensions: async () => {
+      calls.dims += 1;
+      return { width: 900, height: 1200 };
+    },
     ...overrides,
   };
+  return { deps, calls };
 }
 
 test('local provider is named "local" and never touches Anthropic', () => {
-  const provider = createLocalProvider(buildDeps());
-  assert.equal(provider.name, 'local');
+  const { deps } = buildDeps();
+  assert.equal(createLocalProvider(deps).name, 'local');
 });
 
-test('local provider wires crop -> OCR -> parse -> map end to end (mocked crop/OCR)', async () => {
-  const provider = createLocalProvider(buildDeps());
+test('local provider returns the search result immediately when the candidate search succeeds (no fallback calls)', async () => {
+  const { deps, calls } = buildDeps({
+    searchMrzLines: async () => {
+      calls.search += 1;
+      return validSearchResult();
+    },
+  });
+  const provider = createLocalProvider(deps);
+
   const result = await provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg');
 
   assert.equal(result.surname.value, 'ERIKSSON');
-  assert.equal(result.passportNumber.value, 'L898902C3');
-  assert.equal(result.model, 'tesseract-mrz-local');
+  assert.equal(calls.search, 1);
+  assert.equal(calls.locate, 0, 'must not fall back once search succeeds');
+  assert.equal(calls.ocr, 0, 'must not run any fallback OCR once search succeeds');
 });
 
-test('local provider returns a low-confidence, all-null result when OCR output is not a recognizable MRZ (never throws, never guesses)', async () => {
-  const provider = createLocalProvider(
-    buildDeps({
-      runTesseractOcr: async () => 'not an mrz at all',
-    }),
-  );
+test('local provider falls back to the plain fixed crop when search finds nothing', async () => {
+  const { deps, calls } = buildDeps({
+    runTesseractOcr: async () => {
+      calls.ocr += 1;
+      return VALID_SPECIMEN_LINES.join('\n');
+    },
+  });
+  const provider = createLocalProvider(deps);
+
+  const result = await provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg');
+
+  assert.equal(result.surname.value, 'ERIKSSON');
+  assert.equal(calls.search, 1);
+  assert.equal(calls.locate, 1, 'fallback stage 2 must use the original fixed crop');
+  assert.equal(calls.ocr, 1, 'must stop at stage 2 — never run binarized/split fallbacks once stage 2 succeeds');
+});
+
+test('local provider tries the binarized fallback when the plain fallback crop does not parse', async () => {
+  const { deps, calls } = buildDeps({
+    runTesseractOcr: async (_buffer, options) => {
+      calls.ocr += 1;
+      // Plain (stage 2) attempt returns garbage; binarized (stage 3) succeeds.
+      if (calls.ocr === 1) return 'not an mrz';
+      return VALID_SPECIMEN_LINES.join('\n');
+    },
+  });
+  const provider = createLocalProvider(deps);
+
+  const result = await provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg');
+
+  assert.equal(result.surname.value, 'ERIKSSON');
+  assert.equal(calls.ocr, 2, 'stage 2 (plain) then stage 3 (binarized) — must stop there');
+  assert.equal(calls.dims, 1);
+});
+
+test('local provider tries split-line OCR as the last fallback stage', async () => {
+  const { deps, calls } = buildDeps({
+    runTesseractOcr: async () => {
+      calls.ocr += 1;
+      // Every combined-block attempt (stage 2 and 3) fails; only the
+      // split-line calls (stage 4) return usable single-line text.
+      if (calls.ocr <= 2) return 'not an mrz';
+      return calls.ocr === 3 ? VALID_SPECIMEN_LINES[0]! : VALID_SPECIMEN_LINES[1]!;
+    },
+  });
+  const provider = createLocalProvider(deps);
+
+  const result = await provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg');
+
+  assert.equal(result.surname.value, 'ERIKSSON');
+  assert.equal(calls.ocr, 4, 'stage 2 + stage 3 + two split-line (stage 4) calls, then stop');
+});
+
+test('local provider returns a low-confidence, all-null result when every stage fails (never throws, never guesses)', async () => {
+  const { deps } = buildDeps();
+  const provider = createLocalProvider(deps);
 
   const result = await provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg');
 
@@ -40,14 +129,14 @@ test('local provider returns a low-confidence, all-null result when OCR output i
   assert.equal(result.passportNumber.value, null);
 });
 
-test('local provider propagates a crop failure (e.g. corrupt/unreadable image)', async () => {
-  const provider = createLocalProvider(
-    buildDeps({
-      locateMrzRegion: async () => {
-        throw new Error('Could not read image dimensions for MRZ region crop');
-      },
-    }),
-  );
+test('local provider propagates a crop-dimension failure (e.g. corrupt/unreadable image) from the fallback stage', async () => {
+  const { deps } = buildDeps({
+    locateMrzRegion: async () => {
+      throw new Error('Could not read image dimensions for MRZ region crop');
+    },
+  });
+
+  const provider = createLocalProvider(deps);
 
   await assert.rejects(
     () => provider.extract(Buffer.from('not-an-image'), 'image/jpeg'),
@@ -56,13 +145,13 @@ test('local provider propagates a crop failure (e.g. corrupt/unreadable image)',
 });
 
 test('local provider propagates a Tesseract failure (e.g. binary not installed)', async () => {
-  const provider = createLocalProvider(
-    buildDeps({
-      runTesseractOcr: async () => {
-        throw new Error('Failed to start local OCR (tesseract): spawn tesseract ENOENT');
-      },
-    }),
-  );
+  const { deps } = buildDeps({
+    runTesseractOcr: async () => {
+      throw new Error('Failed to start local OCR (tesseract): spawn tesseract ENOENT');
+    },
+  });
+
+  const provider = createLocalProvider(deps);
 
   await assert.rejects(() => provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg'), /Failed to start local OCR/);
 });

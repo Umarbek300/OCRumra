@@ -6,20 +6,29 @@ const MAX_STDERR_LENGTH = 300;
 export interface RunTesseractOptions {
   /** Injectable for tests — defaults to the real `tesseract` binary on PATH. */
   binaryPath?: string;
+  /**
+   * Page segmentation mode. Defaults to 6 (uniform block of text — good
+   * for a 2-line MRZ crop). 7 ("single text line") or 13 ("raw line,
+   * bypass Tesseract-specific hacks") are used when OCR'ing a single MRZ
+   * line on its own, which is often more accurate than multi-line block
+   * segmentation.
+   */
+  psm?: number;
 }
 
 /**
  * Runs the local Tesseract OCR binary against an image buffer entirely via
  * stdin/stdout pipes — no temp file, nothing written to disk, nothing
- * leaves this process. `--psm 6` (uniform block of text) plus a whitelist
- * restricted to the MRZ alphabet measurably improves recognition of MRZ's
- * monospace OCR-B-style text with only the standard `eng` trained data.
+ * leaves this process. A whitelist restricted to the MRZ alphabet
+ * measurably improves recognition of MRZ's monospace OCR-B-style text
+ * with only the standard `eng` trained data.
  */
 export function runTesseractOcr(imageBuffer: Buffer, options: RunTesseractOptions = {}): Promise<string> {
   const binaryPath = options.binaryPath ?? 'tesseract';
+  const psm = options.psm ?? 6;
 
   return new Promise((resolve, reject) => {
-    const child = spawn(binaryPath, ['-', 'stdout', '--psm', '6', '-c', `tessedit_char_whitelist=${MRZ_CHAR_WHITELIST}`], {
+    const child = spawn(binaryPath, ['-', 'stdout', '--psm', String(psm), '-c', `tessedit_char_whitelist=${MRZ_CHAR_WHITELIST}`], {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
