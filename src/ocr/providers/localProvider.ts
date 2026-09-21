@@ -8,6 +8,7 @@ import { runTesseractOcr } from '../mrz/runTesseractOcr.js';
 import { searchMrzLines } from '../mrz/searchMrzLines.js';
 import { splitLineOcr } from '../mrz/splitLineOcr.js';
 import type { PassportExtractionResult } from '../passportExtractionSchema.js';
+import { runVisualFieldOcr } from '../visual/runVisualFieldOcr.js';
 import type { OcrProvider } from './types.js';
 
 export interface LocalProviderDependencies {
@@ -16,6 +17,7 @@ export interface LocalProviderDependencies {
   cropRegion: typeof cropRegion;
   runTesseractOcr: typeof runTesseractOcr;
   getImageDimensions: typeof getImageDimensions;
+  runVisualFieldOcr: typeof runVisualFieldOcr;
 }
 
 const defaultDependencies: LocalProviderDependencies = {
@@ -24,7 +26,40 @@ const defaultDependencies: LocalProviderDependencies = {
   cropRegion,
   runTesseractOcr,
   getImageDimensions,
+  runVisualFieldOcr,
 };
+
+/**
+ * Best-effort add-on stage, run only after a successful MRZ read: tries to
+ * recover passport_issue_date from the passport's visual (non-MRZ) text.
+ * Never overrides a value the MRZ result already has, and — since
+ * runVisualFieldOcr never throws — never turns a working MRZ result into a
+ * failure.
+ */
+async function enrichWithVisualIssueDate(
+  result: PassportExtractionResult,
+  imageBuffer: Buffer,
+  runVisualFieldOcrDep: LocalProviderDependencies['runVisualFieldOcr'],
+): Promise<PassportExtractionResult> {
+  if (result.passportIssueDate.value !== null) return result;
+
+  const known = [result.dateOfBirth.value, result.passportExpiryDate.value].filter(
+    (value): value is string => value !== null,
+  );
+
+  let issueDate: string | null;
+  try {
+    // runVisualFieldOcr already catches its own errors and resolves to
+    // null, but this stage must never break the MRZ result it enriches
+    // even if an injected/future implementation doesn't uphold that.
+    issueDate = await runVisualFieldOcrDep(imageBuffer, known);
+  } catch {
+    return result;
+  }
+  if (issueDate === null) return result;
+
+  return { ...result, passportIssueDate: { value: issueDate, confidence: 'medium' } };
+}
 
 /**
  * Free, on-server passport MRZ extraction. Never calls any external API —
@@ -55,7 +90,11 @@ export function createLocalProvider(deps: LocalProviderDependencies = defaultDep
         runTesseractOcr: deps.runTesseractOcr,
       });
       if (searchResult) {
-        return mapMrzToExtractionResult(searchResult.parsed, searchResult.lines);
+        return enrichWithVisualIssueDate(
+          mapMrzToExtractionResult(searchResult.parsed, searchResult.lines),
+          imageBuffer,
+          deps.runVisualFieldOcr,
+        );
       }
 
       // Fallback stage 2: original fixed crop, plain, combined-block OCR.
@@ -64,7 +103,7 @@ export function createLocalProvider(deps: LocalProviderDependencies = defaultDep
       const fallbackLines = extractMrzLines(fallbackText);
       let parsed = parseAndValidateMrz(fallbackLines);
       if (parsed) {
-        return mapMrzToExtractionResult(parsed, fallbackLines);
+        return enrichWithVisualIssueDate(mapMrzToExtractionResult(parsed, fallbackLines), imageBuffer, deps.runVisualFieldOcr);
       }
 
       // Fallback stage 3: same region, binarized.
@@ -77,7 +116,7 @@ export function createLocalProvider(deps: LocalProviderDependencies = defaultDep
       const binarizedLines = extractMrzLines(binarizedText);
       parsed = parseAndValidateMrz(binarizedLines);
       if (parsed) {
-        return mapMrzToExtractionResult(parsed, binarizedLines);
+        return enrichWithVisualIssueDate(mapMrzToExtractionResult(parsed, binarizedLines), imageBuffer, deps.runVisualFieldOcr);
       }
 
       // Fallback stage 4: same region, lines OCR'd separately.
@@ -87,7 +126,7 @@ export function createLocalProvider(deps: LocalProviderDependencies = defaultDep
       });
       parsed = parseAndValidateMrz(splitLines);
       if (parsed) {
-        return mapMrzToExtractionResult(parsed, splitLines);
+        return enrichWithVisualIssueDate(mapMrzToExtractionResult(parsed, splitLines), imageBuffer, deps.runVisualFieldOcr);
       }
 
       // Nothing worked — never guess. Keep whichever attempt's raw text

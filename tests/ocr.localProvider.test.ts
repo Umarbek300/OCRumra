@@ -14,9 +14,9 @@ function validSearchResult(): MrzSearchResult {
 
 function buildDeps(overrides: Partial<LocalProviderDependencies> = {}): {
   deps: LocalProviderDependencies;
-  calls: { search: number; locate: number; crop: number; ocr: number; dims: number };
+  calls: { search: number; locate: number; crop: number; ocr: number; dims: number; visual: number };
 } {
-  const calls = { search: 0, locate: 0, crop: 0, ocr: 0, dims: 0 };
+  const calls = { search: 0, locate: 0, crop: 0, ocr: 0, dims: 0, visual: 0 };
   const deps: LocalProviderDependencies = {
     searchMrzLines: async () => {
       calls.search += 1;
@@ -37,6 +37,10 @@ function buildDeps(overrides: Partial<LocalProviderDependencies> = {}): {
     getImageDimensions: async () => {
       calls.dims += 1;
       return { width: 900, height: 1200 };
+    },
+    runVisualFieldOcr: async () => {
+      calls.visual += 1;
+      return null;
     },
     ...overrides,
   };
@@ -154,4 +158,68 @@ test('local provider propagates a Tesseract failure (e.g. binary not installed)'
   const provider = createLocalProvider(deps);
 
   await assert.rejects(() => provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg'), /Failed to start local OCR/);
+});
+
+test('local provider fills passportIssueDate from the visual enrichment step after a successful MRZ result, passing the MRZ-derived dates as "known"', async () => {
+  let capturedKnown: string[] | undefined;
+  const { deps, calls } = buildDeps({
+    searchMrzLines: async () => validSearchResult(),
+    runVisualFieldOcr: async (_buffer, known) => {
+      calls.visual += 1;
+      capturedKnown = known;
+      return '2020-01-15';
+    },
+  });
+  const provider = createLocalProvider(deps);
+
+  const result = await provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg');
+
+  assert.equal(result.surname.value, 'ERIKSSON', 'must not disturb fields the MRZ pipeline already produced');
+  assert.equal(result.passportIssueDate.value, '2020-01-15');
+  assert.equal(result.passportIssueDate.confidence, 'medium');
+  assert.equal(calls.visual, 1);
+  assert.ok(capturedKnown, 'runVisualFieldOcr must be called with the known MRZ dates');
+  assert.equal(capturedKnown?.length, 2, 'both dateOfBirth and passportExpiryDate must be passed as known anchors');
+  assert.ok(capturedKnown?.every((value) => typeof value === 'string' && value.length > 0));
+});
+
+test('local provider leaves passportIssueDate null when the visual enrichment step finds no unambiguous date', async () => {
+  const { deps, calls } = buildDeps({
+    searchMrzLines: async () => validSearchResult(),
+    runVisualFieldOcr: async () => {
+      calls.visual += 1;
+      return null;
+    },
+  });
+  const provider = createLocalProvider(deps);
+
+  const result = await provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg');
+
+  assert.equal(result.passportIssueDate.value, null);
+  assert.equal(result.passportIssueDate.confidence, null);
+  assert.equal(calls.visual, 1);
+});
+
+test('local provider never throws when the visual enrichment step fails, and returns the MRZ result unchanged', async () => {
+  const { deps } = buildDeps({
+    searchMrzLines: async () => validSearchResult(),
+    runVisualFieldOcr: async () => {
+      throw new Error('unexpected visual OCR failure');
+    },
+  });
+  const provider = createLocalProvider(deps);
+
+  const result = await provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg');
+
+  assert.equal(result.surname.value, 'ERIKSSON');
+  assert.equal(result.passportIssueDate.value, null);
+});
+
+test('local provider does not call the visual enrichment step when every MRZ stage fails', async () => {
+  const { deps, calls } = buildDeps();
+  const provider = createLocalProvider(deps);
+
+  await provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg');
+
+  assert.equal(calls.visual, 0, 'no successful MRZ result to enrich — visual OCR must not run');
 });

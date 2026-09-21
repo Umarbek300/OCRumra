@@ -14,6 +14,13 @@ export interface RunTesseractOptions {
    * segmentation.
    */
   psm?: number;
+  /**
+   * Restricts recognition to the MRZ alphabet (A-Z, 0-9, `<`). Defaults to
+   * true for the MRZ pipeline. General (non-MRZ) visual text — names,
+   * dates, addresses in mixed case with punctuation — needs this off, since
+   * the MRZ whitelist would silently drop most of that text.
+   */
+  useWhitelist?: boolean;
 }
 
 /**
@@ -26,9 +33,15 @@ export interface RunTesseractOptions {
 export function runTesseractOcr(imageBuffer: Buffer, options: RunTesseractOptions = {}): Promise<string> {
   const binaryPath = options.binaryPath ?? 'tesseract';
   const psm = options.psm ?? 6;
+  const useWhitelist = options.useWhitelist ?? true;
+
+  const args = ['-', 'stdout', '--psm', String(psm)];
+  if (useWhitelist) {
+    args.push('-c', `tessedit_char_whitelist=${MRZ_CHAR_WHITELIST}`);
+  }
 
   return new Promise((resolve, reject) => {
-    const child = spawn(binaryPath, ['-', 'stdout', '--psm', String(psm), '-c', `tessedit_char_whitelist=${MRZ_CHAR_WHITELIST}`], {
+    const child = spawn(binaryPath, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
