@@ -7,20 +7,23 @@ const VALID_SPECIMEN_LINES = ['P<UTOERIKSSON<<ANNA<MARIA<<<<<<<<<<<<<<<<<<<', 'L
 function buildDeps(overrides: Partial<SearchMrzLinesDependencies> = {}): {
   deps: SearchMrzLinesDependencies;
   calls: { crop: number; ocr: number };
+  ocrOptions: Array<{ psm?: number; oem?: number }>;
 } {
   const calls = { crop: 0, ocr: 0 };
+  const ocrOptions: Array<{ psm?: number; oem?: number }> = [];
   const deps: SearchMrzLinesDependencies = {
     cropRegion: async (buffer) => {
       calls.crop += 1;
       return buffer;
     },
-    runTesseractOcr: async () => {
+    runTesseractOcr: async (_buffer, options) => {
       calls.ocr += 1;
+      ocrOptions.push({ psm: options?.psm, oem: options?.oem });
       return 'garbage';
     },
     ...overrides,
   };
-  return { deps, calls };
+  return { deps, calls, ocrOptions };
 }
 
 // A 900x1200 buffer is only used to derive dimensions via sharp — since
@@ -95,4 +98,17 @@ test('searchMrzLines rejects a structurally MRZ-shaped but checksum-invalid pair
 
   assert.ok(result, 'a structurally valid MRZ with a bad check digit still parses (low confidence, not rejected outright)');
   assert.equal(calls.ocr, 1);
+});
+
+test('searchMrzLines requests LSTM-only OCR engine mode (--oem 1) for every candidate', async () => {
+  const image = await makeTestImage(900, 1200);
+  const { deps, ocrOptions } = buildDeps();
+
+  await searchMrzLines(image, deps);
+
+  assert.ok(ocrOptions.length > 0);
+  assert.ok(
+    ocrOptions.every((options) => options.oem === 1 && options.psm === 6),
+    'every candidate attempt must use oem=1, psm=6',
+  );
 });

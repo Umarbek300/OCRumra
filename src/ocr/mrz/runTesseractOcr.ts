@@ -21,6 +21,16 @@ export interface RunTesseractOptions {
    * the MRZ whitelist would silently drop most of that text.
    */
   useWhitelist?: boolean;
+  /**
+   * OCR Engine Mode (tesseract's `--oem`): 0 = legacy only, 1 = LSTM only,
+   * 2 = legacy+LSTM, 3 = default (whatever the installed binary picks).
+   * Left unset by default — no `--oem` flag is passed, preserving the
+   * tesseract binary's own default. The MRZ pipeline passes `1` explicitly
+   * (LSTM tends to read small monospace OCR-B text more reliably than the
+   * legacy engine), decided per call site so it can be compared against the
+   * default via production logs one stage at a time.
+   */
+  oem?: number;
 }
 
 /**
@@ -36,6 +46,9 @@ export function runTesseractOcr(imageBuffer: Buffer, options: RunTesseractOption
   const useWhitelist = options.useWhitelist ?? true;
 
   const args = ['-', 'stdout', '--psm', String(psm)];
+  if (options.oem !== undefined) {
+    args.push('--oem', String(options.oem));
+  }
   if (useWhitelist) {
     args.push('-c', `tessedit_char_whitelist=${MRZ_CHAR_WHITELIST}`);
   }

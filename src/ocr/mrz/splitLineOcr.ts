@@ -36,8 +36,8 @@ export async function splitLineOcr(
   ]);
 
   const [topText, bottomText] = await Promise.all([
-    deps.runTesseractOcr(topCrop, { psm: 7 }),
-    deps.runTesseractOcr(bottomCrop, { psm: 7 }),
+    deps.runTesseractOcr(topCrop, { psm: 7, oem: 1 }),
+    deps.runTesseractOcr(bottomCrop, { psm: 7, oem: 1 }),
   ]);
 
   return [normalizeMrzLineLength(cleanSingleLine(topText)), normalizeMrzLineLength(cleanSingleLine(bottomText))];

@@ -2,9 +2,9 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { splitLineOcr, type SplitLineOcrDependencies } from '../src/ocr/mrz/splitLineOcr.js';
 
-test('splitLineOcr crops and OCRs the top and bottom halves separately with single-line PSM', async () => {
+test('splitLineOcr crops and OCRs the top and bottom halves separately with single-line PSM and LSTM-only engine mode', async () => {
   const cropCalls: Array<{ top: number; height: number }> = [];
-  const ocrCalls: Array<{ psm: number | undefined }> = [];
+  const ocrCalls: Array<{ psm: number | undefined; oem: number | undefined }> = [];
 
   const deps: SplitLineOcrDependencies = {
     cropRegion: async (_buffer, top, height) => {
@@ -12,7 +12,7 @@ test('splitLineOcr crops and OCRs the top and bottom halves separately with sing
       return Buffer.from(`crop-${top}-${height}`);
     },
     runTesseractOcr: async (buffer, options) => {
-      ocrCalls.push({ psm: options?.psm });
+      ocrCalls.push({ psm: options?.psm, oem: options?.oem });
       return buffer.toString() === 'crop-100-100' ? 'LINE1TEXT' : 'LINE2TEXT';
     },
   };
@@ -25,6 +25,7 @@ test('splitLineOcr crops and OCRs the top and bottom halves separately with sing
 
   assert.equal(ocrCalls.length, 2);
   assert.ok(ocrCalls.every((call) => call.psm === 7), 'single-line OCR must use PSM 7');
+  assert.ok(ocrCalls.every((call) => call.oem === 1), 'single-line OCR must request LSTM-only engine mode (oem=1)');
 
   assert.deepEqual(lines, ['LINE1TEXT', 'LINE2TEXT']);
 });

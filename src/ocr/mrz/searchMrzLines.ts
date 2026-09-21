@@ -44,7 +44,7 @@ export async function searchMrzLines(
 
   for (const [index, candidate] of candidates.entries()) {
     const cropped = await deps.cropRegion(imageBuffer, candidate.top, candidate.height);
-    const rawText = await deps.runTesseractOcr(cropped, { psm: 6 });
+    const rawText = await deps.runTesseractOcr(cropped, { psm: 6, oem: 1 });
     const lines = extractMrzLines(rawText);
 
     console.log(

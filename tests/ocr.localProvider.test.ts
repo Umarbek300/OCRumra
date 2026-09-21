@@ -151,6 +151,25 @@ test('local provider returns a low-confidence, all-null result when every stage 
   assert.equal(result.passportNumber.value, null);
 });
 
+test('local provider requests LSTM-only OCR engine mode (--oem 1) on every fallback-stage OCR call', async () => {
+  const ocrOptions: Array<{ psm?: number; oem?: number }> = [];
+  const { deps } = buildDeps({
+    runTesseractOcr: async (_buffer, options) => {
+      ocrOptions.push({ psm: options?.psm, oem: options?.oem });
+      return 'not an mrz';
+    },
+  });
+  const provider = createLocalProvider(deps);
+
+  await provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg');
+
+  assert.equal(ocrOptions.length, 4, 'stage 2 + stage 3 + two split-line (stage 4) calls');
+  assert.ok(
+    ocrOptions.every((options) => options.oem === 1),
+    'every fallback-stage OCR call must request oem=1',
+  );
+});
+
 test('local provider propagates a crop-dimension failure (e.g. corrupt/unreadable image) from the fallback stage', async () => {
   const { deps } = buildDeps({
     locateMrzRegion: async () => {

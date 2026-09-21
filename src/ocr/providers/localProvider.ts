@@ -120,7 +120,7 @@ export function createLocalProvider(deps: LocalProviderDependencies = defaultDep
 
       // Fallback stage 2: original fixed crop, plain, combined-block OCR.
       const fallbackCrop = await deps.locateMrzRegion(imageBuffer);
-      const fallbackText = await deps.runTesseractOcr(fallbackCrop, { psm: 6 });
+      const fallbackText = await deps.runTesseractOcr(fallbackCrop, { psm: 6, oem: 1 });
       const fallbackLines = extractMrzLines(fallbackText);
       let parsed = parseAndValidateMrz(fallbackLines);
       logMrzStageAttempt('fallback-plain', 2, fallbackLines, parsed !== null);
@@ -135,7 +135,7 @@ export function createLocalProvider(deps: LocalProviderDependencies = defaultDep
       const fallbackHeight = height - fallbackTop;
 
       const binarizedCrop = await deps.cropRegion(imageBuffer, fallbackTop, fallbackHeight, { binarize: true });
-      const binarizedText = await deps.runTesseractOcr(binarizedCrop, { psm: 6 });
+      const binarizedText = await deps.runTesseractOcr(binarizedCrop, { psm: 6, oem: 1 });
       const binarizedLines = extractMrzLines(binarizedText);
       parsed = parseAndValidateMrz(binarizedLines);
       logMrzStageAttempt('fallback-binarized', 3, binarizedLines, parsed !== null);
