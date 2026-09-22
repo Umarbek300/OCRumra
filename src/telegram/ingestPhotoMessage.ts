@@ -1,7 +1,7 @@
 import { findAgentByTelegramUserId } from '../db/repositories/agents.repo.js';
 import { findGroupByTelegramChatId } from '../db/repositories/groups.repo.js';
 import { createPassportProcessingRecord } from '../db/repositories/passportProcessing.repo.js';
-import { recordPhotoMessage } from '../db/repositories/telegramMessages.repo.js';
+import { recordPhotoMessage, type TelegramMessageSource } from '../db/repositories/telegramMessages.repo.js';
 import { enqueuePassportProcessing } from '../queue/passportProcessingQueue.js';
 
 export interface PhotoMessageEvent {
@@ -11,6 +11,7 @@ export interface PhotoMessageEvent {
   senderDisplayName: string | null;
   timestamp: Date;
   photoFileId: string;
+  source: TelegramMessageSource;
 }
 
 export interface IngestResult {
@@ -46,6 +47,7 @@ export async function ingestPhotoMessage(event: PhotoMessageEvent): Promise<Inge
     telegramSenderDisplayName: event.senderDisplayName,
     messageTimestamp: event.timestamp,
     telegramPhotoFileId: event.photoFileId,
+    source: event.source,
     groupId: group?.id ?? null,
     agentId: agent?.id ?? null,
   });

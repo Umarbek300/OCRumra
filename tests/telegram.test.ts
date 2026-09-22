@@ -72,6 +72,7 @@ test('links a photo message when the chat and sender are both registered', async
       senderDisplayName: 'Test Sender',
       timestamp: new Date(),
       photoFileId: 'FILE_LINKED',
+      source: 'photo',
     });
     assert.deepEqual(result, {
       outcome: 'inserted',
@@ -79,6 +80,41 @@ test('links a photo message when the chat and sender are both registered', async
       agentLinked: true,
       processingEnqueued: true,
     });
+
+    const linked = await listLinkedMessages();
+    const match = linked.find((m) => m.telegramChatId === String(chatId));
+    assert.equal(match?.source, 'photo');
+  } finally {
+    await deleteFixtures(chatId, groupId, agentId);
+  }
+});
+
+test('links a document-sourced message and records source=document, unaffected by the photo workflow', async () => {
+  const chatId = uniqueChatId();
+  const senderId = uniqueUserId();
+  const groupId = await createGroup(chatId);
+  const agentId = await createAgent(senderId);
+  try {
+    const result = await ingestPhotoMessage({
+      chatId,
+      messageId: uniqueMessageId(),
+      senderUserId: senderId,
+      senderDisplayName: 'Test Sender',
+      timestamp: new Date(),
+      photoFileId: 'FILE_DOCUMENT',
+      source: 'document',
+    });
+    assert.deepEqual(result, {
+      outcome: 'inserted',
+      groupLinked: true,
+      agentLinked: true,
+      processingEnqueued: true,
+    });
+
+    const linked = await listLinkedMessages();
+    const match = linked.find((m) => m.telegramChatId === String(chatId));
+    assert.equal(match?.source, 'document');
+    assert.equal(match?.telegramPhotoFileId, 'FILE_DOCUMENT');
   } finally {
     await deleteFixtures(chatId, groupId, agentId);
   }
@@ -97,6 +133,7 @@ test('records an unlinked message when the chat is not a registered Group', asyn
       senderDisplayName: 'Registered Agent',
       timestamp: new Date(),
       photoFileId: 'FILE_UNKNOWN_GROUP',
+      source: 'photo',
     });
     assert.deepEqual(result, {
       outcome: 'inserted',
@@ -130,6 +167,7 @@ test('records an unlinked message when the sender is not a registered Agent', as
       senderDisplayName: 'Unregistered Sender',
       timestamp: new Date(),
       photoFileId: 'FILE_UNKNOWN_AGENT',
+      source: 'photo',
     });
     assert.deepEqual(result, {
       outcome: 'inserted',
@@ -167,6 +205,7 @@ test('the same (chat, message) id is never processed into a duplicate row', asyn
       senderDisplayName: 'Test Sender',
       timestamp: new Date(),
       photoFileId: 'FILE_ORIGINAL',
+      source: 'photo',
     });
     const second = await ingestPhotoMessage({
       chatId,
@@ -175,6 +214,7 @@ test('the same (chat, message) id is never processed into a duplicate row', asyn
       senderDisplayName: 'Test Sender',
       timestamp: new Date(),
       photoFileId: 'FILE_REDELIVERED',
+      source: 'photo',
     });
 
     assert.equal(first.outcome, 'inserted');
@@ -209,6 +249,7 @@ test('listLinkedMessages and listUnlinkedMessages partition messages correctly',
       senderDisplayName: 'Test Sender',
       timestamp: new Date(),
       photoFileId: 'FILE_LINKED_2',
+      source: 'photo',
     });
     await ingestPhotoMessage({
       chatId,
@@ -217,6 +258,7 @@ test('listLinkedMessages and listUnlinkedMessages partition messages correctly',
       senderDisplayName: 'Stranger',
       timestamp: new Date(),
       photoFileId: 'FILE_UNLINKED_2',
+      source: 'photo',
     });
 
     const linked = await listLinkedMessages();
@@ -244,6 +286,7 @@ test('a fully linked new message gets a passport_processing record and is pushed
       senderDisplayName: 'Test Sender',
       timestamp: new Date(),
       photoFileId: 'FILE_QUEUED',
+      source: 'photo',
     });
     assert.equal(result.processingEnqueued, true);
 
@@ -280,6 +323,7 @@ test('an unlinked message does not get a passport_processing record or a queue e
       senderDisplayName: 'Test Sender',
       timestamp: new Date(),
       photoFileId: 'FILE_NOT_QUEUED',
+      source: 'photo',
     });
     assert.equal(result.processingEnqueued, false);
 

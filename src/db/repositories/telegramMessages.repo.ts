@@ -1,5 +1,7 @@
 import { pool } from '../pool.js';
 
+export type TelegramMessageSource = 'photo' | 'document';
+
 export interface TelegramMessageRecord {
   id: string;
   telegramChatId: string;
@@ -8,6 +10,7 @@ export interface TelegramMessageRecord {
   telegramSenderDisplayName: string | null;
   messageTimestamp: string;
   telegramPhotoFileId: string;
+  source: TelegramMessageSource;
   groupId: string | null;
   agentId: string | null;
   createdAt: string;
@@ -21,6 +24,7 @@ interface TelegramMessageRow {
   telegram_sender_display_name: string | null;
   message_timestamp: string;
   telegram_photo_file_id: string;
+  source: TelegramMessageSource;
   group_id: string | null;
   agent_id: string | null;
   created_at: string;
@@ -35,6 +39,7 @@ function mapRow(row: TelegramMessageRow): TelegramMessageRecord {
     telegramSenderDisplayName: row.telegram_sender_display_name,
     messageTimestamp: row.message_timestamp,
     telegramPhotoFileId: row.telegram_photo_file_id,
+    source: row.source,
     groupId: row.group_id,
     agentId: row.agent_id,
     createdAt: row.created_at,
@@ -44,7 +49,7 @@ function mapRow(row: TelegramMessageRow): TelegramMessageRecord {
 const SELECT_COLUMNS = `
   id, telegram_chat_id, telegram_message_id, telegram_sender_user_id,
   telegram_sender_display_name, message_timestamp, telegram_photo_file_id,
-  group_id, agent_id, created_at
+  source, group_id, agent_id, created_at
 `;
 
 export interface RecordPhotoMessageInput {
@@ -54,6 +59,7 @@ export interface RecordPhotoMessageInput {
   telegramSenderDisplayName: string | null;
   messageTimestamp: Date;
   telegramPhotoFileId: string;
+  source: TelegramMessageSource;
   groupId: string | null;
   agentId: string | null;
 }
@@ -73,8 +79,8 @@ export async function recordPhotoMessage(
     `INSERT INTO telegram_messages (
        telegram_chat_id, telegram_message_id, telegram_sender_user_id,
        telegram_sender_display_name, message_timestamp, telegram_photo_file_id,
-       group_id, agent_id
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       source, group_id, agent_id
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
      ON CONFLICT (telegram_chat_id, telegram_message_id) DO NOTHING
      RETURNING ${SELECT_COLUMNS}`,
     [
@@ -84,6 +90,7 @@ export async function recordPhotoMessage(
       input.telegramSenderDisplayName,
       input.messageTimestamp,
       input.telegramPhotoFileId,
+      input.source,
       input.groupId,
       input.agentId,
     ],

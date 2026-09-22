@@ -1,5 +1,6 @@
 import { Bot } from 'grammy';
 import { env } from '../config/env.js';
+import { evaluateDocumentUpload } from './resolveDocumentUpload.js';
 import { ingestPhotoMessage } from '../telegram/ingestPhotoMessage.js';
 
 export const bot = new Bot(env.TELEGRAM_BOT_TOKEN);
@@ -53,6 +54,7 @@ bot.on('message:photo', async (ctx) => {
     senderDisplayName: getSenderDisplayName(ctx.from),
     timestamp: new Date(ctx.message.date * 1000),
     photoFileId: largestPhoto.file_id,
+    source: 'photo',
   });
 
   if (result.outcome === 'duplicate') {
@@ -71,6 +73,63 @@ bot.on('message:photo', async (ctx) => {
   }
 
   console.log(`Photo message linked and recorded: chat=${ctx.chat.id} message=${ctx.message.message_id}`);
+});
+
+// Recovers full-resolution passport photos: Telegram's "photo" upload path
+// (above) always re-compresses and caps images at ~1280px on the long
+// edge, which root-cause diagnostics showed can be enough on its own to
+// break MRZ OCR. A passport sent as a File/Document instead skips that
+// compression pipeline entirely. Purely additive - the message:photo
+// handler above is untouched.
+bot.on('message:document', async (ctx) => {
+  if (ctx.chat.type !== 'group' && ctx.chat.type !== 'supergroup') {
+    return;
+  }
+
+  if (!ctx.from) {
+    console.warn(
+      `Ignoring document message with no identifiable sender: chat=${ctx.chat.id} message=${ctx.message.message_id}`,
+    );
+    return;
+  }
+
+  const document = ctx.message.document;
+  const decision = evaluateDocumentUpload({ mimeType: document.mime_type, fileSize: document.file_size });
+  if (!decision.accepted) {
+    // Never logs document.file_name (arbitrary user-controlled text) - only
+    // the coarse, non-PII rejection reason.
+    console.warn(
+      `Ignoring document message: chat=${ctx.chat.id} message=${ctx.message.message_id} reason=${decision.reason}`,
+    );
+    return;
+  }
+
+  const result = await ingestPhotoMessage({
+    chatId: ctx.chat.id,
+    messageId: ctx.message.message_id,
+    senderUserId: ctx.from.id,
+    senderDisplayName: getSenderDisplayName(ctx.from),
+    timestamp: new Date(ctx.message.date * 1000),
+    photoFileId: document.file_id,
+    source: 'document',
+  });
+
+  if (result.outcome === 'duplicate') {
+    console.log(
+      `Duplicate document message ignored: chat=${ctx.chat.id} message=${ctx.message.message_id}`,
+    );
+    return;
+  }
+
+  if (!result.groupLinked || !result.agentLinked) {
+    console.warn(
+      `Unlinked document message recorded: chat=${ctx.chat.id} message=${ctx.message.message_id} ` +
+        `groupLinked=${result.groupLinked} agentLinked=${result.agentLinked}`,
+    );
+    return;
+  }
+
+  console.log(`Document message linked and recorded: chat=${ctx.chat.id} message=${ctx.message.message_id}`);
 });
 
 bot.catch((error) => {
