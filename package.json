@@ -19,6 +19,7 @@
     "admin:register-group": "tsx src/admin/registerGroup.ts",
     "admin:register-agent": "tsx src/admin/registerAgent.ts",
     "queue:worker": "tsx src/worker/start.ts",
+    "sheets:worker": "tsx src/sheets/start.ts",
     "test": "node --import tsx --test --test-concurrency=1 tests/*.test.ts"
   },
   "dependencies": {
@@ -26,6 +27,7 @@
     "@google-cloud/vision": "^6.1.0",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "googleapis": "^182.0.0",
     "grammy": "^1.30.0",
     "mrz": "^5.0.2",
     "pg": "^8.13.0",

@@ -47,3 +47,18 @@ test('parseEnv accepts OCR_PROVIDER=google-vision', () => {
 test('parseEnv rejects an invalid NODE_ENV', () => {
   assert.throws(() => parseEnv({ ...VALID_BASE, NODE_ENV: 'staging' }));
 });
+
+test('parseEnv defaults GOOGLE_SHEETS_API_TIMEOUT_MS to 30000', () => {
+  const env = parseEnv({ ...VALID_BASE });
+  assert.equal(env.GOOGLE_SHEETS_API_TIMEOUT_MS, 30_000);
+});
+
+test('parseEnv coerces a custom GOOGLE_SHEETS_API_TIMEOUT_MS to a number', () => {
+  const env = parseEnv({ ...VALID_BASE, GOOGLE_SHEETS_API_TIMEOUT_MS: '5000' });
+  assert.equal(env.GOOGLE_SHEETS_API_TIMEOUT_MS, 5000);
+});
+
+test('parseEnv rejects a non-positive GOOGLE_SHEETS_API_TIMEOUT_MS', () => {
+  assert.throws(() => parseEnv({ ...VALID_BASE, GOOGLE_SHEETS_API_TIMEOUT_MS: '0' }));
+  assert.throws(() => parseEnv({ ...VALID_BASE, GOOGLE_SHEETS_API_TIMEOUT_MS: '-1000' }));
+});

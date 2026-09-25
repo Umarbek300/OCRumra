@@ -40,9 +40,9 @@ function sampleExtraction(): PassportExtractionResult {
 
 function buildDeps(overrides: Partial<PerformPassportOcrDependencies> = {}): {
   deps: PerformPassportOcrDependencies;
-  calls: { findExisting: number; download: number; extract: number; save: number };
+  calls: { findExisting: number; download: number; extract: number; save: number; enqueueSheetSync: number };
 } {
-  const calls = { findExisting: 0, download: 0, extract: 0, save: 0 };
+  const calls = { findExisting: 0, download: 0, extract: 0, save: 0, enqueueSheetSync: 0 };
   const deps: PerformPassportOcrDependencies = {
     findExistingResult: async () => {
       calls.findExisting += 1;
@@ -59,6 +59,10 @@ function buildDeps(overrides: Partial<PerformPassportOcrDependencies> = {}): {
     saveResult: async (input) => {
       calls.save += 1;
       return { id: 'result-id', createdAt: 'now', updatedAt: 'now', ...input } as PassportOcrResultRecord;
+    },
+    enqueueSheetSync: async (telegramMessageId) => {
+      calls.enqueueSheetSync += 1;
+      return { id: 'sheet-sync-id', telegramMessageId } as never;
     },
     ...overrides,
   };
@@ -102,6 +106,7 @@ test('performPassportOcr propagates a Telegram download failure', async () => {
   await assert.rejects(() => performPassportOcr(CONTEXT, deps), /Failed to download Telegram file/);
   assert.equal(calls.extract, 0, 'must not call Claude if the download failed');
   assert.equal(calls.save, 0);
+  assert.equal(calls.enqueueSheetSync, 0, 'must not queue a sheet sync for a message that never got an OCR result');
 });
 
 test('performPassportOcr propagates a Claude extraction failure', async () => {
@@ -114,6 +119,7 @@ test('performPassportOcr propagates a Claude extraction failure', async () => {
 
   await assert.rejects(() => performPassportOcr(CONTEXT, deps), /Claude Vision request failed/);
   assert.equal(calls.save, 0, 'must not save a result when extraction failed');
+  assert.equal(calls.enqueueSheetSync, 0, 'must not queue a sheet sync for a message that never got an OCR result');
 });
 
 test('performPassportOcr treats a concurrent-insert race as benign (does not throw)', async () => {
@@ -122,4 +128,47 @@ test('performPassportOcr treats a concurrent-insert race as benign (does not thr
   });
 
   await assert.doesNotReject(() => performPassportOcr(CONTEXT, deps));
+});
+
+test('performPassportOcr enqueues a sheet sync job after a fresh save', async () => {
+  const { deps, calls } = buildDeps();
+  await performPassportOcr(CONTEXT, deps);
+
+  assert.equal(calls.enqueueSheetSync, 1);
+});
+
+test('performPassportOcr enqueues a sheet sync job even when the OCR result already existed (idempotent safety net for pre-existing results)', async () => {
+  const { deps, calls } = buildDeps({
+    findExistingResult: async () => {
+      calls.findExisting += 1;
+      return { id: 'existing', telegramMessageId: CONTEXT.telegramMessageId } as unknown as PassportOcrResultRecord;
+    },
+  });
+
+  await performPassportOcr(CONTEXT, deps);
+
+  assert.equal(calls.enqueueSheetSync, 1);
+});
+
+test('performPassportOcr enqueues a sheet sync job even when saveResult raced with another worker', async () => {
+  const { deps, calls } = buildDeps({
+    saveResult: async () => null,
+  });
+
+  await performPassportOcr(CONTEXT, deps);
+
+  assert.equal(calls.enqueueSheetSync, 1);
+});
+
+test('a sheet-sync queue failure never fails performPassportOcr — OCR success is unaffected', async () => {
+  const { deps, calls } = buildDeps({
+    enqueueSheetSync: async () => {
+      calls.enqueueSheetSync += 1;
+      throw new Error('sheet_sync_queue insert failed: connection reset');
+    },
+  });
+
+  await assert.doesNotReject(() => performPassportOcr(CONTEXT, deps));
+  assert.equal(calls.save, 1, 'the OCR result must still have been saved successfully');
+  assert.equal(calls.enqueueSheetSync, 1, 'the enqueue was attempted, just never allowed to propagate');
 });

@@ -39,6 +39,16 @@ export async function findAgentByTelegramUserId(telegramUserId: number): Promise
   return row ? mapRow(row) : null;
 }
 
+export async function findAgentById(id: string): Promise<Agent | null> {
+  const { rows } = await pool.query<AgentRow>(
+    `SELECT id, name, telegram_user_id, is_active, created_at, updated_at
+     FROM agents WHERE id = $1`,
+    [id],
+  );
+  const row = rows[0];
+  return row ? mapRow(row) : null;
+}
+
 export async function listAgents(): Promise<Agent[]> {
   const { rows } = await pool.query<AgentRow>(
     `SELECT id, name, telegram_user_id, is_active, created_at, updated_at

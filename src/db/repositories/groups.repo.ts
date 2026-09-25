@@ -42,6 +42,37 @@ export async function findGroupByTelegramChatId(telegramChatId: number): Promise
   return row ? mapRow(row) : null;
 }
 
+export async function findGroupById(id: string): Promise<Group | null> {
+  const { rows } = await pool.query<GroupRow>(
+    `SELECT id, name, departure_date, telegram_chat_id, google_sheet_id, created_at, updated_at
+     FROM groups WHERE id = $1`,
+    [id],
+  );
+  const row = rows[0];
+  return row ? mapRow(row) : null;
+}
+
+/**
+ * Atomically claims the right to be "the one who created this group's
+ * spreadsheet": only succeeds (returns the row) if google_sheet_id was
+ * still NULL at update time. If two callers race to provision a sheet for
+ * the same group concurrently, only one UPDATE actually matches this WHERE
+ * clause — the other gets null back and should discard its own
+ * freshly-created spreadsheet and re-read the winner's id instead (see
+ * ensureGroupSheet.ts). Never overwrites an already-set google_sheet_id.
+ */
+export async function setGroupGoogleSheetId(groupId: string, googleSheetId: string): Promise<Group | null> {
+  const { rows } = await pool.query<GroupRow>(
+    `UPDATE groups
+     SET google_sheet_id = $2
+     WHERE id = $1 AND google_sheet_id IS NULL
+     RETURNING id, name, departure_date, telegram_chat_id, google_sheet_id, created_at, updated_at`,
+    [groupId, googleSheetId],
+  );
+  const row = rows[0];
+  return row ? mapRow(row) : null;
+}
+
 export async function listGroups(): Promise<Group[]> {
   const { rows } = await pool.query<GroupRow>(
     `SELECT id, name, departure_date, telegram_chat_id, google_sheet_id, created_at, updated_at
