@@ -13,3 +13,7 @@ test('selectProvider("local") returns the local provider', () => {
 test('selectProvider("compare") returns a provider named "local" (local is authoritative in compare mode)', () => {
   assert.equal(selectProvider('compare').name, 'local');
 });
+
+test('selectProvider("google-vision") returns the google-vision provider', () => {
+  assert.equal(selectProvider('google-vision').name, 'google-vision');
+});

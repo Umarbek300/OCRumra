@@ -68,13 +68,18 @@ export function runTesseractOcr(imageBuffer: Buffer, options: RunTesseractOption
       reject(new Error(`Failed to start local OCR (tesseract): ${error.message}`));
     });
 
-    child.on('close', (code) => {
+    child.on('close', (code, signal) => {
       if (code !== 0) {
         // tesseract's own stderr only ever describes the binary/engine
         // state (missing trained data, bad image format, etc.) — never
         // document content — but bounded anyway as defense in depth.
         const stderr = Buffer.concat(stderrChunks).toString('utf8').trim().slice(0, MAX_STDERR_LENGTH);
-        reject(new Error(`Local OCR (tesseract) exited with code ${code}${stderr ? `: ${stderr}` : ''}`));
+        // When the process is terminated by a signal (e.g. the OS OOM
+        // killer sending SIGKILL) rather than exiting on its own, `code` is
+        // always null and the signal is the only clue why — surface it
+        // instead of reporting a bare, unexplained "code null".
+        const signalSuffix = signal ? ` (terminated by signal ${signal})` : '';
+        reject(new Error(`Local OCR (tesseract) exited with code ${code}${signalSuffix}${stderr ? `: ${stderr}` : ''}`));
         return;
       }
       resolve(Buffer.concat(stdoutChunks).toString('utf8'));

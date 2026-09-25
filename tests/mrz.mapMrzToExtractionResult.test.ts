@@ -77,3 +77,45 @@ test('buildUnreadableMrzResult handles completely empty OCR output', () => {
   assert.deepEqual(extraction.mrz, { value: null, confidence: null });
   assert.equal(extraction.overallConfidence, 'low');
 });
+
+test('mapMrzToExtractionResult reports the caller-supplied model string instead of the local/Tesseract default, when given one', () => {
+  const extraction = mapMrzToExtractionResult(parseValid(), VALID_SPECIMEN_LINES, 'google-vision-mrz');
+  assert.equal(extraction.model, 'google-vision-mrz');
+});
+
+test('buildUnreadableMrzResult reports the caller-supplied model string instead of the local/Tesseract default, when given one', () => {
+  const extraction = buildUnreadableMrzResult([], 'google-vision-mrz');
+  assert.equal(extraction.model, 'google-vision-mrz');
+});
+
+// --- visualIssueDate parameter -----------------------------------------
+// Google Vision's structured word/bounding-box data can recover
+// passport_issue_date outside the MRZ (which structurally never carries it)
+// — a caller supplies the already-extracted, already-validated ISO date
+// string (or null) as a 4th parameter, rather than this function trying to
+// find it itself.
+
+test('mapMrzToExtractionResult populates passportIssueDate with medium confidence when a visualIssueDate is supplied', () => {
+  const extraction = mapMrzToExtractionResult(parseValid(), VALID_SPECIMEN_LINES, 'tesseract-mrz-local', '2020-01-15');
+  assert.deepEqual(extraction.passportIssueDate, { value: '2020-01-15', confidence: 'medium' });
+});
+
+test('mapMrzToExtractionResult never assigns high confidence to a visual issue date — it has no MRZ check digit to verify it against', () => {
+  const extraction = mapMrzToExtractionResult(parseValid(), VALID_SPECIMEN_LINES, 'tesseract-mrz-local', '2020-01-15');
+  assert.notEqual(extraction.passportIssueDate.confidence, 'high');
+});
+
+test('mapMrzToExtractionResult keeps passportIssueDate null when visualIssueDate is omitted (fully backward compatible)', () => {
+  const extraction = mapMrzToExtractionResult(parseValid(), VALID_SPECIMEN_LINES);
+  assert.deepEqual(extraction.passportIssueDate, { value: null, confidence: null });
+});
+
+test('mapMrzToExtractionResult keeps passportIssueDate null when visualIssueDate is explicitly null', () => {
+  const extraction = mapMrzToExtractionResult(parseValid(), VALID_SPECIMEN_LINES, 'tesseract-mrz-local', null);
+  assert.deepEqual(extraction.passportIssueDate, { value: null, confidence: null });
+});
+
+test('mapMrzToExtractionResult still excludes issue date from the overall-confidence rollup even when a visualIssueDate is supplied (approved design — a structural add-on should not change the local-provider confidence contract)', () => {
+  const extraction = mapMrzToExtractionResult(parseValid(), VALID_SPECIMEN_LINES, 'tesseract-mrz-local', '2020-01-15');
+  assert.notEqual(extraction.overallConfidence, 'low');
+});

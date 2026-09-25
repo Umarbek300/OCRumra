@@ -35,10 +35,21 @@ export async function splitLineOcr(
     deps.cropRegion(imageBuffer, top + halfHeight, height - halfHeight),
   ]);
 
-  const [topText, bottomText] = await Promise.all([
+  // Promise.allSettled (not Promise.all): the top/bottom OCR subprocesses
+  // are still launched concurrently, but one half's Tesseract process
+  // crashing (e.g. a SIGFPE seen in production on certain crops at --psm 7)
+  // must never discard the other half's already-computed result, and must
+  // never make this function reject. A crashed/failed half's text becomes
+  // '' — identical in shape to Tesseract legitimately reading no
+  // recognizable text, which parseAndValidateMrz already rejects without
+  // any special-casing.
+  const [topSettled, bottomSettled] = await Promise.allSettled([
     deps.runTesseractOcr(topCrop, { psm: 7, oem: 1 }),
     deps.runTesseractOcr(bottomCrop, { psm: 7, oem: 1 }),
   ]);
+
+  const topText = topSettled.status === 'fulfilled' ? topSettled.value : '';
+  const bottomText = bottomSettled.status === 'fulfilled' ? bottomSettled.value : '';
 
   return [normalizeMrzLineLength(cleanSingleLine(topText)), normalizeMrzLineLength(cleanSingleLine(bottomText))];
 }

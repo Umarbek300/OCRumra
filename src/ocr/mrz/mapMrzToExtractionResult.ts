@@ -77,7 +77,12 @@ function splitGivenNames(rawFirstName: string | null): { firstName: string | nul
  * needs to know which provider ran. Every value is either something the
  * MRZ actually encoded, or null — nothing is invented.
  */
-export function mapMrzToExtractionResult(result: ParseResult, rawMrzLines: readonly string[]): PassportExtractionResult {
+export function mapMrzToExtractionResult(
+  result: ParseResult,
+  rawMrzLines: readonly string[],
+  model: string = LOCAL_PROVIDER_MODEL,
+  visualIssueDate: string | null = null,
+): PassportExtractionResult {
   const { fields, details, valid: overallValid } = result;
   const compositeDetail = findDetail(details, 'compositeCheckDigit');
 
@@ -97,8 +102,12 @@ export function mapMrzToExtractionResult(result: ParseResult, rawMrzLines: reado
       findDetail(details, 'birthDateCheckDigit'),
       compositeDetail,
     ),
-    // Not encoded in MRZ — never guessed.
-    passportIssueDate: nullField(),
+    // Not encoded in MRZ — a caller (e.g. the Google Vision provider) may
+    // supply an already-extracted, already-validated visual-zone date
+    // instead; never invented here. No MRZ check digit exists for it, so
+    // it can only ever be 'medium' — matching the same policy
+    // localProvider.ts's enrichWithVisualIssueDate() already uses.
+    passportIssueDate: visualIssueDate !== null ? { value: visualIssueDate, confidence: 'medium' } : nullField(),
     passportExpiryDate: checksummedField(
       normalizeMrzDate(fields.expirationDate, 'expiry'),
       findDetail(details, 'expirationDateCheckDigit'),
@@ -117,7 +126,21 @@ export function mapMrzToExtractionResult(result: ParseResult, rawMrzLines: reado
 
   const overallConfidence: ConfidenceLevel = computeOverallConfidence(response, LOCAL_CRITICAL_FIELDS);
 
-  return { ...response, overallConfidence, model: LOCAL_PROVIDER_MODEL };
+  return { ...response, overallConfidence, model };
+}
+
+/**
+ * The MRZ-derived dates (dateOfBirth, passportExpiryDate) already known for
+ * this document, in ISO form, regardless of their checksum confidence —
+ * used as a safety check so a visual-zone issue-date extractor never
+ * echoes back a date that's actually the birth or expiry date under a
+ * different, mislabeled field.
+ */
+export function getKnownCriticalDates(result: ParseResult): string[] {
+  const { fields } = result;
+  return [normalizeMrzDate(fields.birthDate, 'birth'), normalizeMrzDate(fields.expirationDate, 'expiry')].filter(
+    (value): value is string => value !== null,
+  );
 }
 
 /**
@@ -126,7 +149,7 @@ export function mapMrzToExtractionResult(result: ParseResult, rawMrzLines: reado
  * null except the raw OCR text itself, which is kept for human review —
  * that's not a guess, it's exactly what was read, just flagged unreliable.
  */
-export function buildUnreadableMrzResult(rawOcrLines: readonly string[]): PassportExtractionResult {
+export function buildUnreadableMrzResult(rawOcrLines: readonly string[], model: string = LOCAL_PROVIDER_MODEL): PassportExtractionResult {
   const response: ClaudePassportResponse = {
     firstName: nullField(),
     middleName: nullField(),
@@ -141,5 +164,5 @@ export function buildUnreadableMrzResult(rawOcrLines: readonly string[]): Passpo
     issuingAuthority: nullField(),
     mrz: rawOcrLines.length > 0 ? { value: rawOcrLines.join('\n'), confidence: 'low' } : nullField(),
   };
-  return { ...response, overallConfidence: 'low', model: LOCAL_PROVIDER_MODEL };
+  return { ...response, overallConfidence: 'low', model };
 }

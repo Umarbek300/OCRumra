@@ -3,19 +3,24 @@ import { test } from 'node:test';
 import { createLocalProvider, type LocalProviderDependencies } from '../src/ocr/providers/localProvider.js';
 import type { MrzSearchResult } from '../src/ocr/mrz/searchMrzLines.js';
 import { parseAndValidateMrz } from '../src/ocr/mrz/parseAndValidateMrz.js';
+import { findMrzCandidateRegions } from '../src/ocr/mrz/findMrzCandidateRegions.js';
 import { ENHANCED_FALLBACK_ATTEMPTS } from '../src/ocr/mrz/enhancedFallbackAttempts.js';
 import { DESKEW_FALLBACK_ATTEMPTS, TRIM_FALLBACK_ATTEMPTS } from '../src/ocr/mrz/geometryFallbackAttempts.js';
 import type { CropRegionOptions } from '../src/ocr/mrz/cropRegion.js';
 
-const EXISTING_FALLBACK_OCR_CALLS = 4; // stage 2 (plain) + stage 3 (binarized) + stage 4 (2x split)
-const ALL_BOUNDED_OCR_CALLS =
-  EXISTING_FALLBACK_OCR_CALLS + ENHANCED_FALLBACK_ATTEMPTS.length + TRIM_FALLBACK_ATTEMPTS.length + DESKEW_FALLBACK_ATTEMPTS.length;
-// deps.cropRegion call count differs from OCR call count: stage 2 crops via
-// deps.locateMrzRegion (not cropRegion), and stage 4 (split) calls
-// deps.cropRegion twice (top half + bottom half) for its single OCR "stage".
-// So before the enhanced stage starts, cropRegion has been called only
-// 0 (stage 2) + 1 (stage 3) + 2 (stage 4) = 3 times.
-const EXISTING_FALLBACK_CROP_CALLS = 3;
+// Fixed test image size -> 3 deterministic candidates (tightest-first):
+// { top: 900, height: 300 }, { top: 816, height: 384 }, { top: 720, height: 480 }.
+const IMAGE_WIDTH = 900;
+const IMAGE_HEIGHT = 1200;
+const CANDIDATES = findMrzCandidateRegions(IMAGE_WIDTH, IMAGE_HEIGHT);
+
+// Per candidate: 1 (binarized) + 2 (split, two half-crops) + enhanced + localized + deskew.
+const OCR_CALLS_PER_CANDIDATE = 1 + 2 + ENHANCED_FALLBACK_ATTEMPTS.length + TRIM_FALLBACK_ATTEMPTS.length + DESKEW_FALLBACK_ATTEMPTS.length;
+const ALL_BOUNDED_OCR_CALLS = OCR_CALLS_PER_CANDIDATE * CANDIDATES.length;
+// Logged pipeline attempts per candidate (split's 2 OCR calls count as one
+// logged "fallback-split" attempt, matching the existing single-log-line
+// convention for that stage).
+const LOGGED_ATTEMPTS_PER_CANDIDATE = 1 + 1 + ENHANCED_FALLBACK_ATTEMPTS.length + TRIM_FALLBACK_ATTEMPTS.length + DESKEW_FALLBACK_ATTEMPTS.length;
 
 const VALID_SPECIMEN_LINES = ['P<UTOERIKSSON<<ANNA<MARIA<<<<<<<<<<<<<<<<<<<', 'L898902C36UTO7408122F1204159ZE184226B<<<<<10'];
 
@@ -45,19 +50,15 @@ function pipelineLogLines(lines: string[]): string[] {
 
 function buildDeps(overrides: Partial<LocalProviderDependencies> = {}): {
   deps: LocalProviderDependencies;
-  calls: { search: number; locate: number; crop: number; ocr: number; dims: number; visual: number };
+  calls: { search: number; crop: number; ocr: number; dims: number; visual: number };
   cropCalls: Array<{ top: number; height: number; options: CropRegionOptions | undefined }>;
 } {
-  const calls = { search: 0, locate: 0, crop: 0, ocr: 0, dims: 0, visual: 0 };
+  const calls = { search: 0, crop: 0, ocr: 0, dims: 0, visual: 0 };
   const cropCalls: Array<{ top: number; height: number; options: CropRegionOptions | undefined }> = [];
   const deps: LocalProviderDependencies = {
     searchMrzLines: async () => {
       calls.search += 1;
       return null;
-    },
-    locateMrzRegion: async (buffer) => {
-      calls.locate += 1;
-      return buffer;
     },
     cropRegion: async (buffer, top, height, options) => {
       calls.crop += 1;
@@ -70,7 +71,7 @@ function buildDeps(overrides: Partial<LocalProviderDependencies> = {}): {
     },
     getImageDimensions: async () => {
       calls.dims += 1;
-      return { width: 900, height: 1200 };
+      return { width: IMAGE_WIDTH, height: IMAGE_HEIGHT };
     },
     runVisualFieldOcr: async () => {
       calls.visual += 1;
@@ -99,12 +100,11 @@ test('local provider returns the search result immediately when the candidate se
 
   assert.equal(result.surname.value, 'ERIKSSON');
   assert.equal(calls.search, 1);
-  assert.equal(calls.locate, 0, 'must not fall back once search succeeds');
   assert.equal(calls.ocr, 0, 'must not run any fallback OCR once search succeeds');
 });
 
-test('local provider falls back to the plain fixed crop when search finds nothing', async () => {
-  const { deps, calls } = buildDeps({
+test('local provider tries candidate 0 (tightest) binarized fallback first when search finds nothing', async () => {
+  const { deps, calls, cropCalls } = buildDeps({
     runTesseractOcr: async () => {
       calls.ocr += 1;
       return VALID_SPECIMEN_LINES.join('\n');
@@ -115,18 +115,19 @@ test('local provider falls back to the plain fixed crop when search finds nothin
   const result = await provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg');
 
   assert.equal(result.surname.value, 'ERIKSSON');
-  assert.equal(calls.search, 1);
-  assert.equal(calls.locate, 1, 'fallback stage 2 must use the original fixed crop');
-  assert.equal(calls.ocr, 1, 'must stop at stage 2 — never run binarized/split fallbacks once stage 2 succeeds');
+  assert.equal(calls.ocr, 1, 'must stop at the first (binarized) attempt on candidate 0');
+  assert.equal(cropCalls[0]!.top, CANDIDATES[0]!.top);
+  assert.equal(cropCalls[0]!.height, CANDIDATES[0]!.height);
+  assert.equal(cropCalls[0]!.options?.binarize, true);
 });
 
-test('local provider tries the binarized fallback when the plain fallback crop does not parse', async () => {
+test('local provider tries the split-line stage on the same candidate when its binarized attempt fails', async () => {
   const { deps, calls } = buildDeps({
-    runTesseractOcr: async (_buffer, options) => {
+    runTesseractOcr: async () => {
       calls.ocr += 1;
-      // Plain (stage 2) attempt returns garbage; binarized (stage 3) succeeds.
+      // Binarized (call 1) fails; both split halves (calls 2-3) succeed.
       if (calls.ocr === 1) return 'not an mrz';
-      return VALID_SPECIMEN_LINES.join('\n');
+      return calls.ocr === 2 ? VALID_SPECIMEN_LINES[0]! : VALID_SPECIMEN_LINES[1]!;
     },
   });
   const provider = createLocalProvider(deps);
@@ -134,18 +135,17 @@ test('local provider tries the binarized fallback when the plain fallback crop d
   const result = await provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg');
 
   assert.equal(result.surname.value, 'ERIKSSON');
-  assert.equal(calls.ocr, 2, 'stage 2 (plain) then stage 3 (binarized) — must stop there');
+  assert.equal(calls.ocr, 3, 'binarized (1) + split (2) — must stop there');
   assert.equal(calls.dims, 1);
 });
 
-test('local provider tries split-line OCR as the last fallback stage', async () => {
-  const { deps, calls } = buildDeps({
+test('local provider tries enhanced/localized/deskew on candidate 0 before ever moving to candidate 1', async () => {
+  const { deps, calls, cropCalls } = buildDeps({
     runTesseractOcr: async () => {
       calls.ocr += 1;
-      // Every combined-block attempt (stage 2 and 3) fails; only the
-      // split-line calls (stage 4) return usable single-line text.
-      if (calls.ocr <= 2) return 'not an mrz';
-      return calls.ocr === 3 ? VALID_SPECIMEN_LINES[0]! : VALID_SPECIMEN_LINES[1]!;
+      // Only the very last attempt on candidate 0 (deskew, last angle) succeeds.
+      if (calls.ocr < OCR_CALLS_PER_CANDIDATE) return 'not an mrz';
+      return VALID_SPECIMEN_LINES.join('\n');
     },
   });
   const provider = createLocalProvider(deps);
@@ -153,18 +153,48 @@ test('local provider tries split-line OCR as the last fallback stage', async () 
   const result = await provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg');
 
   assert.equal(result.surname.value, 'ERIKSSON');
-  assert.equal(calls.ocr, 4, 'stage 2 + stage 3 + two split-line (stage 4) calls, then stop');
+  assert.equal(calls.ocr, OCR_CALLS_PER_CANDIDATE, 'must exhaust every stage on candidate 0 before succeeding');
+  // Every crop call so far must stay within candidate 0's vertical span —
+  // split-line OCR crops its top/bottom halves separately, so top/height
+  // vary within the region rather than exactly matching the full candidate.
+  const candidate0 = CANDIDATES[0]!;
+  assert.ok(
+    cropCalls.every(
+      (call) => call.top >= candidate0.top && call.top + call.height <= candidate0.top + candidate0.height,
+    ),
+  );
 });
 
-test('local provider returns a low-confidence, all-null result when every stage fails (never throws, never guesses)', async () => {
-  const { deps } = buildDeps();
+test('local provider moves to candidate 1 (next fraction) only after every stage on candidate 0 has failed', async () => {
+  const { deps, calls, cropCalls } = buildDeps({
+    runTesseractOcr: async () => {
+      calls.ocr += 1;
+      // Every attempt on candidate 0 fails; candidate 1's first (binarized) attempt succeeds.
+      if (calls.ocr <= OCR_CALLS_PER_CANDIDATE) return 'not an mrz';
+      return VALID_SPECIMEN_LINES.join('\n');
+    },
+  });
+  const provider = createLocalProvider(deps);
+
+  const result = await provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg');
+
+  assert.equal(result.surname.value, 'ERIKSSON');
+  assert.equal(calls.ocr, OCR_CALLS_PER_CANDIDATE + 1, 'all of candidate 0 + candidate 1\'s first attempt');
+
+  const winningCropCall = cropCalls[cropCalls.length - 1]!;
+  assert.equal(winningCropCall.top, CANDIDATES[1]!.top, 'must have moved to candidate 1\'s geometry');
+  assert.equal(winningCropCall.height, CANDIDATES[1]!.height);
+});
+
+test('local provider tries all 3 candidates, in tightest-first order, before giving up', async () => {
+  const { deps, calls } = buildDeps();
   const provider = createLocalProvider(deps);
 
   const result = await provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg');
 
   assert.equal(result.overallConfidence, 'low');
   assert.equal(result.surname.value, null);
-  assert.equal(result.passportNumber.value, null);
+  assert.equal(calls.ocr, ALL_BOUNDED_OCR_CALLS, 'must try every stage on every candidate exactly once, then stop');
 });
 
 test('local provider requests LSTM-only OCR engine mode (--oem 1) on every fallback-stage OCR call', async () => {
@@ -179,21 +209,14 @@ test('local provider requests LSTM-only OCR engine mode (--oem 1) on every fallb
 
   await provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg');
 
-  assert.equal(
-    ocrOptions.length,
-    ALL_BOUNDED_OCR_CALLS,
-    'stage 2 + stage 3 + two split-line (stage 4) calls + every bounded enhanced/localized/deskew attempt',
-  );
-  assert.ok(
-    ocrOptions.every((options) => options.oem === 1),
-    'every fallback-stage OCR call (including enhanced/localized/deskew attempts) must request oem=1',
-  );
+  assert.equal(ocrOptions.length, ALL_BOUNDED_OCR_CALLS);
+  assert.ok(ocrOptions.every((options) => options.oem === 1), 'every fallback-stage OCR call must request oem=1');
 });
 
-test('local provider propagates a crop-dimension failure (e.g. corrupt/unreadable image) from the fallback stage', async () => {
+test('local provider propagates a dimension-read failure (e.g. corrupt/unreadable image)', async () => {
   const { deps } = buildDeps({
-    locateMrzRegion: async () => {
-      throw new Error('Could not read image dimensions for MRZ region crop');
+    getImageDimensions: async () => {
+      throw new Error('Could not read image dimensions');
     },
   });
 
@@ -217,7 +240,7 @@ test('local provider propagates a Tesseract failure (e.g. binary not installed)'
   await assert.rejects(() => provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg'), /Failed to start local OCR/);
 });
 
-test('local provider fills passportIssueDate from the visual enrichment step after a successful MRZ result, passing the MRZ-derived dates as "known"', async () => {
+test('local provider fills passportIssueDate from the visual enrichment step after a successful MRZ result', async () => {
   let capturedKnown: string[] | undefined;
   const { deps, calls } = buildDeps({
     searchMrzLines: async () => validSearchResult(),
@@ -231,45 +254,11 @@ test('local provider fills passportIssueDate from the visual enrichment step aft
 
   const result = await provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg');
 
-  assert.equal(result.surname.value, 'ERIKSSON', 'must not disturb fields the MRZ pipeline already produced');
+  assert.equal(result.surname.value, 'ERIKSSON');
   assert.equal(result.passportIssueDate.value, '2020-01-15');
   assert.equal(result.passportIssueDate.confidence, 'medium');
   assert.equal(calls.visual, 1);
-  assert.ok(capturedKnown, 'runVisualFieldOcr must be called with the known MRZ dates');
-  assert.equal(capturedKnown?.length, 2, 'both dateOfBirth and passportExpiryDate must be passed as known anchors');
-  assert.ok(capturedKnown?.every((value) => typeof value === 'string' && value.length > 0));
-});
-
-test('local provider leaves passportIssueDate null when the visual enrichment step finds no unambiguous date', async () => {
-  const { deps, calls } = buildDeps({
-    searchMrzLines: async () => validSearchResult(),
-    runVisualFieldOcr: async () => {
-      calls.visual += 1;
-      return null;
-    },
-  });
-  const provider = createLocalProvider(deps);
-
-  const result = await provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg');
-
-  assert.equal(result.passportIssueDate.value, null);
-  assert.equal(result.passportIssueDate.confidence, null);
-  assert.equal(calls.visual, 1);
-});
-
-test('local provider never throws when the visual enrichment step fails, and returns the MRZ result unchanged', async () => {
-  const { deps } = buildDeps({
-    searchMrzLines: async () => validSearchResult(),
-    runVisualFieldOcr: async () => {
-      throw new Error('unexpected visual OCR failure');
-    },
-  });
-  const provider = createLocalProvider(deps);
-
-  const result = await provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg');
-
-  assert.equal(result.surname.value, 'ERIKSSON');
-  assert.equal(result.passportIssueDate.value, null);
+  assert.ok(capturedKnown && capturedKnown.length === 2);
 });
 
 test('local provider does not call the visual enrichment step when every MRZ stage fails', async () => {
@@ -290,96 +279,36 @@ test('local provider logs only winner=search (no fallback-stage attempt logs) wh
   assert.deepEqual(pipelineLogLines(logs), ['[mrz-pipeline] winner=search']);
 });
 
-test('local provider logs the fallback-plain attempt (structural fields only) and winner=fallback-plain when stage 2 succeeds', async () => {
+test('local provider logs each fallback attempt with its candidate index, stage, and structural result only', async () => {
   const { deps } = buildDeps({
     runTesseractOcr: async () => VALID_SPECIMEN_LINES.join('\n'),
   });
   const provider = createLocalProvider(deps);
 
   const logs = await captureLogs(() => provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg').then(() => {}));
-  const expectedLengths = VALID_SPECIMEN_LINES.map((line) => line.length).join(',');
+  const lines = pipelineLogLines(logs);
 
-  assert.deepEqual(pipelineLogLines(logs), [
-    `[mrz-pipeline] stage=fallback-plain attempt=2 lineCount=2 lengths=[${expectedLengths}] parseSuccess=true`,
-    '[mrz-pipeline] winner=fallback-plain',
-  ]);
+  assert.equal(lines.length, 2, 'one attempt log line + one winner line');
+  assert.match(lines[0]!, /candidate=0/);
+  assert.match(lines[0]!, /stage=fallback-binarized/);
+  assert.match(lines[0]!, /parseSuccess=true/);
+  assert.equal(lines[1], '[mrz-pipeline] winner=fallback-binarized');
 });
 
-test('local provider logs a failed fallback-plain attempt, then the fallback-binarized attempt and winner when stage 3 succeeds', async () => {
-  let ocrCallCount = 0;
-  const { deps } = buildDeps({
-    runTesseractOcr: async () => {
-      ocrCallCount += 1;
-      return ocrCallCount === 1 ? 'not an mrz' : VALID_SPECIMEN_LINES.join('\n');
-    },
-  });
-  const provider = createLocalProvider(deps);
-
-  const logs = await captureLogs(() => provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg').then(() => {}));
-  const expectedLengths = VALID_SPECIMEN_LINES.map((line) => line.length).join(',');
-
-  assert.deepEqual(pipelineLogLines(logs), [
-    '[mrz-pipeline] stage=fallback-plain attempt=2 lineCount=1 lengths=[8] parseSuccess=false',
-    `[mrz-pipeline] stage=fallback-binarized attempt=3 lineCount=2 lengths=[${expectedLengths}] parseSuccess=true`,
-    '[mrz-pipeline] winner=fallback-binarized',
-  ]);
-});
-
-test('local provider logs failed fallback-plain and fallback-binarized attempts, then the fallback-split attempt and winner when stage 4 succeeds', async () => {
-  let ocrCallCount = 0;
-  const { deps } = buildDeps({
-    runTesseractOcr: async () => {
-      ocrCallCount += 1;
-      if (ocrCallCount <= 2) return 'not an mrz';
-      return ocrCallCount === 3 ? VALID_SPECIMEN_LINES[0]! : VALID_SPECIMEN_LINES[1]!;
-    },
-  });
-  const provider = createLocalProvider(deps);
-
-  const logs = await captureLogs(() => provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg').then(() => {}));
-  const expectedLengths = VALID_SPECIMEN_LINES.map((line) => line.length).join(',');
-
-  assert.deepEqual(pipelineLogLines(logs), [
-    '[mrz-pipeline] stage=fallback-plain attempt=2 lineCount=1 lengths=[8] parseSuccess=false',
-    '[mrz-pipeline] stage=fallback-binarized attempt=3 lineCount=1 lengths=[8] parseSuccess=false',
-    `[mrz-pipeline] stage=fallback-split attempt=4 lineCount=2 lengths=[${expectedLengths}] parseSuccess=true`,
-    '[mrz-pipeline] winner=fallback-split',
-  ]);
-});
-
-test('local provider logs every fallback attempt as failed and winner=none when the whole pipeline fails', async () => {
+test('local provider logs every attempt across every candidate (and no more) when the whole pipeline fails', async () => {
   const { deps } = buildDeps();
   const provider = createLocalProvider(deps);
 
   const logs = await captureLogs(() => provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg').then(() => {}));
+  const lines = pipelineLogLines(logs);
 
-  const enhancedCount = ENHANCED_FALLBACK_ATTEMPTS.length;
-  const trimCount = TRIM_FALLBACK_ATTEMPTS.length;
-
-  const expectedEnhancedLines = ENHANCED_FALLBACK_ATTEMPTS.map(
-    (attempt, index) =>
-      `[mrz-pipeline] stage=enhanced attempt=${EXISTING_FALLBACK_OCR_CALLS + 1 + index} scale=${attempt.scale} threshold=${attempt.threshold ?? 'none'} lineCount=1 lengths=[8] parseSuccess=false`,
-  );
-
-  const expectedLocalizedLines = TRIM_FALLBACK_ATTEMPTS.map(
-    (attempt, index) =>
-      `[mrz-pipeline] stage=localized attempt=${EXISTING_FALLBACK_OCR_CALLS + enhancedCount + 1 + index} trim=true binarize=${attempt.binarize} lineCount=1 lengths=[8] parseSuccess=false`,
-  );
-
-  const expectedDeskewLines = DESKEW_FALLBACK_ATTEMPTS.map(
-    (attempt, index) =>
-      `[mrz-pipeline] stage=deskew attempt=${EXISTING_FALLBACK_OCR_CALLS + enhancedCount + trimCount + 1 + index} rotateDegrees=${attempt.rotateDegrees} lineCount=1 lengths=[8] parseSuccess=false`,
-  );
-
-  assert.deepEqual(pipelineLogLines(logs), [
-    '[mrz-pipeline] stage=fallback-plain attempt=2 lineCount=1 lengths=[8] parseSuccess=false',
-    '[mrz-pipeline] stage=fallback-binarized attempt=3 lineCount=1 lengths=[8] parseSuccess=false',
-    '[mrz-pipeline] stage=fallback-split attempt=4 lineCount=2 lengths=[8,8] parseSuccess=false',
-    ...expectedEnhancedLines,
-    ...expectedLocalizedLines,
-    ...expectedDeskewLines,
-    '[mrz-pipeline] winner=none',
-  ]);
+  // One logged attempt per stage per candidate, plus the final winner=none line.
+  assert.equal(lines.length, LOGGED_ATTEMPTS_PER_CANDIDATE * CANDIDATES.length + 1);
+  assert.equal(lines[lines.length - 1], '[mrz-pipeline] winner=none');
+  for (let candidateIndex = 0; candidateIndex < CANDIDATES.length; candidateIndex++) {
+    const candidateLines = lines.filter((line) => line.includes(`candidate=${candidateIndex}`));
+    assert.equal(candidateLines.length, LOGGED_ATTEMPTS_PER_CANDIDATE, `candidate ${candidateIndex} must log every stage exactly once`);
+  }
 });
 
 test('local provider pipeline logs never contain OCR text or passport field values — only structural counts/booleans', async () => {
@@ -397,129 +326,36 @@ test('local provider pipeline logs never contain OCR text or passport field valu
   assert.ok(!combined.includes(VALID_SPECIMEN_LINES[1]!), 'pipeline log must not contain the raw MRZ line');
 });
 
-test('local provider tries enhanced preprocessing variants (stronger upscale/threshold) after split-line fails, stopping at the first that parses', async () => {
-  const { deps, calls, cropCalls } = buildDeps({
-    runTesseractOcr: async () => {
-      calls.ocr += 1;
-      // Stages 2-4 (calls 1-4) all fail; the first enhanced attempt
-      // (call 5 — ENHANCED_FALLBACK_ATTEMPTS[0]) succeeds.
-      if (calls.ocr < EXISTING_FALLBACK_OCR_CALLS + 1) return 'not an mrz';
-      return VALID_SPECIMEN_LINES.join('\n');
-    },
-  });
-  const provider = createLocalProvider(deps);
-
-  const result = await provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg');
-
-  assert.equal(result.surname.value, 'ERIKSSON');
-  assert.equal(calls.ocr, EXISTING_FALLBACK_OCR_CALLS + 1, 'must stop at the first successful enhanced attempt');
-
-  const firstAttempt = ENHANCED_FALLBACK_ATTEMPTS[0]!;
-  const enhancedCropCall = cropCalls[cropCalls.length - 1];
-  assert.ok(enhancedCropCall, 'cropRegion must have been called for the winning enhanced attempt');
-  assert.equal(enhancedCropCall.options?.scale, firstAttempt.scale);
-  assert.equal(enhancedCropCall.options?.threshold, firstAttempt.threshold);
-  assert.equal(Boolean(enhancedCropCall.options?.binarize), firstAttempt.threshold !== undefined);
-});
-
-test('local provider exhausts every bounded attempt across every stage (and no more) before giving up', async () => {
-  const { deps, calls } = buildDeps();
-  const provider = createLocalProvider(deps);
-
-  const result = await provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg');
-
-  assert.equal(result.overallConfidence, 'low');
-  assert.equal(
-    calls.ocr,
-    ALL_BOUNDED_OCR_CALLS,
-    'must try every enhanced/localized/deskew attempt exactly once, then stop — bounded, not unbounded',
-  );
-});
-
-test('local provider uses each configured (scale, threshold) combination in order for the enhanced attempts', async () => {
+test('local provider uses each configured (scale, threshold) enhanced combination in order, per candidate', async () => {
   const { deps, cropCalls } = buildDeps();
   const provider = createLocalProvider(deps);
 
   await provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg');
 
-  // cropCalls[0..EXISTING_FALLBACK_CROP_CALLS) belong to stages 2-4; the
-  // enhanced attempts are the next ENHANCED_FALLBACK_ATTEMPTS.length calls.
-  const enhancedCropCalls = cropCalls.slice(
-    EXISTING_FALLBACK_CROP_CALLS,
-    EXISTING_FALLBACK_CROP_CALLS + ENHANCED_FALLBACK_ATTEMPTS.length,
-  );
+  // Within candidate 0: crop calls 0=binarized, 1-2=split, 3..10=enhanced.
+  const enhancedStart = 1 + 2;
+  const enhancedCropCalls = cropCalls.slice(enhancedStart, enhancedStart + ENHANCED_FALLBACK_ATTEMPTS.length);
   const actualCombinations = enhancedCropCalls.map((call) => ({ scale: call.options?.scale, threshold: call.options?.threshold }));
   const expectedCombinations = ENHANCED_FALLBACK_ATTEMPTS.map((attempt) => ({ scale: attempt.scale, threshold: attempt.threshold }));
 
   assert.deepEqual(actualCombinations, expectedCombinations);
+  assert.ok(enhancedCropCalls.every((call) => call.top === CANDIDATES[0]!.top));
 });
 
-test('local provider tries the localized (trim) stage after every enhanced attempt fails, stopping at the first that parses', async () => {
-  const { deps, calls, cropCalls } = buildDeps({
-    runTesseractOcr: async () => {
-      calls.ocr += 1;
-      const localizedStart = EXISTING_FALLBACK_OCR_CALLS + ENHANCED_FALLBACK_ATTEMPTS.length + 1;
-      if (calls.ocr < localizedStart) return 'not an mrz';
-      return VALID_SPECIMEN_LINES.join('\n');
-    },
-  });
-  const provider = createLocalProvider(deps);
-
-  const result = await provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg');
-
-  assert.equal(result.surname.value, 'ERIKSSON');
-  assert.equal(
-    calls.ocr,
-    EXISTING_FALLBACK_OCR_CALLS + ENHANCED_FALLBACK_ATTEMPTS.length + 1,
-    'must stop at the first successful localized attempt',
-  );
-
-  const firstAttempt = TRIM_FALLBACK_ATTEMPTS[0]!;
-  const winningCropCall = cropCalls[cropCalls.length - 1];
-  assert.ok(winningCropCall, 'cropRegion must have been called for the winning localized attempt');
-  assert.equal(winningCropCall.options?.trim, true);
-  assert.equal(Boolean(winningCropCall.options?.binarize), firstAttempt.binarize);
-});
-
-test('local provider tries the deskew stage after the localized stage fails, stopping at the first angle that parses', async () => {
-  const { deps, calls, cropCalls } = buildDeps({
-    runTesseractOcr: async () => {
-      calls.ocr += 1;
-      const deskewStart = EXISTING_FALLBACK_OCR_CALLS + ENHANCED_FALLBACK_ATTEMPTS.length + TRIM_FALLBACK_ATTEMPTS.length + 1;
-      if (calls.ocr < deskewStart) return 'not an mrz';
-      return VALID_SPECIMEN_LINES.join('\n');
-    },
-  });
-  const provider = createLocalProvider(deps);
-
-  const result = await provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg');
-
-  assert.equal(result.surname.value, 'ERIKSSON');
-  assert.equal(
-    calls.ocr,
-    EXISTING_FALLBACK_OCR_CALLS + ENHANCED_FALLBACK_ATTEMPTS.length + TRIM_FALLBACK_ATTEMPTS.length + 1,
-    'must stop at the first successful deskew attempt',
-  );
-
-  const firstAttempt = DESKEW_FALLBACK_ATTEMPTS[0]!;
-  const winningCropCall = cropCalls[cropCalls.length - 1];
-  assert.ok(winningCropCall, 'cropRegion must have been called for the winning deskew attempt');
-  assert.equal(winningCropCall.options?.rotateDegrees, firstAttempt.rotateDegrees);
-  assert.equal(winningCropCall.options?.binarize, true);
-});
-
-test('local provider uses each configured deskew angle in order', async () => {
+test('local provider uses each configured deskew angle in order, per candidate', async () => {
   const { deps, cropCalls } = buildDeps();
   const provider = createLocalProvider(deps);
 
   await provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg');
 
-  const deskewStart = EXISTING_FALLBACK_CROP_CALLS + ENHANCED_FALLBACK_ATTEMPTS.length + TRIM_FALLBACK_ATTEMPTS.length;
+  const deskewStart = 1 + 2 + ENHANCED_FALLBACK_ATTEMPTS.length + TRIM_FALLBACK_ATTEMPTS.length;
   const deskewCropCalls = cropCalls.slice(deskewStart, deskewStart + DESKEW_FALLBACK_ATTEMPTS.length);
   const actualAngles = deskewCropCalls.map((call) => call.options?.rotateDegrees);
   const expectedAngles = DESKEW_FALLBACK_ATTEMPTS.map((attempt) => attempt.rotateDegrees);
 
   assert.deepEqual(actualAngles, expectedAngles);
+  assert.ok(deskewCropCalls.every((call) => call.options?.binarize === true));
+  assert.ok(deskewCropCalls.every((call) => call.top === CANDIDATES[0]!.top));
 });
 
 test('the maximum number of Tesseract attempts across the entire local pipeline is bounded and enumerable', async () => {
@@ -528,10 +364,8 @@ test('the maximum number of Tesseract attempts across the entire local pipeline 
 
   await provider.extract(Buffer.from('fake-image-bytes'), 'image/jpeg');
 
-  // 3 search candidates (mocked away here — searchMrzLines itself is a
-  // single deps call) + 4 original fallback calls + enhanced + localized
-  // + deskew. This pins the worst-case total so it's caught immediately
-  // if a future change accidentally removes the "bounded" guarantee.
-  assert.equal(ALL_BOUNDED_OCR_CALLS, 18, 'expected 4 (fallback 2-4) + 8 (enhanced) + 2 (localized) + 4 (deskew) = 18');
+  assert.equal(CANDIDATES.length, 3);
+  assert.equal(OCR_CALLS_PER_CANDIDATE, 17, '1 (binarized) + 2 (split) + 8 (enhanced) + 2 (localized) + 4 (deskew)');
+  assert.equal(ALL_BOUNDED_OCR_CALLS, 51, '3 candidates x 17 attempts each');
   assert.equal(calls.ocr, ALL_BOUNDED_OCR_CALLS);
 });

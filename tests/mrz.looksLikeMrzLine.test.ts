@@ -19,9 +19,9 @@ test('looksLikeMrzLine rejects characters outside the MRZ alphabet', () => {
   assert.equal(looksLikeMrzLine(withLowercase), false);
 });
 
-test('looksLikeMrzLine rejects a line with no filler at all (real MRZ always has padding)', () => {
+test('looksLikeMrzLine accepts a well-formed 44-char MRZ-alphabet line with no filler at all (a valid TD3 line 2 whose optional personal-number field is fully used, e.g. real message 270/271)', () => {
   const noFiller = 'A'.repeat(44);
-  assert.equal(looksLikeMrzLine(noFiller), false);
+  assert.equal(looksLikeMrzLine(noFiller), true);
 });
 
 test('looksLikeMrzLine respects a custom expected length', () => {

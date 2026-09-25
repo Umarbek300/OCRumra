@@ -39,6 +39,11 @@ test('parseEnv rejects an empty TELEGRAM_BOT_TOKEN', () => {
   assert.throws(() => parseEnv({ ...VALID_BASE, TELEGRAM_BOT_TOKEN: '' }));
 });
 
+test('parseEnv accepts OCR_PROVIDER=google-vision', () => {
+  const env = parseEnv({ ...VALID_BASE, OCR_PROVIDER: 'google-vision' });
+  assert.equal(env.OCR_PROVIDER, 'google-vision');
+});
+
 test('parseEnv rejects an invalid NODE_ENV', () => {
   assert.throws(() => parseEnv({ ...VALID_BASE, NODE_ENV: 'staging' }));
 });

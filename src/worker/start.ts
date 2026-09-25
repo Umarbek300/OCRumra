@@ -1,7 +1,7 @@
 import { pool } from '../db/pool.js';
 import { PASSPORT_PROCESSING_QUEUE } from '../queue/passportProcessingQueue.js';
 import { ensureRedisConnected, redisClient } from '../queue/redis.js';
-import { runWorkerLoop } from './passportWorker.js';
+import { recoverAndRequeueStaleProcessingJobs, runWorkerLoop } from './passportWorker.js';
 
 let shuttingDown = false;
 
@@ -16,6 +16,7 @@ process.on('SIGTERM', () => requestShutdown('SIGTERM'));
 async function main(): Promise<void> {
   await ensureRedisConnected();
   console.log(`[passport-worker] connected to Redis, polling queue "${PASSPORT_PROCESSING_QUEUE}"`);
+  await recoverAndRequeueStaleProcessingJobs();
   await runWorkerLoop(() => !shuttingDown);
 }
 
