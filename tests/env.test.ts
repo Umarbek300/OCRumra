@@ -62,3 +62,30 @@ test('parseEnv rejects a non-positive GOOGLE_SHEETS_API_TIMEOUT_MS', () => {
   assert.throws(() => parseEnv({ ...VALID_BASE, GOOGLE_SHEETS_API_TIMEOUT_MS: '0' }));
   assert.throws(() => parseEnv({ ...VALID_BASE, GOOGLE_SHEETS_API_TIMEOUT_MS: '-1000' }));
 });
+
+test('parseEnv defaults SHEETS_SYNC_ENABLED to false when unset', () => {
+  const env = parseEnv({ ...VALID_BASE });
+  assert.equal(env.SHEETS_SYNC_ENABLED, false);
+});
+
+test('parseEnv parses SHEETS_SYNC_ENABLED="false" as false', () => {
+  // Regression test: z.coerce.boolean() would have parsed this non-empty
+  // string as `true` via JS's Boolean("false") === true — exactly the bug
+  // that let this flag secretly be `true` in production despite `.env`
+  // literally saying SHEETS_SYNC_ENABLED=false.
+  const env = parseEnv({ ...VALID_BASE, SHEETS_SYNC_ENABLED: 'false' });
+  assert.equal(env.SHEETS_SYNC_ENABLED, false);
+});
+
+test('parseEnv parses SHEETS_SYNC_ENABLED="true" as true', () => {
+  const env = parseEnv({ ...VALID_BASE, SHEETS_SYNC_ENABLED: 'true' });
+  assert.equal(env.SHEETS_SYNC_ENABLED, true);
+});
+
+test('parseEnv rejects an invalid SHEETS_SYNC_ENABLED value', () => {
+  assert.throws(() => parseEnv({ ...VALID_BASE, SHEETS_SYNC_ENABLED: 'yes' }));
+  assert.throws(() => parseEnv({ ...VALID_BASE, SHEETS_SYNC_ENABLED: 'no' }));
+  assert.throws(() => parseEnv({ ...VALID_BASE, SHEETS_SYNC_ENABLED: '1' }));
+  assert.throws(() => parseEnv({ ...VALID_BASE, SHEETS_SYNC_ENABLED: '0' }));
+  assert.throws(() => parseEnv({ ...VALID_BASE, SHEETS_SYNC_ENABLED: 'abc' }));
+});

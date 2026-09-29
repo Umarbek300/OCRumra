@@ -1,15 +1,28 @@
 import { findAgentById } from '../db/repositories/agents.repo.js';
+import { computeGroupGenderStats } from '../db/repositories/groupGenderStats.repo.js';
+import { findGroupById } from '../db/repositories/groups.repo.js';
+import {
+  findActiveCanonicalLink,
+  findPassportMessageLinkByTelegramMessageId,
+} from '../db/repositories/passportMessageLinks.repo.js';
 import { findPassportOcrResultByTelegramMessageId } from '../db/repositories/passportOcrResult.repo.js';
 import {
+  clearSheetSyncConfirmationSent,
   MAX_SHEET_SYNC_ATTEMPTS,
+  markSheetSyncConfirmationSent,
   markSheetSyncFailed,
   markSheetSyncStarted,
   markSheetSyncSynced,
 } from '../db/repositories/sheetSyncQueue.repo.js';
 import { findTelegramMessageById } from '../db/repositories/telegramMessages.repo.js';
+import { buildConfirmationMessage } from '../telegram/buildConfirmationMessage.js';
+import { calculateBalance, formatMoneyForSheet, parsePackageAndDeposit } from '../telegram/parsePackageDeposit.js';
+import { sendConfirmationMessage } from '../telegram/sendConfirmationMessage.js';
+import { buildGenderSummaryBlock } from './buildGenderSummaryBlock.js';
 import { buildSheetRow } from './buildSheetRow.js';
 import { ensureGroupSheet } from './ensureGroupSheet.js';
 import { upsertRowInSheet } from './upsertRowInSheet.js';
+import { writeGroupGenderSummary } from './writeGroupGenderSummary.js';
 
 const MAX_ERROR_MESSAGE_LENGTH = 300;
 
@@ -28,15 +41,65 @@ export function computeSheetSyncBackoff(attempts: number, now: () => Date = () =
   return new Date(now().getTime() + minutes * 60_000);
 }
 
+interface SendPassportConfirmationInput {
+  sheetSyncQueueId: string;
+  telegramChatId: string;
+  ocrResult: Parameters<typeof buildConfirmationMessage>[0]['ocrResult'];
+  agent: Parameters<typeof buildConfirmationMessage>[0]['agent'];
+  packageText: string;
+  depositText: string;
+  balanceText: string;
+  sheetRowNumber: number;
+}
+
+/**
+ * Claims the confirmation-send right (at-most-once, see
+ * markSheetSyncConfirmationSent), sends the message, and rolls the claim
+ * back if the send itself throws so a later attempt can still try. A null
+ * claim result (someone already sent it) is a normal, silent no-op — not an
+ * error.
+ */
+async function sendPassportConfirmation(input: SendPassportConfirmationInput, deps: SyncPassportRowToSheetDependencies): Promise<void> {
+  const claimed = await deps.markConfirmationSent(input.sheetSyncQueueId);
+  if (!claimed) {
+    return;
+  }
+
+  const text = buildConfirmationMessage({
+    ocrResult: input.ocrResult,
+    agent: input.agent,
+    packageText: input.packageText,
+    depositText: input.depositText,
+    balanceText: input.balanceText,
+    sheetRowNumber: input.sheetRowNumber,
+  });
+
+  try {
+    await deps.sendConfirmation(input.telegramChatId, text);
+  } catch (error) {
+    await deps.clearConfirmationSent(input.sheetSyncQueueId);
+    throw error;
+  }
+}
+
 export interface SyncPassportRowToSheetDependencies {
   markStarted: typeof markSheetSyncStarted;
   markSynced: typeof markSheetSyncSynced;
   markFailed: typeof markSheetSyncFailed;
+  markConfirmationSent: typeof markSheetSyncConfirmationSent;
+  clearConfirmationSent: typeof clearSheetSyncConfirmationSent;
+  sendConfirmation: typeof sendConfirmationMessage;
   findTelegramMessage: typeof findTelegramMessageById;
   findOcrResult: typeof findPassportOcrResultByTelegramMessageId;
   findAgent: typeof findAgentById;
+  findGroup: typeof findGroupById;
   ensureSheet: typeof ensureGroupSheet;
   upsertRow: typeof upsertRowInSheet;
+  computeGenderStats: typeof computeGroupGenderStats;
+  writeGenderSummary: typeof writeGroupGenderSummary;
+  /** Duplicate-passport canonical resolution (see src/duplicates/). A message with no link (predates the feature, or OCR found no identity data) resolves to itself — pre-feature behavior is exactly preserved. */
+  findMessageLink: typeof findPassportMessageLinkByTelegramMessageId;
+  findActiveCanonicalLink: typeof findActiveCanonicalLink;
   now: () => Date;
 }
 
@@ -44,13 +107,50 @@ const defaultDependencies: SyncPassportRowToSheetDependencies = {
   markStarted: markSheetSyncStarted,
   markSynced: markSheetSyncSynced,
   markFailed: markSheetSyncFailed,
+  markConfirmationSent: markSheetSyncConfirmationSent,
+  clearConfirmationSent: clearSheetSyncConfirmationSent,
+  sendConfirmation: sendConfirmationMessage,
   findTelegramMessage: findTelegramMessageById,
   findOcrResult: findPassportOcrResultByTelegramMessageId,
   findAgent: findAgentById,
+  findGroup: findGroupById,
   ensureSheet: ensureGroupSheet,
   upsertRow: upsertRowInSheet,
+  computeGenderStats: computeGroupGenderStats,
+  writeGenderSummary: writeGroupGenderSummary,
+  findMessageLink: findPassportMessageLinkByTelegramMessageId,
+  findActiveCanonicalLink,
   now: () => new Date(),
 };
+
+/**
+ * Resolves which telegram_message's data should actually drive this
+ * (identity, group)'s Sheet row — design spec §J: an AUTO_MERGEd duplicate
+ * must update the EXISTING canonical row, never append its own. A message
+ * with no passport_message_links row at all (predates this feature, or OCR
+ * found no usable passport number/DOB) resolves to itself, leaving every
+ * pre-existing sync exactly as it always was.
+ */
+async function resolveCanonicalTelegramMessageId(
+  telegramMessageId: string,
+  groupId: string,
+  deps: Pick<SyncPassportRowToSheetDependencies, 'findMessageLink' | 'findActiveCanonicalLink'>,
+): Promise<string> {
+  const link = await deps.findMessageLink(telegramMessageId);
+  if (!link) {
+    return telegramMessageId;
+  }
+  const canonical = await deps.findActiveCanonicalLink(link.passportIdentityId, groupId);
+  if (!canonical) {
+    // No active canonical currently exists for this (identity, group) --
+    // this link's own role may itself be canonical, or a reassignment
+    // hasn't landed yet. Either way, syncing this message directly is safe:
+    // upsertRowInSheet's own column-M lookup makes this an ordinary write,
+    // never a destructive one.
+    return telegramMessageId;
+  }
+  return canonical.telegramMessageId;
+}
 
 /**
  * Processes one sheet_sync_queue job end to end: claim -> telegram_message
@@ -81,20 +181,98 @@ export async function syncPassportRowToSheet(
       throw new Error(`telegram_message ${claimed.telegramMessageId} has no group_id — cannot determine which sheet to sync to`);
     }
 
-    const ocrResult = await deps.findOcrResult(claimed.telegramMessageId);
-    if (!ocrResult) {
-      throw new Error(`no passport_ocr_results row for telegram_message ${claimed.telegramMessageId} — nothing to sync yet`);
+    // Duplicate-passport resolution: a message that AUTO_MERGEd into an
+    // existing (identity, group) canonical must update THAT row, never
+    // create its own — see resolveCanonicalTelegramMessageId's doc comment.
+    // A message with no link at all (pre-feature, or no usable identity
+    // data) resolves to itself, so every pre-existing sync is unaffected.
+    const canonicalTelegramMessageId = await resolveCanonicalTelegramMessageId(
+      claimed.telegramMessageId,
+      telegramMessage.groupId,
+      deps,
+    );
+    const canonicalTelegramMessage =
+      canonicalTelegramMessageId === claimed.telegramMessageId
+        ? telegramMessage
+        : await deps.findTelegramMessage(canonicalTelegramMessageId);
+    if (!canonicalTelegramMessage) {
+      throw new Error(`canonical telegram_message ${canonicalTelegramMessageId} not found`);
     }
 
-    const agent = telegramMessage.agentId ? await deps.findAgent(telegramMessage.agentId) : null;
+    const ocrResult = await deps.findOcrResult(canonicalTelegramMessageId);
+    if (!ocrResult) {
+      throw new Error(`no passport_ocr_results row for telegram_message ${canonicalTelegramMessageId} — nothing to sync yet`);
+    }
+
+    const agent = canonicalTelegramMessage.agentId ? await deps.findAgent(canonicalTelegramMessage.agentId) : null;
 
     const { spreadsheetId } = await deps.ensureSheet(telegramMessage.groupId);
 
-    const row = buildSheetRow({ ocrResult, agent });
-    const result = await deps.upsertRow({ spreadsheetId, telegramMessageId: claimed.telegramMessageId, row });
+    // Package/Deposit/Balance come ONLY from the Telegram message's own
+    // caption text — never from OCR/passport data (see
+    // parsePackageDeposit.ts's own doc comment). A caption with no
+    // recognizable amount, or no caption at all, yields '' for that column,
+    // same as this pipeline's original always-blank behavior. Sourced from
+    // the CANONICAL message, so a Sheet row's content is always driven by
+    // one single, consistent source, never a mix of two messages' data.
+    const { packageAmount, depositAmount } = parsePackageAndDeposit(canonicalTelegramMessage.captionText);
+    const balance = calculateBalance(packageAmount, depositAmount);
+    const packageText = packageAmount ? formatMoneyForSheet(packageAmount) : '';
+    const depositText = depositAmount ? formatMoneyForSheet(depositAmount) : '';
+    const balanceText = balance ? formatMoneyForSheet(balance) : '';
+
+    const row = buildSheetRow({ ocrResult, agent, packageText, depositText, balanceText });
+    const result = await deps.upsertRow({ spreadsheetId, telegramMessageId: canonicalTelegramMessageId, row });
 
     await deps.markSynced(claimed.id, result.rowNumber);
     console.log(`[sheets-sync] job ${claimed.id} synced (${result.action}, sheet=${spreadsheetId}, row=${result.rowNumber})`);
+
+    // The group's gender summary (O1:P5, see genderSummaryLayout.ts) is
+    // always recomputed fresh from the DB and fully overwritten here — see
+    // groupGenderStats.repo.ts's own doc comment for why this is correct
+    // on every retry/duplicate/later-corrected-OCR-result without any
+    // separate "already counted" bookkeeping. Isolated in its own
+    // try/catch for the same reason as the confirmation below: a job that
+    // already succeeded in the sheet must never be flipped back to
+    // status='failed' just because this secondary summary write failed.
+    try {
+      const group = await deps.findGroup(telegramMessage.groupId);
+      if (!group) {
+        throw new Error(`group ${telegramMessage.groupId} not found while writing its gender summary`);
+      }
+      const stats = await deps.computeGenderStats(telegramMessage.groupId);
+      const summaryRows = buildGenderSummaryBlock(group, stats);
+      await deps.writeGenderSummary(spreadsheetId, summaryRows);
+    } catch (genderSummaryError) {
+      console.error(
+        `[sheets-sync] job ${claimed.id} synced successfully but the group gender summary update failed: ${sanitizeErrorMessage(genderSummaryError)}`,
+      );
+    }
+
+    // Confirmation is sent strictly after the sheet write is durably marked
+    // synced above, and its own failures are caught here rather than by the
+    // outer catch: a job that already succeeded in the sheet must never be
+    // flipped back to status='failed' (and retried/re-upserted) just because
+    // the *notification* about that success didn't go through.
+    try {
+      await sendPassportConfirmation(
+        {
+          sheetSyncQueueId: claimed.id,
+          telegramChatId: telegramMessage.telegramChatId,
+          ocrResult,
+          agent,
+          packageText,
+          depositText,
+          balanceText,
+          sheetRowNumber: result.rowNumber,
+        },
+        deps,
+      );
+    } catch (confirmationError) {
+      console.error(
+        `[sheets-sync] job ${claimed.id} synced successfully but confirmation send failed: ${sanitizeErrorMessage(confirmationError)}`,
+      );
+    }
   } catch (error) {
     const message = sanitizeErrorMessage(error);
     const nextAttemptAt = computeSheetSyncBackoff(claimed.attempts, deps.now);

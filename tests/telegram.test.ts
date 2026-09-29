@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 import { findPassportProcessingByTelegramMessageId } from '../src/db/repositories/passportProcessing.repo.js';
 import { pool } from '../src/db/pool.js';
+import { findGroupByTelegramChatId } from '../src/db/repositories/groups.repo.js';
 import { listLinkedMessages, listUnlinkedMessages } from '../src/db/repositories/telegramMessages.repo.js';
 import { PASSPORT_PROCESSING_QUEUE, dequeuePassportProcessing } from '../src/queue/passportProcessingQueue.js';
 import { ensureRedisConnected, redisClient } from '../src/queue/redis.js';
@@ -73,6 +74,8 @@ test('links a photo message when the chat and sender are both registered', async
       timestamp: new Date(),
       photoFileId: 'FILE_LINKED',
       source: 'photo',
+      captionText: null,
+      mediaGroupId: null,
     });
     assert.deepEqual(result, {
       outcome: 'inserted',
@@ -103,6 +106,8 @@ test('links a document-sourced message and records source=document, unaffected b
       timestamp: new Date(),
       photoFileId: 'FILE_DOCUMENT',
       source: 'document',
+      captionText: null,
+      mediaGroupId: null,
     });
     assert.deepEqual(result, {
       outcome: 'inserted',
@@ -134,6 +139,8 @@ test('records an unlinked message when the chat is not a registered Group', asyn
       timestamp: new Date(),
       photoFileId: 'FILE_UNKNOWN_GROUP',
       source: 'photo',
+      captionText: null,
+      mediaGroupId: null,
     });
     assert.deepEqual(result, {
       outcome: 'inserted',
@@ -168,6 +175,8 @@ test('records an unlinked message when the sender is not a registered Agent', as
       timestamp: new Date(),
       photoFileId: 'FILE_UNKNOWN_AGENT',
       source: 'photo',
+      captionText: null,
+      mediaGroupId: null,
     });
     assert.deepEqual(result, {
       outcome: 'inserted',
@@ -191,6 +200,146 @@ test('records an unlinked message when the sender is not a registered Agent', as
   }
 });
 
+test('auto-registers a new group from the chat title and links the message, when the title confidently parses', async () => {
+  const chatId = uniqueChatId();
+  const senderId = uniqueUserId();
+  const agentId = await createAgent(senderId);
+  let groupId: string | null = null;
+  try {
+    const result = await ingestPhotoMessage({
+      chatId,
+      messageId: uniqueMessageId(),
+      senderUserId: senderId,
+      senderDisplayName: 'Test Sender',
+      timestamp: new Date(),
+      photoFileId: 'FILE_AUTO_REGISTER',
+      source: 'photo',
+      captionText: null,
+      mediaGroupId: null,
+      chatTitle: '5 October 2026',
+    });
+    assert.deepEqual(result, {
+      outcome: 'inserted',
+      groupLinked: true,
+      agentLinked: true,
+      processingEnqueued: true,
+    });
+
+    const group = await findGroupByTelegramChatId(chatId);
+    assert.ok(group);
+    groupId = group.id;
+    assert.equal(group.name, '5 October 2026');
+    assert.equal(group.departureDate, '2026-10-05');
+  } finally {
+    await deleteFixtures(chatId, groupId, agentId);
+  }
+});
+
+test('an unparseable chat title never auto-creates a group -- message stays unlinked exactly like the no-title case', async () => {
+  const chatId = uniqueChatId();
+  const senderId = uniqueUserId();
+  const agentId = await createAgent(senderId);
+  try {
+    const result = await ingestPhotoMessage({
+      chatId,
+      messageId: uniqueMessageId(),
+      senderUserId: senderId,
+      senderDisplayName: 'Test Sender',
+      timestamp: new Date(),
+      photoFileId: 'FILE_UNPARSEABLE_TITLE',
+      source: 'photo',
+      captionText: null,
+      mediaGroupId: null,
+      chatTitle: 'Some Random Chat Name',
+    });
+    assert.deepEqual(result, {
+      outcome: 'inserted',
+      groupLinked: false,
+      agentLinked: true,
+      processingEnqueued: false,
+    });
+
+    assert.equal(await findGroupByTelegramChatId(chatId), null, 'no group was ever created from an unparseable title');
+  } finally {
+    await deleteFixtures(chatId, null, agentId);
+  }
+});
+
+test('omitting chatTitle entirely preserves the exact pre-existing unlinked behavior', async () => {
+  const chatId = uniqueChatId();
+  const senderId = uniqueUserId();
+  const agentId = await createAgent(senderId);
+  try {
+    const result = await ingestPhotoMessage({
+      chatId,
+      messageId: uniqueMessageId(),
+      senderUserId: senderId,
+      senderDisplayName: 'Test Sender',
+      timestamp: new Date(),
+      photoFileId: 'FILE_NO_TITLE_FIELD',
+      source: 'photo',
+      captionText: null,
+      mediaGroupId: null,
+      // chatTitle deliberately omitted
+    });
+    assert.deepEqual(result, {
+      outcome: 'inserted',
+      groupLinked: false,
+      agentLinked: true,
+      processingEnqueued: false,
+    });
+  } finally {
+    await deleteFixtures(chatId, null, agentId);
+  }
+});
+
+test('a second message in an already auto-registered chat links straight away, without creating a second group', async () => {
+  const chatId = uniqueChatId();
+  const senderId = uniqueUserId();
+  const agentId = await createAgent(senderId);
+  let groupId: string | null = null;
+  try {
+    const first = await ingestPhotoMessage({
+      chatId,
+      messageId: uniqueMessageId(),
+      senderUserId: senderId,
+      senderDisplayName: 'Test Sender',
+      timestamp: new Date(),
+      photoFileId: 'FILE_FIRST_AUTO',
+      source: 'photo',
+      captionText: null,
+      mediaGroupId: null,
+      chatTitle: '5 October 2026',
+    });
+    assert.equal(first.groupLinked, true);
+
+    const second = await ingestPhotoMessage({
+      chatId,
+      messageId: uniqueMessageId(),
+      senderUserId: senderId,
+      senderDisplayName: 'Test Sender',
+      timestamp: new Date(),
+      photoFileId: 'FILE_SECOND_AUTO',
+      source: 'photo',
+      captionText: null,
+      mediaGroupId: null,
+      chatTitle: '5 October 2026',
+    });
+    assert.equal(second.groupLinked, true);
+
+    const group = await findGroupByTelegramChatId(chatId);
+    assert.ok(group);
+    groupId = group.id;
+
+    const { rows } = await pool.query<{ count: number }>(`SELECT count(*)::int AS count FROM groups WHERE telegram_chat_id = $1`, [
+      chatId,
+    ]);
+    assert.equal(rows[0]?.count, 1);
+  } finally {
+    await deleteFixtures(chatId, groupId, agentId);
+  }
+});
+
 test('the same (chat, message) id is never processed into a duplicate row', async () => {
   const chatId = uniqueChatId();
   const senderId = uniqueUserId();
@@ -206,6 +355,8 @@ test('the same (chat, message) id is never processed into a duplicate row', asyn
       timestamp: new Date(),
       photoFileId: 'FILE_ORIGINAL',
       source: 'photo',
+      captionText: null,
+      mediaGroupId: null,
     });
     const second = await ingestPhotoMessage({
       chatId,
@@ -215,6 +366,8 @@ test('the same (chat, message) id is never processed into a duplicate row', asyn
       timestamp: new Date(),
       photoFileId: 'FILE_REDELIVERED',
       source: 'photo',
+      captionText: null,
+      mediaGroupId: null,
     });
 
     assert.equal(first.outcome, 'inserted');
@@ -250,6 +403,8 @@ test('listLinkedMessages and listUnlinkedMessages partition messages correctly',
       timestamp: new Date(),
       photoFileId: 'FILE_LINKED_2',
       source: 'photo',
+      captionText: null,
+      mediaGroupId: null,
     });
     await ingestPhotoMessage({
       chatId,
@@ -259,6 +414,8 @@ test('listLinkedMessages and listUnlinkedMessages partition messages correctly',
       timestamp: new Date(),
       photoFileId: 'FILE_UNLINKED_2',
       source: 'photo',
+      captionText: null,
+      mediaGroupId: null,
     });
 
     const linked = await listLinkedMessages();
@@ -287,6 +444,8 @@ test('a fully linked new message gets a passport_processing record and is pushed
       timestamp: new Date(),
       photoFileId: 'FILE_QUEUED',
       source: 'photo',
+      captionText: null,
+      mediaGroupId: null,
     });
     assert.equal(result.processingEnqueued, true);
 
@@ -324,6 +483,8 @@ test('an unlinked message does not get a passport_processing record or a queue e
       timestamp: new Date(),
       photoFileId: 'FILE_NOT_QUEUED',
       source: 'photo',
+      captionText: null,
+      mediaGroupId: null,
     });
     assert.equal(result.processingEnqueued, false);
 
@@ -341,6 +502,178 @@ test('an unlinked message does not get a passport_processing record or a queue e
     assert.equal(job, null, 'expected nothing to have been pushed onto the Redis queue');
   } finally {
     await deleteFixtures(chatId, null, agentId);
+  }
+});
+
+// --- media-group (album) caption correlation ---
+// Telegram attaches a caption to only ONE message of an album; every
+// sibling photo/document arrives with caption = null even when the
+// operator wrote one caption for the whole album.
+
+test('a message with no caption of its own borrows an already-recorded sibling album message\'s caption', async () => {
+  const chatId = uniqueChatId();
+  const senderId = uniqueUserId();
+  const groupId = await createGroup(chatId);
+  const agentId = await createAgent(senderId);
+  const mediaGroupId = `album-${uniqueMessageId()}`;
+  try {
+    // First photo in the album: carries the caption.
+    await ingestPhotoMessage({
+      chatId,
+      messageId: uniqueMessageId(),
+      senderUserId: senderId,
+      senderDisplayName: 'Test Sender',
+      timestamp: new Date(),
+      photoFileId: 'FILE_ALBUM_1',
+      source: 'photo',
+      captionText: 'Package: Standard $1400',
+      mediaGroupId,
+    });
+
+    // Second photo in the SAME album: Telegram itself never puts a caption here.
+    const result = await ingestPhotoMessage({
+      chatId,
+      messageId: uniqueMessageId(),
+      senderUserId: senderId,
+      senderDisplayName: 'Test Sender',
+      timestamp: new Date(),
+      photoFileId: 'FILE_ALBUM_2',
+      source: 'photo',
+      captionText: null,
+      mediaGroupId,
+    });
+    assert.equal(result.outcome, 'inserted');
+
+    const linked = await listLinkedMessages();
+    const second = linked.find((m) => m.telegramPhotoFileId === 'FILE_ALBUM_2');
+    assert.equal(second?.captionText, 'Package: Standard $1400', 'borrowed the sibling\'s caption, never left null');
+  } finally {
+    await deleteFixtures(chatId, groupId, agentId);
+  }
+});
+
+test('a caption-carrying message backfills an earlier sibling in the same album that arrived without one', async () => {
+  const chatId = uniqueChatId();
+  const senderId = uniqueUserId();
+  const groupId = await createGroup(chatId);
+  const agentId = await createAgent(senderId);
+  const mediaGroupId = `album-${uniqueMessageId()}`;
+  try {
+    // First photo arrives WITHOUT a caption (the caption-carrying photo in
+    // this album is the second one to arrive -- order is not guaranteed).
+    await ingestPhotoMessage({
+      chatId,
+      messageId: uniqueMessageId(),
+      senderUserId: senderId,
+      senderDisplayName: 'Test Sender',
+      timestamp: new Date(),
+      photoFileId: 'FILE_ALBUM_EARLY',
+      source: 'photo',
+      captionText: null,
+      mediaGroupId,
+    });
+
+    // Second photo carries the caption.
+    await ingestPhotoMessage({
+      chatId,
+      messageId: uniqueMessageId(),
+      senderUserId: senderId,
+      senderDisplayName: 'Test Sender',
+      timestamp: new Date(),
+      photoFileId: 'FILE_ALBUM_LATE',
+      source: 'photo',
+      captionText: 'Deposit: $200',
+      mediaGroupId,
+    });
+
+    const linked = await listLinkedMessages();
+    const early = linked.find((m) => m.telegramPhotoFileId === 'FILE_ALBUM_EARLY');
+    assert.equal(early?.captionText, 'Deposit: $200', 'the earlier sibling was backfilled once the caption arrived');
+  } finally {
+    await deleteFixtures(chatId, groupId, agentId);
+  }
+});
+
+test('a standalone message (no media_group_id) never borrows a caption from an unrelated message', async () => {
+  const chatId = uniqueChatId();
+  const senderId = uniqueUserId();
+  const groupId = await createGroup(chatId);
+  const agentId = await createAgent(senderId);
+  try {
+    // An unrelated captioned message in the same chat, but NOT in any album.
+    await ingestPhotoMessage({
+      chatId,
+      messageId: uniqueMessageId(),
+      senderUserId: senderId,
+      senderDisplayName: 'Test Sender',
+      timestamp: new Date(),
+      photoFileId: 'FILE_UNRELATED_CAPTIONED',
+      source: 'photo',
+      captionText: 'Package: $999',
+      mediaGroupId: null,
+    });
+
+    const result = await ingestPhotoMessage({
+      chatId,
+      messageId: uniqueMessageId(),
+      senderUserId: senderId,
+      senderDisplayName: 'Test Sender',
+      timestamp: new Date(),
+      photoFileId: 'FILE_STANDALONE_NO_CAPTION',
+      source: 'photo',
+      captionText: null,
+      mediaGroupId: null,
+    });
+    assert.equal(result.outcome, 'inserted');
+
+    const linked = await listLinkedMessages();
+    const standalone = linked.find((m) => m.telegramPhotoFileId === 'FILE_STANDALONE_NO_CAPTION');
+    assert.equal(standalone?.captionText, null, 'never borrows a caption across unrelated, non-album messages');
+  } finally {
+    await deleteFixtures(chatId, groupId, agentId);
+  }
+});
+
+test('never overwrites a sibling\'s own already-known caption when backfilling', async () => {
+  const chatId = uniqueChatId();
+  const senderId = uniqueUserId();
+  const groupId = await createGroup(chatId);
+  const agentId = await createAgent(senderId);
+  const mediaGroupId = `album-${uniqueMessageId()}`;
+  try {
+    // Two photos in the same album, each with its OWN distinct caption --
+    // an unusual but possible case (Telegram clients don't normally do
+    // this, but nothing here should assume they can't).
+    await ingestPhotoMessage({
+      chatId,
+      messageId: uniqueMessageId(),
+      senderUserId: senderId,
+      senderDisplayName: 'Test Sender',
+      timestamp: new Date(),
+      photoFileId: 'FILE_ALBUM_OWN_CAPTION_1',
+      source: 'photo',
+      captionText: 'Package: $1000',
+      mediaGroupId,
+    });
+    await ingestPhotoMessage({
+      chatId,
+      messageId: uniqueMessageId(),
+      senderUserId: senderId,
+      senderDisplayName: 'Test Sender',
+      timestamp: new Date(),
+      photoFileId: 'FILE_ALBUM_OWN_CAPTION_2',
+      source: 'photo',
+      captionText: 'Deposit: $100',
+      mediaGroupId,
+    });
+
+    const linked = await listLinkedMessages();
+    const first = linked.find((m) => m.telegramPhotoFileId === 'FILE_ALBUM_OWN_CAPTION_1');
+    const second = linked.find((m) => m.telegramPhotoFileId === 'FILE_ALBUM_OWN_CAPTION_2');
+    assert.equal(first?.captionText, 'Package: $1000', 'keeps its own caption, never overwritten by the sibling');
+    assert.equal(second?.captionText, 'Deposit: $100', 'keeps its own caption, never borrowed the earlier sibling\'s');
+  } finally {
+    await deleteFixtures(chatId, groupId, agentId);
   }
 });
 

@@ -3,12 +3,19 @@ import { google, type drive_v3, type sheets_v4 } from 'googleapis';
 import { env } from '../config/env.js';
 
 /**
- * spreadsheets: create/read/write group sheets. drive.file: move a
- * spreadsheet this service account created into a Drive folder — narrowest
- * scope that can do that, never the full `drive` scope (never needs to see
- * files it didn't create itself).
+ * spreadsheets: create/read/write group sheets. drive: look up a
+ * pre-existing Drive folder a human shared with this service account
+ * (ensureGroupSheet.ts's files.get on GOOGLE_SHEETS_DRIVE_FOLDER_ID), then
+ * move a newly created spreadsheet into it. drive.file's per-file access
+ * model only covers files/folders this app itself created — confirmed via
+ * production diagnostics that a folder shared through the ordinary Drive
+ * "Share" UI 404s under drive.file even though the share is valid, while
+ * the same files.get succeeds under a broader scope. No scope narrower
+ * than full `drive` covers both "see pre-existing shared content" and
+ * "create/write new files", so this is the minimal scope for what
+ * ensureGroupSheet.ts needs.
  */
-const SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.file'];
+const SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive'];
 
 export interface SheetsAuthConfig {
   keyFilePath: string;

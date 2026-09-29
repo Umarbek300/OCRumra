@@ -33,7 +33,23 @@ export const envSchema = z.object({
   // Defaults to false so this feature ships dormant until explicitly turned
   // on — enqueueing into sheet_sync_queue (performPassportOcr.ts) is
   // unaffected either way; this only gates the worker that drains it.
-  SHEETS_SYNC_ENABLED: z.coerce.boolean().default(false),
+  //
+  // Deliberately NOT z.coerce.boolean(): that coerces via JS's native
+  // Boolean(...), so the literal string "false" (non-empty) parses as
+  // `true` — silently defeating the one env var this flag exists to gate
+  // on. This instead only accepts the exact strings "true"/"false" (or the
+  // var being unset, defaulting to false); anything else is a validation
+  // error at startup rather than a silently-wrong boolean.
+  SHEETS_SYNC_ENABLED: z
+    .string()
+    .optional()
+    .transform((value, ctx) => {
+      if (value === undefined) return false;
+      if (value === 'true') return true;
+      if (value === 'false') return false;
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'SHEETS_SYNC_ENABLED must be "true" or "false" if set' });
+      return z.NEVER;
+    }),
   // Per-request timeout (ms) applied to every Google Sheets/Drive API call
   // this pipeline makes (see src/sheets/sheetsAuth.ts's
   // getConfiguredApiTimeoutMs()). Bounds how long one stuck/slow Google API
@@ -41,6 +57,20 @@ export const envSchema = z.object({
   // single hung request could stall the whole poll loop indefinitely. 30s
   // is generous headroom for a normal Sheets/Drive call.
   GOOGLE_SHEETS_API_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
+  // A plain service account (no Google Workspace domain-wide delegation)
+  // has zero Drive storage quota, so it cannot create a new spreadsheet
+  // itself — see src/sheets/appsScriptProvisioning.ts's own doc comment.
+  // Instead, a small Apps Script Web App bound to a real Google account
+  // creates the file (under that account's own quota) and returns its id.
+  // Optional for the same reason as the Sheets vars above — only
+  // ensureGroupSheet.ts's new-provisioning path enforces these, and only
+  // once it actually needs to create a spreadsheet.
+  APPS_SCRIPT_WEB_APP_URL: z.string().url().optional(),
+  // Shared secret sent in every request body to the Apps Script Web App
+  // (never a header — Apps Script's doPost cannot read custom headers —
+  // and never a URL query parameter). Must match the value configured in
+  // that Apps Script project's own Script Properties.
+  APPS_SCRIPT_SHARED_SECRET: z.string().min(1).optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;

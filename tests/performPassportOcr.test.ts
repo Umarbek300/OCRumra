@@ -40,10 +40,19 @@ function sampleExtraction(): PassportExtractionResult {
 
 function buildDeps(overrides: Partial<PerformPassportOcrDependencies> = {}): {
   deps: PerformPassportOcrDependencies;
-  calls: { findExisting: number; download: number; extract: number; save: number; enqueueSheetSync: number };
+  calls: { findExisting: number; download: number; extract: number; save: number; enqueueSheetSync: number; resolveIdentity: number };
 } {
-  const calls = { findExisting: 0, download: 0, extract: 0, save: 0, enqueueSheetSync: 0 };
+  const calls = { findExisting: 0, download: 0, extract: 0, save: 0, enqueueSheetSync: 0, resolveIdentity: 0 };
   const deps: PerformPassportOcrDependencies = {
+    // Duplicate-passport identity resolution is a separate feature with
+    // its own dedicated test suite (tests/duplicates.*.test.ts) — these
+    // pre-existing OCR-pipeline tests fake it out to a benign default
+    // (never touching a real DB, never suppressing the sheet-sync enqueue)
+    // so this file's own assertions stay exactly as they were.
+    resolveIdentity: async () => {
+      calls.resolveIdentity += 1;
+      return { kind: 'NO_IDENTITY_DATA' };
+    },
     findExistingResult: async () => {
       calls.findExisting += 1;
       return null;
@@ -171,4 +180,86 @@ test('a sheet-sync queue failure never fails performPassportOcr — OCR success 
   await assert.doesNotReject(() => performPassportOcr(CONTEXT, deps));
   assert.equal(calls.save, 1, 'the OCR result must still have been saved successfully');
   assert.equal(calls.enqueueSheetSync, 1, 'the enqueue was attempted, just never allowed to propagate');
+});
+
+// --- duplicate-passport identity resolution integration (see src/duplicates/) ---
+
+test('performPassportOcr suppresses the sheet-sync enqueue when identity resolution flags a REVIEW', async () => {
+  const { deps, calls } = buildDeps({
+    resolveIdentity: async () => {
+      calls.resolveIdentity += 1;
+      return { kind: 'REVIEW' };
+    },
+  });
+
+  await performPassportOcr(CONTEXT, deps);
+
+  assert.equal(calls.save, 1, 'the OCR result must still be saved even when flagged for review');
+  assert.equal(calls.enqueueSheetSync, 0, 'a REVIEW-flagged message must never be written to the Sheet until an operator resolves it');
+});
+
+test('performPassportOcr proceeds with the sheet-sync enqueue when identity resolution returns LINKED', async () => {
+  const { deps, calls } = buildDeps({
+    resolveIdentity: async () => {
+      calls.resolveIdentity += 1;
+      return { kind: 'LINKED', identityId: 'identity-1', role: 'canonical' };
+    },
+  });
+
+  await performPassportOcr(CONTEXT, deps);
+
+  assert.equal(calls.enqueueSheetSync, 1);
+});
+
+test('performPassportOcr proceeds with the sheet-sync enqueue when identity resolution returns ALREADY_RESOLVED', async () => {
+  const { deps, calls } = buildDeps({
+    resolveIdentity: async () => {
+      calls.resolveIdentity += 1;
+      return { kind: 'ALREADY_RESOLVED', role: 'duplicate' };
+    },
+  });
+
+  await performPassportOcr(CONTEXT, deps);
+
+  assert.equal(calls.enqueueSheetSync, 1);
+});
+
+test('an identity-resolution failure never fails performPassportOcr and does not suppress sheet sync', async () => {
+  const { deps, calls } = buildDeps({
+    resolveIdentity: async () => {
+      calls.resolveIdentity += 1;
+      throw new Error('passport_identity insert failed: connection reset');
+    },
+  });
+
+  await assert.doesNotReject(() => performPassportOcr(CONTEXT, deps));
+  assert.equal(calls.save, 1);
+  assert.equal(calls.enqueueSheetSync, 1, 'sheet sync must proceed as if duplicate detection did not run');
+});
+
+test('performPassportOcr passes the existing result\'s passport/DOB fields to identity resolution on the idempotent (already-exists) path', async () => {
+  let receivedPassportNumber: unknown;
+  let receivedDob: unknown;
+  const { deps, calls } = buildDeps({
+    findExistingResult: async () => {
+      calls.findExisting += 1;
+      return {
+        id: 'existing',
+        telegramMessageId: CONTEXT.telegramMessageId,
+        passportNumber: { value: 'X1234567', confidence: 'high' },
+        dateOfBirth: { value: '1990-05-15', confidence: 'high' },
+      } as unknown as import('../src/db/repositories/passportOcrResult.repo.js').PassportOcrResultRecord;
+    },
+    resolveIdentity: async (input) => {
+      calls.resolveIdentity += 1;
+      receivedPassportNumber = input.passportNumber;
+      receivedDob = input.dateOfBirth;
+      return { kind: 'NO_IDENTITY_DATA' };
+    },
+  });
+
+  await performPassportOcr(CONTEXT, deps);
+
+  assert.deepEqual(receivedPassportNumber, { value: 'X1234567', confidence: 'high' });
+  assert.deepEqual(receivedDob, { value: '1990-05-15', confidence: 'high' });
 });

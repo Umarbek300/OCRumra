@@ -1,4 +1,5 @@
 import { pool } from '../db/pool.js';
+import { backfillUnlinkedMessagesForGroup } from '../telegram/ensureGroupRegistered.js';
 
 interface Args {
   name: string;
@@ -39,7 +40,7 @@ function parseArgs(argv: string[]): Args {
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
 
-  const { rows } = await pool.query(
+  const { rows } = await pool.query<{ id: string; name: string; departure_date: string; telegram_chat_id: string }>(
     `INSERT INTO groups (name, departure_date, telegram_chat_id)
      VALUES ($1, $2, $3)
      ON CONFLICT (telegram_chat_id) DO UPDATE
@@ -48,7 +49,20 @@ async function main(): Promise<void> {
     [args.name, args.departureDate, args.chatId],
   );
 
-  console.log('Registered group:', rows[0]);
+  const group = rows[0];
+  console.log('Registered group:', group);
+
+  // Also sweeps any messages that arrived for this chat BEFORE it was
+  // registered (group_id IS NULL) -- links them, creates their
+  // passport_processing record, and enqueues them, exactly as the bot's
+  // own automatic registration path does (see ensureGroupRegistered.ts).
+  // Idempotent: re-running this command finds nothing left to backfill.
+  if (group) {
+    const backfilledMessageCount = await backfillUnlinkedMessagesForGroup(args.chatId, group.id);
+    if (backfilledMessageCount > 0) {
+      console.log(`Backfilled ${backfilledMessageCount} previously-unlinked message(s) for this chat.`);
+    }
+  }
 }
 
 try {

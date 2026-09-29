@@ -2,9 +2,11 @@ import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 import { pool } from '../src/db/pool.js';
 import {
+  clearSheetSyncConfirmationSent,
   enqueueSheetSync,
   findDueSheetSyncJobs,
   findSheetSyncQueueByTelegramMessageId,
+  markSheetSyncConfirmationSent,
   markSheetSyncFailed,
   markSheetSyncStarted,
   markSheetSyncSynced,
@@ -433,6 +435,45 @@ test('a job stuck in syncing below MAX_SHEET_SYNC_ATTEMPTS, once recovered, flow
     const record = await findSheetSyncQueueByTelegramMessageId(fixture.telegramMessageId);
     assert.ok(record);
     assert.equal(record.attempts, 3, 'recovery must never bump attempts on its own — only markSheetSyncStarted does');
+  } finally {
+    await cleanup(fixture);
+  }
+});
+
+test('markSheetSyncConfirmationSent claims once and returns null on a second call (duplicate-prevention guard)', async () => {
+  const fixture = await createLinkedTelegramMessage();
+  try {
+    const job = await enqueueSheetSync(fixture.telegramMessageId);
+    assert.ok(job);
+    assert.equal(job.confirmationSentAt, null, 'not sent yet for a freshly enqueued job');
+
+    const firstClaim = await markSheetSyncConfirmationSent(job.id);
+    assert.ok(firstClaim);
+    assert.ok(firstClaim.confirmationSentAt, 'the claim stamps confirmation_sent_at');
+
+    const secondClaim = await markSheetSyncConfirmationSent(job.id);
+    assert.equal(secondClaim, null, 'a second claim on the same job must be a no-op, not a second send opportunity');
+  } finally {
+    await cleanup(fixture);
+  }
+});
+
+test('clearSheetSyncConfirmationSent rolls back a claim so a later attempt can win it again', async () => {
+  const fixture = await createLinkedTelegramMessage();
+  try {
+    const job = await enqueueSheetSync(fixture.telegramMessageId);
+    assert.ok(job);
+
+    const claimed = await markSheetSyncConfirmationSent(job.id);
+    assert.ok(claimed);
+
+    await clearSheetSyncConfirmationSent(job.id);
+
+    const record = await findSheetSyncQueueByTelegramMessageId(fixture.telegramMessageId);
+    assert.equal(record?.confirmationSentAt, null, 'rollback resets it to unsent');
+
+    const reclaimed = await markSheetSyncConfirmationSent(job.id);
+    assert.ok(reclaimed, 'a fresh attempt can now win the claim again');
   } finally {
     await cleanup(fixture);
   }

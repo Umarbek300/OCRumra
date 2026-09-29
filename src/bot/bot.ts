@@ -55,6 +55,9 @@ bot.on('message:photo', async (ctx) => {
     timestamp: new Date(ctx.message.date * 1000),
     photoFileId: largestPhoto.file_id,
     source: 'photo',
+    captionText: ctx.message.caption ?? null,
+    mediaGroupId: ctx.message.media_group_id ?? null,
+    chatTitle: ctx.chat.title,
   });
 
   if (result.outcome === 'duplicate') {
@@ -112,6 +115,9 @@ bot.on('message:document', async (ctx) => {
     timestamp: new Date(ctx.message.date * 1000),
     photoFileId: document.file_id,
     source: 'document',
+    captionText: ctx.message.caption ?? null,
+    mediaGroupId: ctx.message.media_group_id ?? null,
+    chatTitle: ctx.chat.title,
   });
 
   if (result.outcome === 'duplicate') {

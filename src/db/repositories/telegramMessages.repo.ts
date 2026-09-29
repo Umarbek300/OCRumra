@@ -13,6 +13,10 @@ export interface TelegramMessageRecord {
   source: TelegramMessageSource;
   groupId: string | null;
   agentId: string | null;
+  /** The message's own Telegram caption, verbatim -- never passport data, never touched by OCR. Null when sent with no caption (possibly backfilled from a media-group sibling -- see ingestPhotoMessage.ts). */
+  captionText: string | null;
+  /** Telegram's album id when this message was sent as part of a media group. Null for a standalone message. */
+  mediaGroupId: string | null;
   createdAt: string;
 }
 
@@ -27,6 +31,8 @@ interface TelegramMessageRow {
   source: TelegramMessageSource;
   group_id: string | null;
   agent_id: string | null;
+  caption_text: string | null;
+  media_group_id: string | null;
   created_at: string;
 }
 
@@ -42,6 +48,8 @@ function mapRow(row: TelegramMessageRow): TelegramMessageRecord {
     source: row.source,
     groupId: row.group_id,
     agentId: row.agent_id,
+    captionText: row.caption_text,
+    mediaGroupId: row.media_group_id,
     createdAt: row.created_at,
   };
 }
@@ -49,7 +57,7 @@ function mapRow(row: TelegramMessageRow): TelegramMessageRecord {
 const SELECT_COLUMNS = `
   id, telegram_chat_id, telegram_message_id, telegram_sender_user_id,
   telegram_sender_display_name, message_timestamp, telegram_photo_file_id,
-  source, group_id, agent_id, created_at
+  source, group_id, agent_id, caption_text, media_group_id, created_at
 `;
 
 export interface RecordPhotoMessageInput {
@@ -62,6 +70,10 @@ export interface RecordPhotoMessageInput {
   source: TelegramMessageSource;
   groupId: string | null;
   agentId: string | null;
+  /** The message's own Telegram caption, verbatim. Null when sent with no caption. */
+  captionText: string | null;
+  /** Telegram's album id when this message was sent as part of a media group. Null for a standalone message. */
+  mediaGroupId: string | null;
 }
 
 export type RecordPhotoMessageResult =
@@ -79,8 +91,8 @@ export async function recordPhotoMessage(
     `INSERT INTO telegram_messages (
        telegram_chat_id, telegram_message_id, telegram_sender_user_id,
        telegram_sender_display_name, message_timestamp, telegram_photo_file_id,
-       source, group_id, agent_id
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       source, group_id, agent_id, caption_text, media_group_id
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
      ON CONFLICT (telegram_chat_id, telegram_message_id) DO NOTHING
      RETURNING ${SELECT_COLUMNS}`,
     [
@@ -93,16 +105,86 @@ export async function recordPhotoMessage(
       input.source,
       input.groupId,
       input.agentId,
+      input.captionText,
+      input.mediaGroupId,
     ],
   );
   const row = rows[0];
   return row ? { outcome: 'inserted', message: mapRow(row) } : { outcome: 'duplicate' };
 }
 
+/**
+ * Telegram attaches a caption to only ONE message of a media group (album)
+ * -- every sibling photo/document sent in the same album arrives with
+ * caption = NULL, even though the operator wrote one caption for the whole
+ * album. Looks for any already-recorded sibling in the same chat + album
+ * that does have a caption, so a message missing its own caption can
+ * borrow the album's. Returns null if no sibling with a caption exists yet
+ * (e.g. it hasn't arrived/been processed yet, or there simply isn't one) --
+ * never guesses, never fabricates a caption.
+ */
+export async function findCaptionForMediaGroup(telegramChatId: number, mediaGroupId: string): Promise<string | null> {
+  const { rows } = await pool.query<{ caption_text: string | null }>(
+    `SELECT caption_text FROM telegram_messages
+     WHERE telegram_chat_id = $1 AND media_group_id = $2 AND caption_text IS NOT NULL
+     ORDER BY created_at
+     LIMIT 1`,
+    [telegramChatId, mediaGroupId],
+  );
+  return rows[0]?.caption_text ?? null;
+}
+
+/**
+ * The reverse direction of findCaptionForMediaGroup: when a message WITH a
+ * caption arrives, propagates it to any sibling in the same chat + album
+ * that was recorded earlier without one -- covering the case where the
+ * caption-carrying message in the album isn't the first to arrive. Only
+ * ever fills a NULL caption_text; never overwrites a sibling's own
+ * already-known caption. Returns the number of sibling rows updated.
+ */
+export async function backfillCaptionForMediaGroup(
+  telegramChatId: number,
+  mediaGroupId: string,
+  captionText: string,
+): Promise<number> {
+  const { rowCount } = await pool.query(
+    `UPDATE telegram_messages
+     SET caption_text = $3
+     WHERE telegram_chat_id = $1 AND media_group_id = $2 AND caption_text IS NULL`,
+    [telegramChatId, mediaGroupId, captionText],
+  );
+  return rowCount ?? 0;
+}
+
 export async function findTelegramMessageById(id: string): Promise<TelegramMessageRecord | null> {
   const { rows } = await pool.query<TelegramMessageRow>(
     `SELECT ${SELECT_COLUMNS} FROM telegram_messages WHERE id = $1`,
     [id],
+  );
+  const row = rows[0];
+  return row ? mapRow(row) : null;
+}
+
+/** Unlinked messages for ONE chat -- what ensureGroupRegistered.ts's backfill sweep scans, scoped to the chat it just resolved a group for. */
+export async function findUnlinkedMessagesByTelegramChatId(telegramChatId: number): Promise<TelegramMessageRecord[]> {
+  const { rows } = await pool.query<TelegramMessageRow>(
+    `SELECT ${SELECT_COLUMNS} FROM telegram_messages WHERE telegram_chat_id = $1 AND group_id IS NULL`,
+    [telegramChatId],
+  );
+  return rows.map(mapRow);
+}
+
+/**
+ * Backfill-only: patches a previously-unlinked message's group_id once its
+ * group has been (auto-)registered. Guarded by `WHERE group_id IS NULL` --
+ * a safe no-op (returns null) if something else already linked this exact
+ * message between the caller's own read and this UPDATE, so a concurrent
+ * or repeated backfill sweep can never double-link or clobber a link.
+ */
+export async function linkTelegramMessageToGroup(id: string, groupId: string): Promise<TelegramMessageRecord | null> {
+  const { rows } = await pool.query<TelegramMessageRow>(
+    `UPDATE telegram_messages SET group_id = $2 WHERE id = $1 AND group_id IS NULL RETURNING ${SELECT_COLUMNS}`,
+    [id, groupId],
   );
   const row = rows[0];
   return row ? mapRow(row) : null;

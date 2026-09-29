@@ -241,6 +241,83 @@ test('extract leaves passportIssueDate null when the structured pages contain no
   assert.deepEqual(result.passportIssueDate, { value: null, confidence: null });
 });
 
+// --- flat-text (elimination) fallback for punctuated/textual-month dates ---
+// extractVisualIssueDate only matches three separate all-digit words on one
+// row next to an ISSUE label. A single punctuated token ("15.01.2020") or a
+// textual month ("15 JAN 2020") never matches that shape, so these tests
+// exercise the fallback that recovers the date from Vision's own fullText
+// instead, via the same conservative extractDateCandidates + inferIssueDate
+// elimination the local/Tesseract provider already relies on.
+
+test('extract recovers passportIssueDate from a punctuated single-token date in fullText when the structural (label-row) approach finds nothing', async () => {
+  const fullText = [VALID_LINE_1, VALID_LINE_2, 'Date of issue: 15.01.2020'].join('\n');
+  const provider = buildProvider(() => Promise.resolve({ fullText, pages: [] }));
+
+  const result = await provider.extract(Buffer.from('fake-image'), 'image/jpeg');
+
+  assert.deepEqual(result.passportIssueDate, { value: '2020-01-15', confidence: 'medium' });
+});
+
+test('extract recovers passportIssueDate from a textual-month date in fullText ("15 JAN 2020")', async () => {
+  const fullText = [VALID_LINE_1, VALID_LINE_2, 'Date of issue 15 JAN 2020'].join('\n');
+  const provider = buildProvider(() => Promise.resolve({ fullText, pages: [] }));
+
+  const result = await provider.extract(Buffer.from('fake-image'), 'image/jpeg');
+
+  assert.deepEqual(result.passportIssueDate, { value: '2020-01-15', confidence: 'medium' });
+});
+
+test('extract prefers the structural (label-row) issue date over the flat-text fallback when both are present', async () => {
+  const fullText = [VALID_LINE_1, VALID_LINE_2, 'some other date 20.02.2021 printed elsewhere'].join('\n');
+  const pages: VisionPage[] = [
+    {
+      width: 1000,
+      height: 1000,
+      blocks: [
+        {
+          paragraphs: [
+            {
+              words: [
+                word('DATE', box(0, 100, 40, 110)),
+                word('OF', box(42, 100, 55, 110)),
+                word('ISSUE', box(57, 100, 90, 110)),
+                word('15', box(95, 100, 110, 110)),
+                word('01', box(112, 100, 128, 110)),
+                word('2020', box(130, 100, 160, 110)),
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  ];
+  const provider = buildProvider(() => Promise.resolve({ fullText, pages }));
+
+  const result = await provider.extract(Buffer.from('fake-image'), 'image/jpeg');
+
+  assert.deepEqual(result.passportIssueDate, { value: '2020-01-15', confidence: 'medium' }, 'the structural row wins, not the unrelated flat-text date');
+});
+
+test('extract does not echo an MRZ-known date (birth/expiry) as the issue date via the flat-text fallback either', async () => {
+  // VALID_LINE_2 encodes birthDate=740812 -> 1974-08-12 and
+  // expirationDate=120415 -> 2012-04-15 (see mrz.mapMrzToExtractionResult.test.ts).
+  const fullText = [VALID_LINE_1, VALID_LINE_2, 'Date of birth 12.08.1974'].join('\n');
+  const provider = buildProvider(() => Promise.resolve({ fullText, pages: [] }));
+
+  const result = await provider.extract(Buffer.from('fake-image'), 'image/jpeg');
+
+  assert.deepEqual(result.passportIssueDate, { value: null, confidence: null }, 'a date that only re-states a known MRZ date must never be surfaced as the issue date');
+});
+
+test('extract leaves passportIssueDate null via the flat-text fallback when more than one unexplained date-shaped string is present (never guesses which one)', async () => {
+  const fullText = [VALID_LINE_1, VALID_LINE_2, 'two candidates: 15.01.2020 and 20.02.2021'].join('\n');
+  const provider = buildProvider(() => Promise.resolve({ fullText, pages: [] }));
+
+  const result = await provider.extract(Buffer.from('fake-image'), 'image/jpeg');
+
+  assert.deepEqual(result.passportIssueDate, { value: null, confidence: null });
+});
+
 test('extract never logs the visual issue date value itself — only a found/not-found boolean', async () => {
   const fullText = [VALID_LINE_1, VALID_LINE_2].join('\n');
   const pages: VisionPage[] = [

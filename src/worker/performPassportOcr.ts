@@ -1,6 +1,11 @@
 import { env } from '../config/env.js';
-import { createPassportOcrResult, findPassportOcrResultByTelegramMessageId } from '../db/repositories/passportOcrResult.repo.js';
+import {
+  createPassportOcrResult,
+  findPassportOcrResultByTelegramMessageId,
+  type OcrConfidenceLevel,
+} from '../db/repositories/passportOcrResult.repo.js';
 import { enqueueSheetSync } from '../db/repositories/sheetSyncQueue.repo.js';
+import { resolveAndLinkIdentity } from '../duplicates/resolveAndLinkIdentity.js';
 import { selectProvider, type OcrProvider } from '../ocr/providers/index.js';
 import { downloadTelegramPhoto } from '../telegram/downloadTelegramPhoto.js';
 
@@ -17,6 +22,8 @@ export interface PerformPassportOcrDependencies {
   extract: OcrProvider['extract'];
   saveResult: typeof createPassportOcrResult;
   enqueueSheetSync: typeof enqueueSheetSync;
+  /** Duplicate-passport identity resolution — see src/duplicates/resolveAndLinkIdentity.ts. Injectable so tests never need real DB rows for this feature. */
+  resolveIdentity: typeof resolveAndLinkIdentity;
 }
 
 const defaultProvider = selectProvider(env.OCR_PROVIDER);
@@ -27,6 +34,7 @@ const defaultDependencies: PerformPassportOcrDependencies = {
   extract: defaultProvider.extract,
   saveResult: createPassportOcrResult,
   enqueueSheetSync,
+  resolveIdentity: resolveAndLinkIdentity,
 };
 
 /**
@@ -63,6 +71,41 @@ async function enqueueSheetSyncSafely(
  * Telegram/Anthropic/subprocess. Logs are sanitized — only the message id
  * and coarse status, never passport data.
  */
+/**
+ * Resolves duplicate-passport identity for this message and reports
+ * whether the Sheet-sync enqueue that follows must be suppressed. Never
+ * lets a failure here block OCR from being considered successful — a
+ * problem in the duplicate-detection feature must not turn a successful
+ * OCR result into a failed passport_processing job, same safety principle
+ * as enqueueSheetSyncSafely below. On any error, sheet sync proceeds as if
+ * duplicate detection didn't exist (pre-feature behavior), rather than
+ * silently dropping the message.
+ */
+async function resolveIdentitySafely(
+  context: OcrProcessingContext,
+  passportNumber: { value: string | null; confidence: OcrConfidenceLevel | null },
+  dateOfBirth: { value: string | null; confidence: OcrConfidenceLevel | null },
+  resolveIdentity: PerformPassportOcrDependencies['resolveIdentity'],
+): Promise<boolean> {
+  try {
+    const outcome = await resolveIdentity({
+      telegramMessageId: context.telegramMessageId,
+      groupId: context.groupId,
+      agentId: context.agentId,
+      passportNumber,
+      dateOfBirth,
+    });
+    return outcome.kind === 'REVIEW';
+  } catch (error) {
+    console.error(
+      `[passport-ocr] duplicate-identity resolution failed for message ${context.telegramMessageId}; ` +
+        'proceeding with sheet sync as if unresolved (never blocks OCR success)',
+      error,
+    );
+    return false;
+  }
+}
+
 export async function performPassportOcr(
   context: OcrProcessingContext,
   deps: PerformPassportOcrDependencies = defaultDependencies,
@@ -70,7 +113,15 @@ export async function performPassportOcr(
   const existing = await deps.findExistingResult(context.telegramMessageId);
   if (existing) {
     console.log(`[passport-ocr] result already exists for message ${context.telegramMessageId}; skipping OCR call`);
-    await enqueueSheetSyncSafely(context.telegramMessageId, deps.enqueueSheetSync);
+    const suppressForReview = await resolveIdentitySafely(
+      context,
+      existing.passportNumber,
+      existing.dateOfBirth,
+      deps.resolveIdentity,
+    );
+    if (!suppressForReview) {
+      await enqueueSheetSyncSafely(context.telegramMessageId, deps.enqueueSheetSync);
+    }
     return;
   }
 
@@ -103,5 +154,13 @@ export async function performPassportOcr(
     console.log(`[passport-ocr] result was stored concurrently for message ${context.telegramMessageId}`);
   }
 
-  await enqueueSheetSyncSafely(context.telegramMessageId, deps.enqueueSheetSync);
+  const suppressForReview = await resolveIdentitySafely(
+    context,
+    extraction.passportNumber,
+    extraction.dateOfBirth,
+    deps.resolveIdentity,
+  );
+  if (!suppressForReview) {
+    await enqueueSheetSyncSafely(context.telegramMessageId, deps.enqueueSheetSync);
+  }
 }

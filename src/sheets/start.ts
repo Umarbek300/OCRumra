@@ -1,5 +1,6 @@
 import { env } from '../config/env.js';
 import { pool } from '../db/pool.js';
+import { reconcileStaleReconciliationJobs, runSheetReconciliationLoop } from './runSheetReconciliationLoop.js';
 import { reconcileStaleSyncingJobs, runSheetSyncLoop } from './runSheetSyncLoop.js';
 
 let shuttingDown = false;
@@ -25,13 +26,22 @@ process.on('SIGTERM', () => requestShutdown('SIGTERM'));
  * itself repeats this same reconciliation periodically once running (see
  * its own doc comment), so this call only matters for whatever a crash
  * left behind between the last run and this one.
+ *
+ * Runs the ordinary sync loop AND the Sheet-reconciliation loop (crash-safe
+ * delete/reassign recovery — see reconcileSheetRow.ts) concurrently in this
+ * SAME process, rather than as a separate worker: both loops only ever
+ * touch Google Sheets, both are gated by the same SHEETS_SYNC_ENABLED flag,
+ * and neither's DB polling depends on the other, so Promise.all is enough —
+ * a fatal error in either loop propagates out here exactly like a single
+ * loop's own fatal error always has, causing this whole process to exit
+ * non-zero so its supervisor can restart it.
  */
 async function main(): Promise<void> {
   console.log(
     `[sheets-sync] starting sheet-sync worker (SHEETS_SYNC_ENABLED=${env.SHEETS_SYNC_ENABLED}, no Redis involved)`,
   );
-  await reconcileStaleSyncingJobs();
-  await runSheetSyncLoop(() => !shuttingDown);
+  await Promise.all([reconcileStaleSyncingJobs(), reconcileStaleReconciliationJobs()]);
+  await Promise.all([runSheetSyncLoop(() => !shuttingDown), runSheetReconciliationLoop(() => !shuttingDown)]);
 }
 
 try {

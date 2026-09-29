@@ -29,6 +29,7 @@ const SAMPLE_JOB: SheetSyncQueueRecord = {
   sheetRowNumber: null,
   nextAttemptAt: '2026-01-01T00:00:00.000Z',
   syncedAt: null,
+  confirmationSentAt: null,
   createdAt: '2026-01-01T00:00:00.000Z',
   updatedAt: '2026-01-01T00:00:00.000Z',
 };
@@ -429,6 +430,8 @@ test('two concurrent syncPassportRowToSheet calls for the same real queue row ca
         source: 'photo',
         groupId: 'irrelevant-not-used-because-ensureSheet-is-faked',
         agentId: null,
+        captionText: null,
+        mediaGroupId: null,
         createdAt: new Date().toISOString(),
       }),
       findOcrResult: async () => ({
@@ -454,11 +457,22 @@ test('two concurrent syncPassportRowToSheet calls for the same real queue row ca
         updatedAt: new Date().toISOString(),
       }),
       findAgent: async () => null,
+      findGroup: async () => null,
       ensureSheet: async () => ({ spreadsheetId: 'fake-sheet-id' }),
       upsertRow: async () => {
         upsertCalls += 1;
         return { action: 'appended', rowNumber: 2 };
       },
+      computeGenderStats: async () => ({ male: 0, female: 0, unspecified: 0, total: 0 }),
+      writeGenderSummary: async () => {},
+      markConfirmationSent: sheetSyncQueueRepo.markSheetSyncConfirmationSent,
+      clearConfirmationSent: sheetSyncQueueRepo.clearSheetSyncConfirmationSent,
+      sendConfirmation: async () => {},
+      // Duplicate-passport canonical resolution (src/duplicates/) — no link
+      // for this fixture, so it resolves to the job's own message, exactly
+      // preserving this test's pre-feature behavior.
+      findMessageLink: async () => null,
+      findActiveCanonicalLink: async () => null,
       now: () => new Date(),
     };
 

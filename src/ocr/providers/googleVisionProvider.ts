@@ -1,5 +1,7 @@
 import { ImageAnnotatorClient, protos } from '@google-cloud/vision';
+import { extractDateCandidates } from '../visual/extractDateCandidates.js';
 import { extractVisualIssueDate, type VisionPage } from '../visual/extractIssueDateFromVisionStructure.js';
+import { inferIssueDate } from '../visual/inferIssueDate.js';
 import { findMrzCandidateWindows } from '../mrz/findMrzCandidateWindows.js';
 import { buildUnreadableMrzResult, mapMrzToExtractionResult } from '../mrz/mapMrzToExtractionResult.js';
 import { normalizeMrzDate } from '../mrz/normalizeMrzDate.js';
@@ -129,13 +131,35 @@ export function createGoogleVisionProvider(deps: GoogleVisionProviderDependencie
         normalizeMrzDate(validWinner.parsed.fields.expirationDate, 'expiry'),
       ].filter((value): value is string => value !== null);
       const visualIssueDate = extractVisualIssueDate(pages, knownDates);
-      console.log(`[google-vision] visualIssueDateFound=${visualIssueDate !== null}`);
+
+      // extractVisualIssueDate only recognizes one printed shape: three
+      // separate all-digit words (DD, MM, YYYY) on the same row next to an
+      // ISSUE/ISSUED label — the shape observed on real messages 270/271
+      // (see that module's own doc comment). Many passports instead print
+      // the date as a single punctuated token ("15.01.2020", "15/01/2020")
+      // or with a textual month ("15 JAN 2020"), which that structural,
+      // label-proximity approach cannot match at all — it simply finds no
+      // digit-triple row and returns null, even though Vision's own
+      // fullText (already fetched by the same API call, zero extra cost)
+      // contains the date in plain text. This reuses extractDateCandidates
+      // + inferIssueDate — the exact same conservative "elimination"
+      // strategy the local/Tesseract provider already applies via
+      // enrichWithVisualIssueDate — as a second, independent signal source:
+      // it only ever returns a value when exactly one date-shaped
+      // substring in the full text is NOT already explained by a known MRZ
+      // date, so this still never guesses among multiple candidates.
+      const flatTextIssueDate =
+        visualIssueDate === null ? inferIssueDate(extractDateCandidates(fullText), knownDates) : null;
+      const issueDate = visualIssueDate ?? flatTextIssueDate;
+      console.log(
+        `[google-vision] visualIssueDateFound=${visualIssueDate !== null} flatTextIssueDateFound=${flatTextIssueDate !== null}`,
+      );
 
       return mapMrzToExtractionResult(
         validWinner.parsed,
         validWinner.lines,
         GOOGLE_VISION_PROVIDER_MODEL,
-        visualIssueDate,
+        issueDate,
       );
     },
   };

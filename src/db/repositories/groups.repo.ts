@@ -42,6 +42,30 @@ export async function findGroupByTelegramChatId(telegramChatId: number): Promise
   return row ? mapRow(row) : null;
 }
 
+/**
+ * Idempotent create for automatic group registration (see
+ * ensureGroupRegistered.ts) -- returns null if a group with this
+ * telegram_chat_id already exists, via the same ON CONFLICT DO NOTHING
+ * idiom used throughout this schema, so a concurrent race between two
+ * ingests for a brand-new chat can never create two group rows. Unlike
+ * the admin CLI's own registerGroup.ts (which deliberately DOES update
+ * name/departure_date on conflict, an explicit human action), this NEVER
+ * touches an existing row's name or departure_date -- telegram_chat_id is
+ * the sole identity; a later Telegram title edit must never silently
+ * overwrite an already-registered group's departure date.
+ */
+export async function createGroup(name: string, departureDate: string, telegramChatId: number): Promise<Group | null> {
+  const { rows } = await pool.query<GroupRow>(
+    `INSERT INTO groups (name, departure_date, telegram_chat_id)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (telegram_chat_id) DO NOTHING
+     RETURNING id, name, departure_date, telegram_chat_id, google_sheet_id, created_at, updated_at`,
+    [name, departureDate, telegramChatId],
+  );
+  const row = rows[0];
+  return row ? mapRow(row) : null;
+}
+
 export async function findGroupById(id: string): Promise<Group | null> {
   const { rows } = await pool.query<GroupRow>(
     `SELECT id, name, departure_date, telegram_chat_id, google_sheet_id, created_at, updated_at

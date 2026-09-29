@@ -11,6 +11,8 @@ export interface SheetSyncQueueRecord {
   sheetRowNumber: number | null;
   nextAttemptAt: string;
   syncedAt: string | null;
+  /** When the post-sync Telegram confirmation message was sent, or null if not sent yet. See markSheetSyncConfirmationSent. */
+  confirmationSentAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -24,6 +26,7 @@ interface SheetSyncQueueRow {
   sheet_row_number: number | null;
   next_attempt_at: string;
   synced_at: string | null;
+  confirmation_sent_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -38,6 +41,7 @@ function mapRow(row: SheetSyncQueueRow): SheetSyncQueueRecord {
     sheetRowNumber: row.sheet_row_number,
     nextAttemptAt: row.next_attempt_at,
     syncedAt: row.synced_at,
+    confirmationSentAt: row.confirmation_sent_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -45,7 +49,7 @@ function mapRow(row: SheetSyncQueueRow): SheetSyncQueueRecord {
 
 const SELECT_COLUMNS = `
   id, telegram_message_id, status, attempts, last_error,
-  sheet_row_number, next_attempt_at, synced_at, created_at, updated_at
+  sheet_row_number, next_attempt_at, synced_at, confirmation_sent_at, created_at, updated_at
 `;
 
 /**
@@ -239,4 +243,63 @@ export async function recoverStaleSyncingJobs(
   );
 
   return { requeued: requeuedRows.map(mapRow), failed: failedRows.map(mapRow) };
+}
+
+/**
+ * Atomically claims the right to send this job's post-sync Telegram
+ * confirmation: sets confirmation_sent_at = now() only if it is still NULL,
+ * same "claim guard" shape as markSheetSyncStarted. Returns null if a
+ * confirmation was already sent (or being sent) for this job, so the caller
+ * knows to skip sending — the sole guard against a duplicate confirmation
+ * message, including for a job an operator manually resets and re-syncs.
+ *
+ * The caller is expected to send the message only after winning this claim.
+ * If the send then fails, call clearSheetSyncConfirmationSent to allow a
+ * future attempt to try again — see syncPassportRowToSheet.ts.
+ */
+export async function markSheetSyncConfirmationSent(id: string): Promise<SheetSyncQueueRecord | null> {
+  const { rows } = await pool.query<SheetSyncQueueRow>(
+    `UPDATE sheet_sync_queue
+     SET confirmation_sent_at = now()
+     WHERE id = $1 AND confirmation_sent_at IS NULL
+     RETURNING ${SELECT_COLUMNS}`,
+    [id],
+  );
+  const row = rows[0];
+  return row ? mapRow(row) : null;
+}
+
+/**
+ * Rolls back a confirmation claim after the actual Telegram send failed, so
+ * confirmation_sent_at keeps meaning "successfully sent" rather than
+ * "attempted". Unconditional by id (no WHERE ... IS NULL guard) — only ever
+ * called by the same code path that just won the claim via
+ * markSheetSyncConfirmationSent, so there is no concurrent claim to disturb.
+ */
+export async function clearSheetSyncConfirmationSent(id: string): Promise<void> {
+  await pool.query(`UPDATE sheet_sync_queue SET confirmation_sent_at = NULL WHERE id = $1`, [id]);
+}
+
+/**
+ * Resets an existing 'synced' job back to 'pending' so the next poll
+ * cycle re-processes it — used when a message's canonical resolution
+ * changes AFTER it was already synced (identity split is the first
+ * caller), and the Sheet needs to be brought back in sync through the
+ * normal sheet_sync_queue pipeline rather than a bespoke direct write.
+ * A no-op (returns null) if the job isn't currently 'synced' — e.g. it's
+ * already pending/syncing (nothing to do, the next ordinary poll will
+ * already re-resolve canonical fresh) or doesn't exist at all (never
+ * silently creates one; a genuinely missing job means this message was
+ * never synced in the first place).
+ */
+export async function requeueSheetSyncForResync(telegramMessageId: string): Promise<SheetSyncQueueRecord | null> {
+  const { rows } = await pool.query<SheetSyncQueueRow>(
+    `UPDATE sheet_sync_queue
+     SET status = 'pending', next_attempt_at = now()
+     WHERE telegram_message_id = $1 AND status = 'synced'
+     RETURNING ${SELECT_COLUMNS}`,
+    [telegramMessageId],
+  );
+  const row = rows[0];
+  return row ? mapRow(row) : null;
 }
