@@ -71,6 +71,13 @@ export const envSchema = z.object({
   // and never a URL query parameter). Must match the value configured in
   // that Apps Script project's own Script Properties.
   APPS_SCRIPT_SHARED_SECRET: z.string().min(1).optional(),
+  // Id of the single, shared Google Spreadsheet that the target
+  // "one master file, one tab per Telegram group" architecture will use
+  // (via the Apps Script `ensureTab` action) instead of provisioning a
+  // dedicated spreadsheet file per group. Reserved for that future change
+  // only — nothing in this codebase reads this value yet, and no existing
+  // provisioning/sync logic is affected by setting or leaving it unset.
+  GOOGLE_SHEETS_MASTER_SPREADSHEET_ID: z.string().min(1).optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;

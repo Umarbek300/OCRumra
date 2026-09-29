@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import type { Group } from '../src/db/repositories/groups.repo.js';
 import type { PassportMessageLinkRecord } from '../src/db/repositories/passportMessageLinks.repo.js';
 import type { SheetReconciliationJobRecord } from '../src/db/repositories/sheetReconciliation.repo.js';
 import type { TelegramMessageRecord } from '../src/db/repositories/telegramMessages.repo.js';
@@ -113,6 +114,7 @@ function buildDeps(overrides: Partial<ReconcileSheetRowDependencies> = {}): {
       updatedAt: new Date().toISOString(),
     }),
     findAgent: async () => null,
+    findGroup: async () => null,
     ...overrides,
   };
 
@@ -138,6 +140,7 @@ test('reconcileSheetRow reassigns to the CURRENT canonical when one exists, re-r
     oldCanonicalTelegramMessageId: 'old-msg',
     newCanonicalTelegramMessageId: 'new-msg',
     row: (reassignArgs as { row: unknown }).row,
+    googleSheetGid: undefined,
   });
 });
 
@@ -155,7 +158,11 @@ test('reconcileSheetRow deletes when NO current canonical exists, then marks don
 
   assert.equal(calls.reassignRow, 0);
   assert.equal(calls.markDone, 1);
-  assert.deepEqual(deleteArgs, { spreadsheetId: 'sheet-for-group-1', expectedCanonicalTelegramMessageId: 'old-msg' });
+  assert.deepEqual(deleteArgs, {
+    spreadsheetId: 'sheet-for-group-1',
+    expectedCanonicalTelegramMessageId: 'old-msg',
+    googleSheetGid: undefined,
+  });
 });
 
 test('reconcileSheetRow treats a not_found delete result as success (already handled by an earlier job)', async () => {
@@ -238,4 +245,68 @@ test('reconcileSheetRow does nothing further when the job is not claimable', asy
   assert.equal(calls.reassignRow, 0);
   assert.equal(calls.markDone, 0);
   assert.equal(calls.markFailed, 0);
+});
+
+// --- M-2: master/tab architecture -- googleSheetGid wiring from findGroup into deleteRow/reassignRow ---
+
+function masterTabGroup(gid: number): Group {
+  return {
+    id: 'group-1',
+    name: 'Master/Tab Test Group',
+    departureDate: '2026-09-20',
+    telegramChatId: null,
+    googleSheetId: 'master-abc',
+    googleSheetGid: gid,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+test('M-2: a master/tab group\'s googleSheetGid (456789) is threaded into reassignRow when a current canonical exists', async () => {
+  let reassignArgs: unknown;
+  const { deps } = buildDeps({
+    findGroup: async () => masterTabGroup(456789),
+    findActiveCanonicalLink: async () => sampleLink('new-msg'),
+    reassignRow: async (input) => {
+      reassignArgs = input;
+      return { outcome: 'reassigned', rowNumber: 4 };
+    },
+  });
+
+  await reconcileSheetRow('job-1', deps);
+
+  assert.equal((reassignArgs as { googleSheetGid: number | null | undefined }).googleSheetGid, 456789);
+});
+
+test('M-2: a master/tab group\'s googleSheetGid (456789) is threaded into deleteRow when no current canonical exists', async () => {
+  let deleteArgs: unknown;
+  const { deps } = buildDeps({
+    findGroup: async () => masterTabGroup(456789),
+    findActiveCanonicalLink: async () => null,
+    deleteRow: async (input) => {
+      deleteArgs = input;
+      return { outcome: 'deleted', rowNumber: 3 };
+    },
+  });
+
+  await reconcileSheetRow('job-1', deps);
+
+  assert.equal((deleteArgs as { googleSheetGid: number | null | undefined }).googleSheetGid, 456789);
+});
+
+test('M-2: a master/tab group\'s googleSheetGid (456789) is threaded into deleteRow for a merge-sourced job too', async () => {
+  let deleteArgs: unknown;
+  const { deps } = buildDeps({
+    claim: async (id) => ({ ...SAMPLE_JOB, id, sourceOperation: 'merge' }),
+    findGroup: async () => masterTabGroup(456789),
+    findActiveCanonicalLink: async () => sampleLink('some-other-already-synced-message'),
+    deleteRow: async (input) => {
+      deleteArgs = input;
+      return { outcome: 'deleted', rowNumber: 1 };
+    },
+  });
+
+  await reconcileSheetRow('job-1', deps);
+
+  assert.equal((deleteArgs as { googleSheetGid: number | null | undefined }).googleSheetGid, 456789);
 });

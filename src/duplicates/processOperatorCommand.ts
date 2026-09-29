@@ -1,4 +1,5 @@
 import { findAgentById } from '../db/repositories/agents.repo.js';
+import { findGroupById } from '../db/repositories/groups.repo.js';
 import {
   findActiveCanonicalLink,
   findActiveDuplicateCandidates,
@@ -41,6 +42,8 @@ export interface ProcessOperatorCommandDependencies {
   findAgent: typeof findAgentById;
   /** Only still needed for MOVE_TO_GROUP's destination side — an ordinary first-time append, never a delete/reassign (those are now handled by sheet_reconciliation_jobs, see applyIdentityStateChange.ts). */
   ensureSheet: typeof ensureGroupSheet;
+  /** Only needed for MOVE_TO_GROUP's destination side, to read its google_sheet_gid — ensureGroupSheet's own result never exposes it (see ensureGroupSheet.ts's EnsureGroupSheetResult). */
+  findGroup: typeof findGroupById;
   upsertRow: typeof upsertRowInSheet;
   retireAndPromote: typeof retireCanonicalAndPromoteReplacement;
   promoteAndRelocate: typeof promoteReplacementAndRelocateLink;
@@ -56,6 +59,7 @@ const defaultDependencies: ProcessOperatorCommandDependencies = {
   findOcrResult: findPassportOcrResultByTelegramMessageId,
   findAgent: findAgentById,
   ensureSheet: ensureGroupSheet,
+  findGroup: findGroupById,
   upsertRow: upsertRowInSheet,
   retireAndPromote: retireCanonicalAndPromoteReplacement,
   promoteAndRelocate: promoteReplacementAndRelocateLink,
@@ -139,6 +143,16 @@ async function retireInGroup(
  * row via the untouched upsertRowInSheet — a different spreadsheet has
  * never seen this message id before, so it naturally appends; this side is
  * unaffected by the P1 reconciliation work (it was never a delete/reassign).
+ *
+ * toGroupId's own google_sheet_gid is looked up via deps.findGroup — a
+ * second DB read alongside ensureSheet's own, since ensureGroupSheet's
+ * result only ever exposes { spreadsheetId }, never the group's gid (see
+ * its own EnsureGroupSheetResult). A master/tab destination group's row
+ * must land in ITS OWN tab, never the master spreadsheet's default/first
+ * sheet — omitting this would resolve to an unprefixed A1 range, silently
+ * misdirecting the write. A legacy destination (googleSheetGid null, or the
+ * group somehow not found) passes googleSheetGid as null/undefined, the
+ * exact prior behavior, completely unchanged.
  */
 async function moveToGroup(
   passportIdentityId: string,
@@ -167,9 +181,15 @@ async function moveToGroup(
   });
 
   const { spreadsheetId: toSpreadsheetId } = await deps.ensureSheet(toGroupId);
+  const destinationGroup = await deps.findGroup(toGroupId);
   const builtMoved = await buildRowForMessage(movedLink.telegramMessageId, deps);
   if (builtMoved) {
-    await deps.upsertRow({ spreadsheetId: toSpreadsheetId, telegramMessageId: movedLink.telegramMessageId, row: builtMoved.row });
+    await deps.upsertRow({
+      spreadsheetId: toSpreadsheetId,
+      telegramMessageId: movedLink.telegramMessageId,
+      row: builtMoved.row,
+      googleSheetGid: destinationGroup?.googleSheetGid,
+    });
   }
 }
 

@@ -1,7 +1,8 @@
-import { buildRealSheetsWriteClient, type SheetsWriteClient } from './upsertRowInSheet.js';
+import { buildRealSheetsWriteClient, buildRealSheetTitleResolver, type ResolveSheetTitleByGid, type SheetsWriteClient } from './upsertRowInSheet.js';
 import { FIRST_DATA_ROW_NUMBER } from './sheetLayout.js';
 
 const defaultClient: SheetsWriteClient = buildRealSheetsWriteClient();
+const defaultResolveSheetTitle: ResolveSheetTitleByGid = buildRealSheetTitleResolver();
 
 export interface ReassignCanonicalRowInput {
   spreadsheetId: string;
@@ -11,6 +12,15 @@ export interface ReassignCanonicalRowInput {
   newCanonicalTelegramMessageId: string;
   /** Exactly buildSheetRow()'s 12-element output for the NEW canonical's own data. */
   row: readonly string[];
+  /**
+   * Additive and optional. Omitted/null (every legacy, one-dedicated-file
+   * group today) targets spreadsheetId's own default/first sheet, exactly
+   * as before this field existed. A number (a master/tab group's
+   * groups.google_sheet_gid) makes this call resolve that tab's CURRENT
+   * live title (via upsertRowInSheet.ts's own resolver — no separate
+   * resolution logic here) and target it specifically — never sheets[0].
+   */
+  googleSheetGid?: number | null;
 }
 
 export type ReassignCanonicalRowResult =
@@ -30,12 +40,29 @@ export type ReassignCanonicalRowResult =
  *
  * Never touches column A (№) — updateVisibleRow only ever writes B:M,
  * same guarantee as every other update-in-place path in this codebase.
+ *
+ * Master/tab groups (input.googleSheetGid set): before touching the sheet
+ * at all, resolves that gid's CURRENT tab title live via resolveSheetTitle
+ * — the exact same resolver upsertRowInSheet.ts/deleteRowInSheet.ts already
+ * use, never a separately re-implemented lookup. That resolution happening
+ * first means an unresolvable gid or a spreadsheets.get failure throws
+ * immediately, before any read or write is ever made. The resolved title
+ * is threaded through both the read and the write, so they always target
+ * the same tab. Legacy groups (googleSheetGid null/undefined) pass
+ * sheetTitle as undefined throughout — the exact prior behavior
+ * (spreadsheetId's own default/first sheet), completely unchanged.
  */
 export async function reassignCanonicalRow(
   input: ReassignCanonicalRowInput,
   client: SheetsWriteClient = defaultClient,
+  resolveSheetTitle: ResolveSheetTitleByGid = defaultResolveSheetTitle,
 ): Promise<ReassignCanonicalRowResult> {
-  const rows = await client.getAllDataRows(input.spreadsheetId);
+  const sheetTitle =
+    input.googleSheetGid !== undefined && input.googleSheetGid !== null
+      ? await resolveSheetTitle(input.spreadsheetId, input.googleSheetGid)
+      : undefined;
+
+  const rows = await client.getAllDataRows(input.spreadsheetId, sheetTitle);
   const rowIndex = rows.findIndex((row) => row[12] === input.oldCanonicalTelegramMessageId);
 
   if (rowIndex === -1) {
@@ -44,6 +71,6 @@ export async function reassignCanonicalRow(
 
   const rowNumber = FIRST_DATA_ROW_NUMBER + rowIndex;
   const valuesFromColumnB = [...input.row.slice(1), input.newCanonicalTelegramMessageId];
-  await client.updateVisibleRow(input.spreadsheetId, rowNumber, valuesFromColumnB);
+  await client.updateVisibleRow(input.spreadsheetId, rowNumber, valuesFromColumnB, sheetTitle);
   return { outcome: 'reassigned', rowNumber };
 }

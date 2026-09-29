@@ -155,3 +155,110 @@ export async function provisionSpreadsheetViaAppsScript(
 
   return { spreadsheetId: parsed.spreadsheetId };
 }
+
+export interface AppsScriptEnsureTabRequest {
+  /** The one, fixed master spreadsheet's id — passed explicitly by the caller, never read from env by this function itself. */
+  masterSpreadsheetId: string;
+  /** Passed through to Apps Script exactly as given — never trimmed, cased, or otherwise normalized here. */
+  tabTitle: string;
+  /** Apps Script uses this as its idempotency key (requestId -> tab mapping), same role requestId plays in provisionSpreadsheetViaAppsScript. */
+  requestId: string;
+}
+
+export interface AppsScriptEnsureTabResult {
+  /** Always the same value as the request's masterSpreadsheetId on success — the one fixed master file. */
+  spreadsheetId: string;
+  /** The tab's persistent gid — the ONLY stable identifier for it; never derive a range from `title` without re-resolving it live first (see sheetLayout.ts's withSheetTitle doc comment). */
+  sheetId: number;
+  /** The tab's current title. Never cache/persist this as an addressing key — a human can rename a tab at any time. */
+  title: string;
+  /** true if this call just created the tab, false if an existing, verified-owned tab was found and reused (idempotent repeat call). */
+  created: boolean;
+}
+
+/**
+ * Calls the Apps Script Web App's `ensureTab` action to idempotently create
+ * (or look up) one Telegram group's tab inside the single, shared master
+ * Google Spreadsheet — the target "one master file, one tab per group"
+ * architecture, as opposed to provisionSpreadsheetViaAppsScript's legacy
+ * "one dedicated file per group" contract, which this function does not
+ * touch, replace, or share any request/response shape with.
+ *
+ * Sends {token, action: "ensureTab", masterSpreadsheetId, tabTitle,
+ * requestId} / receives {ok, spreadsheetId, sheetId, title, created,
+ * requestId} — same secret-transport, timeout, and error-sanitization
+ * rules as provisionSpreadsheetViaAppsScript (see that function's own doc
+ * comment for the full rationale, which applies identically here).
+ *
+ * Not yet called from any production code path in this stage — this is
+ * only the API client function itself.
+ */
+export async function provisionTabViaAppsScript(
+  request: AppsScriptEnsureTabRequest,
+  deps: ProvisionSpreadsheetDependencies = defaultDependencies,
+): Promise<AppsScriptEnsureTabResult> {
+  const { webAppUrl, sharedSecret } = deps.getConfig();
+
+  let response: Response;
+  try {
+    response = await deps.fetchImpl(webAppUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        token: sharedSecret,
+        action: 'ensureTab',
+        masterSpreadsheetId: request.masterSpreadsheetId,
+        tabTitle: request.tabTitle,
+        requestId: request.requestId,
+      }),
+      signal: AbortSignal.timeout(deps.getTimeoutMs()),
+    });
+  } catch (error) {
+    throw new Error(`Apps Script ensureTab request failed: ${sanitizeErrorMessage(error, sharedSecret)}`);
+  }
+
+  if (!response.ok) {
+    throw new Error(`Apps Script ensureTab request failed: HTTP ${response.status}`);
+  }
+
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch (error) {
+    throw new Error(`Apps Script ensureTab response was not valid JSON: ${sanitizeErrorMessage(error, sharedSecret)}`);
+  }
+
+  if (!body || typeof body !== 'object') {
+    throw new Error('Apps Script ensureTab response was not a JSON object');
+  }
+  const parsed = body as Record<string, unknown>;
+
+  if (parsed.ok !== true) {
+    const reportedError = typeof parsed.error === 'string' ? parsed.error.slice(0, MAX_ERROR_MESSAGE_LENGTH) : 'unknown error';
+    throw new Error(`Apps Script ensureTab reported failure: ${reportedError}`);
+  }
+
+  if (parsed.requestId !== request.requestId) {
+    throw new Error('Apps Script ensureTab response requestId does not match the request');
+  }
+
+  if (typeof parsed.spreadsheetId !== 'string' || parsed.spreadsheetId.length === 0) {
+    throw new Error('Apps Script ensureTab response did not include a valid spreadsheetId');
+  }
+  if (typeof parsed.sheetId !== 'number' || !Number.isFinite(parsed.sheetId)) {
+    throw new Error('Apps Script ensureTab response did not include a valid sheetId');
+  }
+  if (typeof parsed.title !== 'string' || parsed.title.length === 0) {
+    throw new Error('Apps Script ensureTab response did not include a valid title');
+  }
+  if (typeof parsed.created !== 'boolean') {
+    throw new Error('Apps Script ensureTab response did not include a valid created flag');
+  }
+
+  return {
+    spreadsheetId: parsed.spreadsheetId,
+    sheetId: parsed.sheetId,
+    title: parsed.title,
+    created: parsed.created,
+  };
+}

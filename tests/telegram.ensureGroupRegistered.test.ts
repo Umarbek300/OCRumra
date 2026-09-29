@@ -1,12 +1,41 @@
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 import { pool } from '../src/db/pool.js';
-import { findGroupByTelegramChatId } from '../src/db/repositories/groups.repo.js';
-import { findPassportProcessingByTelegramMessageId } from '../src/db/repositories/passportProcessing.repo.js';
-import { findTelegramMessageById } from '../src/db/repositories/telegramMessages.repo.js';
-import { PASSPORT_PROCESSING_QUEUE, dequeuePassportProcessing } from '../src/queue/passportProcessingQueue.js';
+import { createGroup, findGroupByTelegramChatId } from '../src/db/repositories/groups.repo.js';
+import { createPassportProcessingRecord, findPassportProcessingByTelegramMessageId } from '../src/db/repositories/passportProcessing.repo.js';
+import {
+  findTelegramMessageById,
+  findUnlinkedMessagesByTelegramChatId,
+  linkTelegramMessageToGroup,
+} from '../src/db/repositories/telegramMessages.repo.js';
+import { dequeuePassportProcessing, enqueuePassportProcessing } from '../src/queue/passportProcessingQueue.js';
 import { ensureRedisConnected, redisClient } from '../src/queue/redis.js';
-import { ensureGroupRegistered } from '../src/telegram/ensureGroupRegistered.js';
+import {
+  ensureGroupRegistered as ensureGroupRegisteredWithProdDeps,
+  type EnsureGroupRegisteredDependencies,
+  type EnsureGroupRegisteredResult,
+} from '../src/telegram/ensureGroupRegistered.js';
+
+// Isolated from the real production queue (which the live
+// ocrumra-worker.service actively consumes from) so these tests never race
+// a live consumer for their own just-enqueued job, and never push fake test
+// jobs onto the real queue. See passportProcessingQueue.ts's own doc
+// comment on the queueName parameter this relies on.
+const TEST_QUEUE_NAME = 'ocrumra:test:ensure-group-registered-queue';
+
+const testDeps: EnsureGroupRegisteredDependencies = {
+  findGroup: findGroupByTelegramChatId,
+  createGroup,
+  findUnlinked: findUnlinkedMessagesByTelegramChatId,
+  linkMessage: linkTelegramMessageToGroup,
+  createProcessingRecord: createPassportProcessingRecord,
+  enqueueProcessing: (telegramMessageId: string) => enqueuePassportProcessing(telegramMessageId, TEST_QUEUE_NAME),
+};
+
+/** Every call in this file routes through testDeps above -- isolated from the real production queue. */
+function ensureGroupRegistered(telegramChatId: number, chatTitle: string | null): Promise<EnsureGroupRegisteredResult> {
+  return ensureGroupRegisteredWithProdDeps(telegramChatId, chatTitle, testDeps);
+}
 
 let idCounter = 0;
 function uniqueChatId(): number {
@@ -55,12 +84,12 @@ async function cleanup(chatId: number, groupId: string | null, agentIds: string[
   for (const agentId of agentIds) {
     await pool.query('DELETE FROM agents WHERE id = $1', [agentId]);
   }
-  await redisClient.del(PASSPORT_PROCESSING_QUEUE);
+  await redisClient.del(TEST_QUEUE_NAME);
 }
 
 before(async () => {
   await ensureRedisConnected();
-  await redisClient.del(PASSPORT_PROCESSING_QUEUE);
+  await redisClient.del(TEST_QUEUE_NAME);
 });
 
 test('creates a new group from a confidently-parsed title when the chat is unregistered', async () => {
@@ -147,7 +176,7 @@ test('backfills pre-existing unlinked messages once the group is auto-registered
     const processing = await findPassportProcessingByTelegramMessageId(messageId);
     assert.equal(processing?.status, 'queued');
 
-    const job = await dequeuePassportProcessing(1);
+    const job = await dequeuePassportProcessing(1, TEST_QUEUE_NAME);
     assert.equal(job?.telegramMessageId, messageId);
   } finally {
     await cleanup(chatId, groupId, [agentId]);

@@ -50,16 +50,55 @@ export const TECHNICAL_ID_COLUMN_LETTER = 'M';
 export const HEADER_RANGE_A1 = `${FIRST_VISIBLE_COLUMN_LETTER}${HEADER_ROW_NUMBER}:${TECHNICAL_ID_COLUMN_LETTER}${HEADER_ROW_NUMBER}`;
 export const FULL_ROW_RANGE_COLUMNS = `${FIRST_VISIBLE_COLUMN_LETTER}:${TECHNICAL_ID_COLUMN_LETTER}`;
 
+/**
+ * Escapes a tab title for safe use as an A1-notation sheet-name prefix
+ * ('<title>'!<range>), per Google Sheets' own escaping rule: wrap in single
+ * quotes, and double any single quote that appears inside the title itself
+ * (e.g. "Bob's Group" -> 'Bob''s Group').
+ */
+export function escapeSheetTitleForA1(title: string): string {
+  return `'${title.replace(/'/g, "''")}'`;
+}
+
+/**
+ * Prefixes a bare A1 range with a tab title, per Google Sheets' own
+ * "'<title>'!<range>" syntax. `sheetTitle` is additive and optional: every
+ * existing caller in this codebase omits it today and gets back the exact
+ * same unprefixed range as before (Sheets then resolves that against the
+ * spreadsheet's first/default sheet — today's one-file-per-group behavior,
+ * completely unchanged). Only a future, tab-aware caller passes it.
+ *
+ * A tab's title is never cached or persisted anywhere in this codebase as
+ * an addressing key — a human can rename a tab at any time — so whatever
+ * title a caller passes here must always have been re-resolved live (e.g.
+ * via spreadsheets.get, keyed by the tab's stable sheetId/gid) immediately
+ * before building the range, never read back from storage.
+ */
+export function withSheetTitle(range: string, sheetTitle?: string): string {
+  if (sheetTitle === undefined) return range;
+  return `${escapeSheetTitleForA1(sheetTitle)}!${range}`;
+}
+
+/** Function form of HEADER_RANGE_A1, additionally tab-aware — see withSheetTitle. */
+export function headerRangeA1(sheetTitle?: string): string {
+  return withSheetTitle(HEADER_RANGE_A1, sheetTitle);
+}
+
+/** Function form of FULL_ROW_RANGE_COLUMNS, additionally tab-aware — see withSheetTitle. */
+export function fullRowRangeColumns(sheetTitle?: string): string {
+  return withSheetTitle(FULL_ROW_RANGE_COLUMNS, sheetTitle);
+}
+
 /** Range for column A:L only (excludes № is included; excludes the technical id column) — used when updating an existing row without touching its № or technical id. */
-export function visibleDataRangeForRow(rowNumber: number): string {
-  return `${FIRST_VISIBLE_COLUMN_LETTER}${rowNumber}:${LAST_VISIBLE_COLUMN_LETTER}${rowNumber}`;
+export function visibleDataRangeForRow(rowNumber: number, sheetTitle?: string): string {
+  return withSheetTitle(`${FIRST_VISIBLE_COLUMN_LETTER}${rowNumber}:${LAST_VISIBLE_COLUMN_LETTER}${rowNumber}`, sheetTitle);
 }
 
 /** № (column A) is left out on purpose — see visibleDataRangeForRow's doc comment. */
-export function columnBAndAfterRangeForRow(rowNumber: number): string {
-  return `B${rowNumber}:${TECHNICAL_ID_COLUMN_LETTER}${rowNumber}`;
+export function columnBAndAfterRangeForRow(rowNumber: number, sheetTitle?: string): string {
+  return withSheetTitle(`B${rowNumber}:${TECHNICAL_ID_COLUMN_LETTER}${rowNumber}`, sheetTitle);
 }
 
-export function fullRowRange(rowNumber: number): string {
-  return `${FIRST_VISIBLE_COLUMN_LETTER}${rowNumber}:${TECHNICAL_ID_COLUMN_LETTER}${rowNumber}`;
+export function fullRowRange(rowNumber: number, sheetTitle?: string): string {
+  return withSheetTitle(`${FIRST_VISIBLE_COLUMN_LETTER}${rowNumber}:${TECHNICAL_ID_COLUMN_LETTER}${rowNumber}`, sheetTitle);
 }

@@ -84,6 +84,7 @@ const GROUP: Group = {
   departureDate: '2026-09-20',
   telegramChatId: '-1001234567890',
   googleSheetId: 'sheet-abc',
+  googleSheetGid: null,
   createdAt: '2026-01-01T00:00:00.000Z',
   updatedAt: '2026-01-01T00:00:00.000Z',
 };
@@ -759,4 +760,45 @@ test('computeSheetSyncBackoff follows the deterministic schedule: 1min, 5min, 30
   assert.equal(computeSheetSyncBackoff(3, now).getTime(), new Date('2026-01-01T00:30:00.000Z').getTime());
   assert.equal(computeSheetSyncBackoff(4, now).getTime(), new Date('2026-01-01T01:00:00.000Z').getTime());
   assert.equal(computeSheetSyncBackoff(10, now).getTime(), new Date('2026-01-01T01:00:00.000Z').getTime(), 'caps at the last schedule entry, never grows unbounded');
+});
+
+// --- googleSheetGid data-flow (master/tab architecture) ---
+
+test('A: a legacy group (googleSheetGid null) passes googleSheetGid: null through to upsertRow, unchanged behavior', async () => {
+  let seenInput: unknown;
+  const { deps } = buildDeps({
+    group: { ...GROUP, googleSheetGid: null },
+    upsertRowImpl: async (input) => {
+      seenInput = input;
+      return { action: 'appended', rowNumber: 5 };
+    },
+  });
+
+  await syncPassportRowToSheet('job-1', deps);
+
+  assert.equal((seenInput as { googleSheetGid: number | null }).googleSheetGid, null);
+});
+
+test('B: a master/tab group passes its exact googleSheetGid through to upsertRow', async () => {
+  let seenInput: unknown;
+  const { deps } = buildDeps({
+    group: { ...GROUP, googleSheetGid: 918273645 },
+    upsertRowImpl: async (input) => {
+      seenInput = input;
+      return { action: 'appended', rowNumber: 5 };
+    },
+  });
+
+  await syncPassportRowToSheet('job-1', deps);
+
+  assert.equal((seenInput as { googleSheetGid: number | null }).googleSheetGid, 918273645);
+});
+
+test('findGroup is called exactly once per sync, reused for both upsertRow and the gender summary (no redundant DB call)', async () => {
+  const { deps, calls } = buildDeps({ group: { ...GROUP, googleSheetGid: 111 } });
+
+  await syncPassportRowToSheet('job-1', deps);
+
+  assert.equal(calls.findGroup, 1);
+  assert.equal(calls.writeGenderSummary, 1, 'the gender summary still gets written, using the same already-fetched group');
 });

@@ -221,8 +221,21 @@ export async function syncPassportRowToSheet(
     const depositText = depositAmount ? formatMoneyForSheet(depositAmount) : '';
     const balanceText = balance ? formatMoneyForSheet(balance) : '';
 
+    // Fetched once here (not re-fetched below) and reused for both the
+    // Sheets write target and the gender summary — a master/tab group's
+    // stable gid (null for a legacy, one-dedicated-file group — upsertRow
+    // then falls back to its exact prior, unchanged behavior). Never
+    // resolved to a title here — that live gid -> title resolution is
+    // upsertRowInSheet's own job.
+    const group = await deps.findGroup(telegramMessage.groupId);
+
     const row = buildSheetRow({ ocrResult, agent, packageText, depositText, balanceText });
-    const result = await deps.upsertRow({ spreadsheetId, telegramMessageId: canonicalTelegramMessageId, row });
+    const result = await deps.upsertRow({
+      spreadsheetId,
+      telegramMessageId: canonicalTelegramMessageId,
+      row,
+      googleSheetGid: group?.googleSheetGid,
+    });
 
     await deps.markSynced(claimed.id, result.rowNumber);
     console.log(`[sheets-sync] job ${claimed.id} synced (${result.action}, sheet=${spreadsheetId}, row=${result.rowNumber})`);
@@ -236,13 +249,12 @@ export async function syncPassportRowToSheet(
     // already succeeded in the sheet must never be flipped back to
     // status='failed' just because this secondary summary write failed.
     try {
-      const group = await deps.findGroup(telegramMessage.groupId);
       if (!group) {
         throw new Error(`group ${telegramMessage.groupId} not found while writing its gender summary`);
       }
       const stats = await deps.computeGenderStats(telegramMessage.groupId);
       const summaryRows = buildGenderSummaryBlock(group, stats);
-      await deps.writeGenderSummary(spreadsheetId, summaryRows);
+      await deps.writeGenderSummary(spreadsheetId, summaryRows, group.googleSheetGid);
     } catch (genderSummaryError) {
       console.error(
         `[sheets-sync] job ${claimed.id} synced successfully but the group gender summary update failed: ${sanitizeErrorMessage(genderSummaryError)}`,

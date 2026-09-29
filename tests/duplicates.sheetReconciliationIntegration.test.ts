@@ -28,6 +28,7 @@ import { findTelegramMessageById } from '../src/db/repositories/telegramMessages
 import { findActiveCanonicalLink as findActiveCanonicalLinkReal, findActiveDuplicateCandidates } from '../src/db/repositories/passportMessageLinks.repo.js';
 import { claimPassportOperatorCommand, markPassportOperatorCommandCompleted, markPassportOperatorCommandFailed } from '../src/db/repositories/passportOperatorCommands.repo.js';
 import { retireCanonicalAndPromoteReplacement, promoteReplacementAndRelocateLink } from '../src/duplicates/applyIdentityStateChange.js';
+import { findGroupById } from '../src/db/repositories/groups.repo.js';
 
 let idCounter = 0;
 function uniqueChatId(): number {
@@ -164,6 +165,7 @@ function fakeReconcileDeps(overrides: Partial<ReconcileSheetRowDependencies> = {
     findTelegramMessage: findTelegramMessageById,
     findOcrResult: findPassportOcrResultByTelegramMessageId,
     findAgent: findAgentById,
+    findGroup: findGroupById,
     ...overrides,
   };
 
@@ -182,6 +184,7 @@ function fakeCommandDeps(overrides: Partial<ProcessOperatorCommandDependencies> 
     findOcrResult: findPassportOcrResultByTelegramMessageId,
     findAgent: findAgentById,
     ensureSheet: async (groupId) => ({ spreadsheetId: `sheet-for-${groupId}` }),
+    findGroup: findGroupById,
     upsertRow: async () => ({ action: 'appended', rowNumber: 2 }),
     retireAndPromote: retireCanonicalAndPromoteReplacement,
     promoteAndRelocate: promoteReplacementAndRelocateLink,

@@ -1,4 +1,5 @@
 import { findAgentById } from '../db/repositories/agents.repo.js';
+import { findGroupById } from '../db/repositories/groups.repo.js';
 import { findActiveCanonicalLink } from '../db/repositories/passportMessageLinks.repo.js';
 import { findPassportOcrResultByTelegramMessageId } from '../db/repositories/passportOcrResult.repo.js';
 import {
@@ -32,6 +33,7 @@ export interface ReconcileSheetRowDependencies {
   findTelegramMessage: typeof findTelegramMessageById;
   findOcrResult: typeof findPassportOcrResultByTelegramMessageId;
   findAgent: typeof findAgentById;
+  findGroup: typeof findGroupById;
 }
 
 const defaultDependencies: ReconcileSheetRowDependencies = {
@@ -45,6 +47,7 @@ const defaultDependencies: ReconcileSheetRowDependencies = {
   findTelegramMessage: findTelegramMessageById,
   findOcrResult: findPassportOcrResultByTelegramMessageId,
   findAgent: findAgentById,
+  findGroup: findGroupById,
 };
 
 /**
@@ -89,6 +92,11 @@ export async function reconcileSheetRow(jobId: string, deps: ReconcileSheetRowDe
 
   try {
     const { spreadsheetId } = await deps.ensureSheet(claimed.groupId);
+    // A master/tab group's stable gid (null/absent for a legacy group —
+    // deleteCanonicalRow then falls back to its exact prior, unchanged
+    // behavior). Never resolved to a title here — deleteCanonicalRow's own
+    // live gid -> title resolution handles that.
+    const googleSheetGid = (await deps.findGroup(claimed.groupId))?.googleSheetGid;
 
     if (claimed.sourceOperation === 'merge') {
       // Retire mode: a merge's same-group conflict resolution permanently
@@ -105,7 +113,7 @@ export async function reconcileSheetRow(jobId: string, deps: ReconcileSheetRowDe
       // Reassigning the anchor to it would therefore create a DUPLICATE
       // row, not fix a stale one — so this is always a delete, never a
       // fresh findActiveCanonicalLink-driven reassign.
-      await deps.deleteRow({ spreadsheetId, expectedCanonicalTelegramMessageId: claimed.expectedOldCanonicalTelegramMessageId });
+      await deps.deleteRow({ spreadsheetId, expectedCanonicalTelegramMessageId: claimed.expectedOldCanonicalTelegramMessageId, googleSheetGid });
       await deps.markDone(claimed.id);
       console.log(`[sheet-reconciliation] job ${claimed.id} (${claimed.sourceOperation}) done`);
       return;
@@ -130,9 +138,10 @@ export async function reconcileSheetRow(jobId: string, deps: ReconcileSheetRowDe
         oldCanonicalTelegramMessageId: claimed.expectedOldCanonicalTelegramMessageId,
         newCanonicalTelegramMessageId: currentCanonical.telegramMessageId,
         row: built.row,
+        googleSheetGid,
       });
     } else {
-      await deps.deleteRow({ spreadsheetId, expectedCanonicalTelegramMessageId: claimed.expectedOldCanonicalTelegramMessageId });
+      await deps.deleteRow({ spreadsheetId, expectedCanonicalTelegramMessageId: claimed.expectedOldCanonicalTelegramMessageId, googleSheetGid });
     }
 
     await deps.markDone(claimed.id);

@@ -1,5 +1,6 @@
-import { provisionSpreadsheetViaAppsScript } from './appsScriptProvisioning.js';
-import { findGroupById, setGroupGoogleSheetId, type Group } from '../db/repositories/groups.repo.js';
+import { env } from '../config/env.js';
+import { provisionSpreadsheetViaAppsScript, provisionTabViaAppsScript } from './appsScriptProvisioning.js';
+import { findGroupById, setGroupGoogleSheetId, setGroupSheetTab, type Group } from '../db/repositories/groups.repo.js';
 import { getConfiguredApiTimeoutMs, getConfiguredDriveFolderId, getSheetsClients } from './sheetsAuth.js';
 import { HEADER_RANGE_A1, SHEET_HEADER_ROW } from './sheetLayout.js';
 
@@ -157,19 +158,41 @@ export function buildRealProvisioningClient(
   };
 }
 
+/**
+ * Reads the single, shared master spreadsheet id for the target "one
+ * master file, one tab per group" architecture (populated via the Apps
+ * Script `ensureTab` action). Optional: when unset — the case for every
+ * production flow today, since nothing yet sets this env var — every
+ * group, new or existing, falls back entirely to the legacy
+ * one-dedicated-file-per-group path below, completely unchanged.
+ * Injectable source, same pattern as sheetsAuth.ts's own config resolvers.
+ */
+export function getConfiguredMasterSpreadsheetId(
+  source: { GOOGLE_SHEETS_MASTER_SPREADSHEET_ID?: string } = env,
+): string | null {
+  return source.GOOGLE_SHEETS_MASTER_SPREADSHEET_ID ?? null;
+}
+
 export interface EnsureGroupSheetDependencies {
   findGroup: typeof findGroupById;
   setGoogleSheetId: typeof setGroupGoogleSheetId;
+  setGroupSheetTab: typeof setGroupSheetTab;
   provisioningClient: SheetsProvisioningClient;
+  provisionTab: typeof provisionTabViaAppsScript;
   /** A function, not a pre-resolved value — only called when a spreadsheet actually needs creating, never on the "already has one" fast path. */
   getDriveFolderId: () => string | null;
+  /** A function, not a pre-resolved value — only called for a brand-new group that has no spreadsheet yet. */
+  getMasterSpreadsheetId: () => string | null;
 }
 
 const defaultDependencies: EnsureGroupSheetDependencies = {
   findGroup: findGroupById,
   setGoogleSheetId: setGroupGoogleSheetId,
+  setGroupSheetTab: setGroupSheetTab,
   provisioningClient: buildRealProvisioningClient(),
+  provisionTab: provisionTabViaAppsScript,
   getDriveFolderId: getConfiguredDriveFolderId,
+  getMasterSpreadsheetId: getConfiguredMasterSpreadsheetId,
 };
 
 export interface EnsureGroupSheetResult {
@@ -179,26 +202,44 @@ export interface EnsureGroupSheetResult {
 /**
  * Returns the group's spreadsheet, creating it once if this is the first
  * time. Never sends the group's passport data anywhere — only the
- * spreadsheet title (built from group.name/departureDate, never
- * passport/OCR content) and the fixed header row.
+ * spreadsheet/tab title (built from group.name/departureDate, never
+ * passport/OCR content) and, on the legacy path, the fixed header row.
  *
- * Race-safety: if two callers race to provision the same group's sheet
- * concurrently, groups.repo.ts's setGroupGoogleSheetId only lets ONE of
- * them actually persist a google_sheet_id (its UPDATE ... WHERE
- * google_sheet_id IS NULL only matches once) — this is the single
- * authoritative guard, unchanged by Apps Script provisioning. (Apps
- * Script's own requestId-keyed lookup adds a second, best-effort layer
- * that often avoids even creating a duplicate file in the first place, but
- * it is an optimization, never something this function relies on for
- * correctness.) The loser's own freshly-created spreadsheet is simply
- * discarded (left as an orphan in Drive — an accepted, documented cost,
- * not retried/deleted: it now lives in a real human's Drive, created via
- * Apps Script, and this service account has at most Editor access to it —
- * neither this backend nor its service account can safely delete a file
- * they do not own, and guessing at deletion risks removing something a
- * human might already be viewing) and it reads back the winner's
- * spreadsheet id instead, so every caller converges on the same one
- * spreadsheet per group regardless of who "won".
+ * Dual-path, dispatched on whether the group already has a google_sheet_id
+ * and, for a brand-new group, on whether a master spreadsheet is
+ * configured:
+ *
+ *  - Already has google_sheet_id (legacy dedicated file OR an
+ *    already-resolved master+tab — either way this one column is always
+ *    the persisted answer): returned immediately, no provisioning call of
+ *    any kind. This single check is also what enforces grandfathering — an
+ *    existing legacy group is NEVER migrated onto the master architecture,
+ *    even once GOOGLE_SHEETS_MASTER_SPREADSHEET_ID is configured, because
+ *    it never reaches the branches below that consult it.
+ *  - No google_sheet_id yet, master spreadsheet configured: provisions a
+ *    tab inside that master file (see ensureGroupTabInMasterSpreadsheet_).
+ *  - No google_sheet_id yet, no master spreadsheet configured: the
+ *    original, entirely unchanged legacy one-dedicated-file provisioning
+ *    path (see ensureLegacyDedicatedSpreadsheet_).
+ *
+ * Race-safety for the legacy path: groups.repo.ts's setGroupGoogleSheetId
+ * only lets ONE racing caller actually persist a google_sheet_id (its
+ * UPDATE ... WHERE google_sheet_id IS NULL only matches once) — the single
+ * authoritative guard there, unchanged by this stage. (Apps Script's own
+ * requestId-keyed lookup adds a second, best-effort layer that often
+ * avoids even creating a duplicate file in the first place, but it is an
+ * optimization, never something this function relies on for correctness.)
+ * The loser's own freshly-created spreadsheet is simply discarded (left as
+ * an orphan in Drive — an accepted, documented cost, not retried/deleted:
+ * it now lives in a real human's Drive, created via Apps Script, and this
+ * service account has at most Editor access to it — neither this backend
+ * nor its service account can safely delete a file they do not own, and
+ * guessing at deletion risks removing something a human might already be
+ * viewing) and it reads back the winner's spreadsheet id instead, so every
+ * caller converges on the same one spreadsheet per group regardless of who
+ * "won". See ensureGroupTabInMasterSpreadsheet_'s own doc comment for the
+ * master/tab path's different, but equally authoritative, race-safety
+ * story.
  */
 export async function ensureGroupSheet(
   groupId: string,
@@ -212,6 +253,66 @@ export async function ensureGroupSheet(
     return { spreadsheetId: group.googleSheetId };
   }
 
+  const masterSpreadsheetId = deps.getMasterSpreadsheetId();
+  if (masterSpreadsheetId) {
+    return ensureGroupTabInMasterSpreadsheet_(group, masterSpreadsheetId, deps);
+  }
+
+  return ensureLegacyDedicatedSpreadsheet_(group, groupId, deps);
+}
+
+/**
+ * New-architecture path for a group with no spreadsheet yet, taken only
+ * when GOOGLE_SHEETS_MASTER_SPREADSHEET_ID is configured.
+ *
+ * Race-safety here comes from a different, but equally authoritative,
+ * source than the legacy path's DB-side "claim": the Apps Script
+ * `ensureTab` action's own requestId-keyed idempotency and LockService
+ * critical section — confirmed safe under genuinely concurrent HTTP
+ * requests via real testing, not merely assumed — guarantees that two
+ * callers racing with the SAME requestId (here, the group's own id, the
+ * same convention the legacy path already uses) always converge on the
+ * identical {spreadsheetId, sheetId} pair. setGroupSheetTab's own write is
+ * a plain, non-claim-guarded UPDATE (see its own doc comment in
+ * groups.repo.ts) precisely because it never has to arbitrate a race
+ * itself here — both racing callers write the same already-converged
+ * values, so whichever one's UPDATE lands last simply repeats it
+ * redundantly, never corrupts it.
+ *
+ * Deliberately does not (yet) write a header row into the new tab — this
+ * stage only wires up tab provisioning + persistence; header-writing for a
+ * tab (as opposed to a whole new file) needs its own tab-scoped Sheets
+ * write and is left for a later stage.
+ */
+async function ensureGroupTabInMasterSpreadsheet_(
+  group: Group,
+  masterSpreadsheetId: string,
+  deps: EnsureGroupSheetDependencies,
+): Promise<EnsureGroupSheetResult> {
+  const tabTitle = buildSpreadsheetTitle(group);
+  const tab = await deps.provisionTab({ masterSpreadsheetId, tabTitle, requestId: group.id });
+
+  const persisted = await deps.setGroupSheetTab(group.id, tab.spreadsheetId, tab.sheetId);
+  if (!persisted) {
+    // Apps Script already created/found the tab — never hide this partial
+    // state behind a generic failure. A human must reconcile: the tab is
+    // real, but the database does not yet know about it.
+    throw new Error(
+      `ensureGroupSheet: Apps Script ensureTab succeeded for group ${group.id} ` +
+        `(spreadsheetId=${tab.spreadsheetId}, sheetId=${tab.sheetId}, title=${tab.title}) ` +
+        'but persisting it failed — no matching group row was found to update. ' +
+        'The tab now exists in the master spreadsheet but is not recorded in the database; manual reconciliation is required.',
+    );
+  }
+  return { spreadsheetId: persisted.googleSheetId };
+}
+
+/** The original one-dedicated-file-per-group path — entirely unchanged behavior, only extracted into its own function so ensureGroupSheet can dispatch to it. */
+async function ensureLegacyDedicatedSpreadsheet_(
+  group: Group,
+  groupId: string,
+  deps: EnsureGroupSheetDependencies,
+): Promise<EnsureGroupSheetResult> {
   const folderId = deps.getDriveFolderId();
   if (!folderId) {
     throw new Error(
@@ -229,9 +330,9 @@ export async function ensureGroupSheet(
     return { spreadsheetId: claimed.googleSheetId };
   }
 
-  // Lost the race — see doc comment above. No cleanup is attempted here,
-  // deliberately: see the doc comment for why deleting the orphan is not a
-  // safe operation this backend can perform.
+  // Lost the race — see ensureGroupSheet's doc comment above. No cleanup is
+  // attempted here, deliberately: see that doc comment for why deleting
+  // the orphan is not a safe operation this backend can perform.
   const winner = await deps.findGroup(groupId);
   if (!winner || !winner.googleSheetId) {
     throw new Error(

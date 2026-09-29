@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import { pool } from '../src/db/pool.js';
 import { createPassportOcrResult } from '../src/db/repositories/passportOcrResult.repo.js';
 import { createPassportIdentity } from '../src/db/repositories/passportIdentity.repo.js';
+import { findGroupById, type Group } from '../src/db/repositories/groups.repo.js';
 import {
   createPassportMessageLink,
   findActiveCanonicalLink,
@@ -140,6 +141,7 @@ function fakeDeps(overrides: Partial<ProcessOperatorCommandDependencies> = {}): 
     findOcrResult: findPassportOcrResultByTelegramMessageId,
     findAgent: findAgentById,
     ensureSheet: async (groupId: string) => ({ spreadsheetId: `sheet-for-${groupId}` }),
+    findGroup: findGroupById,
     upsertRow: async (input) => {
       calls.upsertRow += 1;
       upsertArgs.push(input);
@@ -386,6 +388,11 @@ test('move_to_group with no remaining source in the old group deletes the old ro
     assert.equal(calls.upsertRow, 1);
     assert.equal((upsertArgs[0] as { telegramMessageId: string; spreadsheetId: string }).telegramMessageId, messageId);
     assert.equal((upsertArgs[0] as { spreadsheetId: string }).spreadsheetId, `sheet-for-${toGroupId}`);
+    assert.equal(
+      (upsertArgs[0] as { googleSheetGid: number | null | undefined }).googleSheetGid,
+      null,
+      'H-1: a legacy destination group (google_sheet_gid null in the DB) passes googleSheetGid as null, unchanged behavior',
+    );
 
     // P1: the ORIGIN group's cleanup is now a durable reconciliation job,
     // not a direct deleteRow call.
@@ -407,6 +414,62 @@ test('move_to_group with no remaining source in the old group deletes the old ro
 
     const events = await listEventsForIdentity(identity.id);
     assert.ok(events.some((e) => e.eventType === 'group_transferred'));
+  } finally {
+    await cleanupAll([fromGroupId, toGroupId], [agentId], [identity.id]);
+  }
+});
+
+test('H-1: move_to_group threads the destination (master/tab) group\'s googleSheetGid into upsertRow, never dropping it', async () => {
+  const fromGroupId = await createGroup();
+  const toGroupId = await createGroup();
+  const agentId = await createAgent();
+  const messageId = await createMessage(fromGroupId, agentId, 'Package: $1000');
+  await createOcrResult(messageId);
+  const identity = await createPassportIdentity(uniquePassportNumber(), '1990-01-01');
+  assert.ok(identity);
+  const link = await createPassportMessageLink({
+    passportIdentityId: identity.id,
+    telegramMessageId: messageId,
+    groupId: fromGroupId,
+    agentId,
+    role: 'canonical',
+    matchConfidenceTier: 'new_identity',
+  });
+  assert.ok(link);
+
+  try {
+    const command = await createMoveToGroupCommand({
+      passportIdentityId: identity.id,
+      fromGroupId,
+      toGroupId,
+      telegramMessageId: messageId,
+      operatorId: 'operator-1',
+    });
+    // The destination group is a master/tab group in this scenario --
+    // overriding findGroup (rather than writing google_sheet_gid into the
+    // real DB row) keeps this test a pure dependency-injection unit test,
+    // same style as every other fakeDeps override in this file.
+    const fakeDestinationGroup: Group = {
+      id: toGroupId,
+      name: 'Destination Master/Tab Group',
+      departureDate: '2026-09-20',
+      telegramChatId: null,
+      googleSheetId: 'master-abc',
+      googleSheetGid: 456789,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    const { deps, calls, upsertArgs } = fakeDeps({
+      findGroup: async (id: string) => (id === toGroupId ? fakeDestinationGroup : findGroupById(id)),
+    });
+    await processPassportOperatorCommand(command.id, deps);
+
+    assert.equal(calls.upsertRow, 1);
+    assert.equal(
+      (upsertArgs[0] as { googleSheetGid: number | null | undefined }).googleSheetGid,
+      456789,
+      'H-1: a master/tab destination group\'s googleSheetGid must reach upsertRow -- never dropped/omitted',
+    );
   } finally {
     await cleanupAll([fromGroupId, toGroupId], [agentId], [identity.id]);
   }
