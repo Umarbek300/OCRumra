@@ -10,6 +10,7 @@ import {
 import type { AppsScriptEnsureTabResult } from '../src/sheets/appsScriptProvisioning.js';
 import type { Group, GroupSheetTab } from '../src/db/repositories/groups.repo.js';
 import type { SheetsClients } from '../src/sheets/sheetsAuth.js';
+import { SHEET_HEADER_ROW } from '../src/sheets/sheetLayout.js';
 
 const BASE_GROUP: Group = {
   id: 'group-1',
@@ -30,6 +31,11 @@ interface Calls {
   moveToFolder: number;
   provisionTab: number;
   setGroupSheetTab: number;
+}
+
+interface WriteHeaderRowCallArgs {
+  spreadsheetId: string;
+  sheetTitle: string | undefined;
 }
 
 interface CreateSpreadsheetCallArgs {
@@ -58,6 +64,8 @@ function buildDeps(
   createSpreadsheetCalls: CreateSpreadsheetCallArgs[];
   provisionTabCalls: ProvisionTabCallArgs[];
   setGroupSheetTabCalls: SetGroupSheetTabCallArgs[];
+  writeHeaderRowCalls: WriteHeaderRowCallArgs[];
+  callOrder: string[];
 } {
   const calls: Calls = {
     findGroup: 0,
@@ -71,6 +79,8 @@ function buildDeps(
   const createSpreadsheetCalls: CreateSpreadsheetCallArgs[] = [];
   const provisionTabCalls: ProvisionTabCallArgs[] = [];
   const setGroupSheetTabCalls: SetGroupSheetTabCallArgs[] = [];
+  const writeHeaderRowCalls: WriteHeaderRowCallArgs[] = [];
+  const callOrder: string[] = [];
   const group = overrides.group !== undefined ? overrides.group : BASE_GROUP;
 
   const deps: EnsureGroupSheetDependencies = {
@@ -85,6 +95,7 @@ function buildDeps(
     },
     setGroupSheetTab: async (groupId, spreadsheetId, sheetId): Promise<GroupSheetTab | null> => {
       calls.setGroupSheetTab += 1;
+      callOrder.push('setGroupSheetTab');
       setGroupSheetTabCalls.push({ groupId, spreadsheetId, sheetId });
       return { id: groupId, googleSheetId: spreadsheetId, googleSheetGid: sheetId };
     },
@@ -94,8 +105,10 @@ function buildDeps(
         createSpreadsheetCalls.push({ title, requestId, folderId });
         return { spreadsheetId: `created-for-${title}` };
       },
-      writeHeaderRow: async () => {
+      writeHeaderRow: async (spreadsheetId, sheetTitle) => {
         calls.writeHeaderRow += 1;
+        callOrder.push('writeHeaderRow');
+        writeHeaderRowCalls.push({ spreadsheetId, sheetTitle });
       },
       moveToFolder: async () => {
         calls.moveToFolder += 1;
@@ -103,6 +116,7 @@ function buildDeps(
     },
     provisionTab: async ({ masterSpreadsheetId, tabTitle, requestId }): Promise<AppsScriptEnsureTabResult> => {
       calls.provisionTab += 1;
+      callOrder.push('provisionTab');
       provisionTabCalls.push({ masterSpreadsheetId, tabTitle, requestId });
       return { spreadsheetId: masterSpreadsheetId, sheetId: 918273645, title: tabTitle, created: true };
     },
@@ -110,7 +124,7 @@ function buildDeps(
     getMasterSpreadsheetId: () => null,
     ...overrides,
   };
-  return { deps, calls, createSpreadsheetCalls, provisionTabCalls, setGroupSheetTabCalls };
+  return { deps, calls, createSpreadsheetCalls, provisionTabCalls, setGroupSheetTabCalls, writeHeaderRowCalls, callOrder };
 }
 
 test('buildSpreadsheetTitle combines name and departure date, stripping embedded newlines', () => {
@@ -135,7 +149,7 @@ test('ensureGroupSheet returns the existing spreadsheet id without any provision
 });
 
 test('ensureGroupSheet creates a new spreadsheet via the provisioning client, writes the header, and persists the id when none exists yet', async () => {
-  const { deps, calls, createSpreadsheetCalls } = buildDeps({ getDriveFolderId: () => 'folder-xyz' });
+  const { deps, calls, createSpreadsheetCalls, writeHeaderRowCalls } = buildDeps({ getDriveFolderId: () => 'folder-xyz' });
 
   const result = await ensureGroupSheet('group-1', deps);
 
@@ -148,6 +162,11 @@ test('ensureGroupSheet creates a new spreadsheet via the provisioning client, wr
     requestId: 'group-1',
     folderId: 'folder-xyz',
   });
+  assert.equal(
+    writeHeaderRowCalls[0]!.sheetTitle,
+    undefined,
+    'legacy path: no sheetTitle -- targets the spreadsheet default/first sheet, unchanged behavior',
+  );
 });
 
 test('ensureGroupSheet passes the group id as the provisioning requestId (Apps Script idempotency key)', async () => {
@@ -283,6 +302,118 @@ test('B.7/8: a successful ensureTab response is persisted via setGroupSheetTab w
   assert.equal(result.spreadsheetId, 'master-abc');
 });
 
+// --- M-1: master/tab header-row write ---
+
+test('M-1.1: master/tab path writes the header row into the newly provisioned tab, using the tab title Apps Script returned -- never sheets[0]', async () => {
+  const { deps, calls, writeHeaderRowCalls } = buildDeps({
+    getMasterSpreadsheetId: () => 'master-abc',
+    provisionTab: async () => ({ spreadsheetId: 'master-abc', sheetId: 555666777, title: '20 September 2026 — 2026-09-20', created: true }),
+  });
+
+  await ensureGroupSheet('group-1', deps);
+
+  assert.equal(calls.writeHeaderRow, 1);
+  assert.deepEqual(writeHeaderRowCalls[0], { spreadsheetId: 'master-abc', sheetTitle: '20 September 2026 — 2026-09-20' });
+});
+
+test('M-1.2: the header row is written BEFORE the gid is persisted via setGroupSheetTab, never after', async () => {
+  const { deps, callOrder } = buildDeps({ getMasterSpreadsheetId: () => 'master-abc' });
+
+  await ensureGroupSheet('group-1', deps);
+
+  assert.deepEqual(callOrder, ['provisionTab', 'writeHeaderRow', 'setGroupSheetTab']);
+});
+
+test('M-1.3: a header-write failure propagates and never reaches setGroupSheetTab -- no gid is persisted for a tab whose header write is unconfirmed', async () => {
+  const { deps, calls } = buildDeps({
+    getMasterSpreadsheetId: () => 'master-abc',
+    provisioningClient: {
+      createSpreadsheet: async () => ({ spreadsheetId: 'unused' }),
+      writeHeaderRow: async () => {
+        throw new Error('writeHeaderRow (spreadsheets.values.update) failed: simulated API error');
+      },
+      moveToFolder: async () => {},
+    },
+  });
+
+  await assert.rejects(() => ensureGroupSheet('group-1', deps), /simulated API error/);
+  assert.equal(calls.setGroupSheetTab, 0);
+});
+
+test('M-1.4: a retry after a header-write failure re-provisions (idempotent) and re-attempts the header write, then succeeds', async () => {
+  let writeHeaderAttempt = 0;
+  const { deps, calls } = buildDeps({
+    getMasterSpreadsheetId: () => 'master-abc',
+    provisioningClient: {
+      createSpreadsheet: async () => ({ spreadsheetId: 'unused' }),
+      writeHeaderRow: async () => {
+        writeHeaderAttempt += 1;
+        if (writeHeaderAttempt === 1) {
+          throw new Error('simulated transient API error');
+        }
+      },
+      moveToFolder: async () => {},
+    },
+  });
+
+  await assert.rejects(() => ensureGroupSheet('group-1', deps), /simulated transient API error/);
+  assert.equal(calls.setGroupSheetTab, 0, 'first attempt: header failed, nothing persisted');
+  assert.equal(writeHeaderAttempt, 1, 'first attempt made exactly one header-write attempt');
+
+  // Same group, still no google_sheet_id persisted (deps.group is unchanged) -- ensureGroupSheet
+  // re-enters the master/tab path exactly as it would on a real retry.
+  await ensureGroupSheet('group-1', deps);
+  assert.equal(calls.provisionTab, 2, 'provisionTab is idempotent -- safe to call again on retry');
+  assert.equal(writeHeaderAttempt, 2, 'header write is retried, not skipped, once persistence never happened');
+  assert.equal(calls.setGroupSheetTab, 1, 'second attempt: header succeeded, gid is now persisted');
+});
+
+test('M-1.5: the header row uses the exact SHEET_HEADER_ROW values via buildRealProvisioningClient, scoped to the tab title (not the spreadsheet default sheet)', async () => {
+  const seenUpdateCalls: { range?: string; values?: unknown }[] = [];
+  const fakeClients: SheetsClients = {
+    sheets: {
+      spreadsheets: {
+        values: {
+          update: (async (params: { range: string; requestBody: { values: unknown } }) => {
+            seenUpdateCalls.push({ range: params.range, values: params.requestBody.values });
+            return { data: {} };
+          }) as never,
+        },
+      },
+    } as never,
+    drive: {} as never,
+  };
+
+  const client = buildRealProvisioningClient(() => fakeClients);
+  await client.writeHeaderRow('master-abc', '20 September 2026 — 2026-09-20');
+
+  assert.equal(seenUpdateCalls.length, 1);
+  assert.equal(seenUpdateCalls[0]!.range, "'20 September 2026 — 2026-09-20'!A1:M1");
+  assert.deepEqual(seenUpdateCalls[0]!.values, [SHEET_HEADER_ROW]);
+});
+
+test("M-1.6: buildRealProvisioningClient.writeHeaderRow with no sheetTitle targets the bare A1:M1 range -- unchanged legacy behavior", async () => {
+  const seenUpdateCalls: { range?: string }[] = [];
+  const fakeClients: SheetsClients = {
+    sheets: {
+      spreadsheets: {
+        values: {
+          update: (async (params: { range: string }) => {
+            seenUpdateCalls.push({ range: params.range });
+            return { data: {} };
+          }) as never,
+        },
+      },
+    } as never,
+    drive: {} as never,
+  };
+
+  const client = buildRealProvisioningClient(() => fakeClients);
+  await client.writeHeaderRow('legacy-spreadsheet-id');
+
+  assert.equal(seenUpdateCalls[0]!.range, 'A1:M1');
+});
+
 test('B.9: a group that already has both google_sheet_id and google_sheet_gid never triggers a new ensureTab call', async () => {
   const { deps, calls } = buildDeps({
     group: { ...BASE_GROUP, googleSheetId: 'master-abc', googleSheetGid: 111 },
@@ -306,10 +437,11 @@ test('B.10: an Apps Script ensureTab failure never reaches setGroupSheetTab -- n
 
   await assert.rejects(() => ensureGroupSheet('group-1', deps), /simulated network error/);
   assert.equal(calls.setGroupSheetTab, 0);
+  assert.equal(calls.writeHeaderRow, 0, 'the header is never written for a tab that was never actually provisioned');
 });
 
 test('B.11: a DB update (setGroupSheetTab) failure after a successful ensureTab is surfaced clearly, naming the partial state', async () => {
-  const { deps } = buildDeps({
+  const { deps, calls } = buildDeps({
     getMasterSpreadsheetId: () => 'master-abc',
     provisionTab: async () => ({ spreadsheetId: 'master-abc', sheetId: 999, title: '20 September 2026 — 2026-09-20', created: true }),
     setGroupSheetTab: async () => null, // e.g. the group row vanished between findGroup and this write
@@ -319,6 +451,7 @@ test('B.11: a DB update (setGroupSheetTab) failure after a successful ensureTab 
     () => ensureGroupSheet('group-1', deps),
     /Apps Script ensureTab succeeded.*spreadsheetId=master-abc.*sheetId=999.*manual reconciliation is required/is,
   );
+  assert.equal(calls.writeHeaderRow, 1, 'the header IS written before this persistence failure -- part of the documented partial state');
 });
 
 test('B.11b: a thrown (not just null-returning) setGroupSheetTab failure is never swallowed', async () => {

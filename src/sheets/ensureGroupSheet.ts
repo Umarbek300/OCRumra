@@ -2,7 +2,7 @@ import { env } from '../config/env.js';
 import { provisionSpreadsheetViaAppsScript, provisionTabViaAppsScript } from './appsScriptProvisioning.js';
 import { findGroupById, setGroupGoogleSheetId, setGroupSheetTab, type Group } from '../db/repositories/groups.repo.js';
 import { getConfiguredApiTimeoutMs, getConfiguredDriveFolderId, getSheetsClients } from './sheetsAuth.js';
-import { HEADER_RANGE_A1, SHEET_HEADER_ROW } from './sheetLayout.js';
+import { headerRangeA1, SHEET_HEADER_ROW } from './sheetLayout.js';
 
 const MAX_TITLE_LENGTH = 200;
 
@@ -20,7 +20,15 @@ export function buildSpreadsheetTitle(group: Pick<Group, 'name' | 'departureDate
 
 export interface SheetsProvisioningClient {
   createSpreadsheet(title: string, requestId: string, folderId: string): Promise<{ spreadsheetId: string }>;
-  writeHeaderRow(spreadsheetId: string): Promise<void>;
+  /**
+   * `sheetTitle` is additive and optional, same convention as every other
+   * tab-aware client in this codebase (see sheetLayout.ts's withSheetTitle):
+   * omitted (the legacy, one-file-per-group caller) targets the
+   * spreadsheet's own default/first sheet, unchanged. A master/tab caller
+   * passes the tab's title so the header lands in that specific tab, never
+   * the master spreadsheet's default/first sheet.
+   */
+  writeHeaderRow(spreadsheetId: string, sheetTitle?: string): Promise<void>;
   /**
    * Retained as a real, working capability and for test/interface
    * compatibility — but no longer called from ensureGroupSheet's own
@@ -121,13 +129,13 @@ export function buildRealProvisioningClient(
 
       return { spreadsheetId };
     },
-    async writeHeaderRow(spreadsheetId) {
+    async writeHeaderRow(spreadsheetId, sheetTitle) {
       const { sheets } = getClients();
       try {
         await sheets.spreadsheets.values.update(
           {
             spreadsheetId,
-            range: HEADER_RANGE_A1,
+            range: headerRangeA1(sheetTitle),
             valueInputOption: 'RAW',
             requestBody: { values: [[...SHEET_HEADER_ROW]] },
           },
@@ -203,7 +211,9 @@ export interface EnsureGroupSheetResult {
  * Returns the group's spreadsheet, creating it once if this is the first
  * time. Never sends the group's passport data anywhere — only the
  * spreadsheet/tab title (built from group.name/departureDate, never
- * passport/OCR content) and, on the legacy path, the fixed header row.
+ * passport/OCR content) and the fixed header row (both paths write it now —
+ * see ensureGroupTabInMasterSpreadsheet_'s own doc comment for the
+ * master/tab path's header-write ordering and idempotency story).
  *
  * Dual-path, dispatched on whether the group already has a google_sheet_id
  * and, for a brand-new group, on whether a master spreadsheet is
@@ -279,10 +289,32 @@ export async function ensureGroupSheet(
  * values, so whichever one's UPDATE lands last simply repeats it
  * redundantly, never corrupts it.
  *
- * Deliberately does not (yet) write a header row into the new tab — this
- * stage only wires up tab provisioning + persistence; header-writing for a
- * tab (as opposed to a whole new file) needs its own tab-scoped Sheets
- * write and is left for a later stage.
+ * Writes the header row into the tab using the SAME provisioningClient the
+ * legacy path already uses (SheetsProvisioningClient.writeHeaderRow), now
+ * tab-aware via its optional sheetTitle parameter — never a separately
+ * re-implemented write. Uses tab.title exactly as Apps Script's ensureTab
+ * response just returned it: that response IS the live-resolved title at
+ * this exact moment, so no extra spreadsheets.get round-trip is needed here
+ * (unlike upsertRowInSheet.ts etc., which resolve a PERSISTED gid back to a
+ * title long after tab creation and so must always re-resolve it live).
+ * Nothing here ever persists tab.title itself — only tab.sheetId is stored,
+ * via setGroupSheetTab below.
+ *
+ * Runs on every call that reaches this function — which, by construction of
+ * ensureGroupSheet's own dispatch above, is only ever a group that does NOT
+ * yet have google_sheet_id persisted. That is itself the idempotency guard:
+ * once setGroupSheetTab below succeeds, this function is never reached
+ * again for that group, so the header is never rewritten in steady state.
+ * If a previous attempt wrote the header but then failed before persisting
+ * (see the throw below), a retry re-enters this same function, calls
+ * provisionTab again (idempotent — Apps Script's ensureTab returns the SAME
+ * tab, created:false), and rewrites the identical fixed header values —
+ * a harmless, idempotent overwrite, not a duplicate write to a different
+ * location. If the header write itself throws, it propagates out of this
+ * function exactly like any other provisioning failure (same as the legacy
+ * path's own unguarded writeHeaderRow call below) — setGroupSheetTab is
+ * never reached, so the DB is never marked "done" for a tab whose header
+ * write is unconfirmed; a retry starts over from provisionTab.
  */
 async function ensureGroupTabInMasterSpreadsheet_(
   group: Group,
@@ -291,6 +323,8 @@ async function ensureGroupTabInMasterSpreadsheet_(
 ): Promise<EnsureGroupSheetResult> {
   const tabTitle = buildSpreadsheetTitle(group);
   const tab = await deps.provisionTab({ masterSpreadsheetId, tabTitle, requestId: group.id });
+
+  await deps.provisioningClient.writeHeaderRow(tab.spreadsheetId, tab.title);
 
   const persisted = await deps.setGroupSheetTab(group.id, tab.spreadsheetId, tab.sheetId);
   if (!persisted) {
