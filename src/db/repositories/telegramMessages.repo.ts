@@ -165,6 +165,19 @@ export async function findTelegramMessageById(id: string): Promise<TelegramMessa
   return row ? mapRow(row) : null;
 }
 
+/** Looks a message up by Telegram's own (chat, message) pair — what a bot command replying to a specific Telegram message has on hand, before it knows this table's own UUID at all. Same uniqueness pair as recordPhotoMessage's own ON CONFLICT target. */
+export async function findTelegramMessageByChatAndMessageId(
+  telegramChatId: number,
+  telegramMessageId: number,
+): Promise<TelegramMessageRecord | null> {
+  const { rows } = await pool.query<TelegramMessageRow>(
+    `SELECT ${SELECT_COLUMNS} FROM telegram_messages WHERE telegram_chat_id = $1 AND telegram_message_id = $2`,
+    [telegramChatId, telegramMessageId],
+  );
+  const row = rows[0];
+  return row ? mapRow(row) : null;
+}
+
 /** Unlinked messages for ONE chat -- what ensureGroupRegistered.ts's backfill sweep scans, scoped to the chat it just resolved a group for. */
 export async function findUnlinkedMessagesByTelegramChatId(telegramChatId: number): Promise<TelegramMessageRecord[]> {
   const { rows } = await pool.query<TelegramMessageRow>(
