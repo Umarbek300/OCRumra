@@ -53,6 +53,7 @@ const MONTH_NAME_TO_NUMBER: Readonly<Record<string, number>> = {
   avgust: 8,
   sentyabr: 9,
   oktyabr: 10,
+  oktabr: 10,
   noyabr: 11,
   dekabr: 12,
   // Russian -- nominative

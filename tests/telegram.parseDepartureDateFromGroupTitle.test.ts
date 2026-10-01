@@ -59,6 +59,16 @@ test('parses Russian month names (nominative and genitive forms), case-insensiti
   assert.deepEqual(parseDepartureDateFromGroupTitle('5 ОКТЯБРЯ 2026'), { date: '2026-10-05' });
 });
 
+test('parses "oktabr" as an alias for "oktyabr" (October), case-insensitive', () => {
+  assert.deepEqual(parseDepartureDateFromGroupTitle('5 oktabr 2026'), { date: '2026-10-05' });
+  assert.deepEqual(parseDepartureDateFromGroupTitle('5 Oktabr 2026'), { date: '2026-10-05' });
+  assert.deepEqual(parseDepartureDateFromGroupTitle('5 OKTABR 2026'), { date: '2026-10-05' });
+});
+
+test('parses "5 Oktyabr 2026" (capitalized Uzbek month, as Telegram group titles are typically typed)', () => {
+  assert.deepEqual(parseDepartureDateFromGroupTitle('5 Oktyabr 2026'), { date: '2026-10-05' });
+});
+
 test('parses "DD.MM.YYYY" and "D.MM.YYYY"', () => {
   assert.deepEqual(parseDepartureDateFromGroupTitle('05.10.2026'), { date: '2026-10-05' });
   assert.deepEqual(parseDepartureDateFromGroupTitle('5.10.2026'), { date: '2026-10-05' });
