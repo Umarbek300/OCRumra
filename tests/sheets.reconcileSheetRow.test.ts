@@ -57,11 +57,31 @@ function sampleLink(telegramMessageId: string): PassportMessageLinkRecord {
 
 function buildDeps(overrides: Partial<ReconcileSheetRowDependencies> = {}): {
   deps: ReconcileSheetRowDependencies;
-  calls: { claim: number; markDone: number; markFailed: number; deleteRow: number; reassignRow: number; ensureSheet: number };
+  calls: {
+    claim: number;
+    markDone: number;
+    markFailed: number;
+    deleteRow: number;
+    reassignRow: number;
+    ensureSheet: number;
+    computeGenderStats: number;
+    writeGenderSummary: number;
+  };
   markFailedArgs: { id: string; message: string }[];
+  writeGenderSummaryArgs: { spreadsheetId: string; googleSheetGid: number | null | undefined }[];
 } {
-  const calls = { claim: 0, markDone: 0, markFailed: 0, deleteRow: 0, reassignRow: 0, ensureSheet: 0 };
+  const calls = {
+    claim: 0,
+    markDone: 0,
+    markFailed: 0,
+    deleteRow: 0,
+    reassignRow: 0,
+    ensureSheet: 0,
+    computeGenderStats: 0,
+    writeGenderSummary: 0,
+  };
   const markFailedArgs: { id: string; message: string }[] = [];
+  const writeGenderSummaryArgs: { spreadsheetId: string; googleSheetGid: number | null | undefined }[] = [];
 
   const deps: ReconcileSheetRowDependencies = {
     claim: async (id) => {
@@ -115,10 +135,18 @@ function buildDeps(overrides: Partial<ReconcileSheetRowDependencies> = {}): {
     }),
     findAgent: async () => null,
     findGroup: async () => null,
+    computeGenderStats: async () => {
+      calls.computeGenderStats += 1;
+      return { male: 1, female: 0, unspecified: 0, total: 1 };
+    },
+    writeGenderSummary: async (spreadsheetId, _rows, googleSheetGid) => {
+      calls.writeGenderSummary += 1;
+      writeGenderSummaryArgs.push({ spreadsheetId, googleSheetGid });
+    },
     ...overrides,
   };
 
-  return { deps, calls, markFailedArgs };
+  return { deps, calls, markFailedArgs, writeGenderSummaryArgs };
 }
 
 test('reconcileSheetRow reassigns to the CURRENT canonical when one exists, re-resolved fresh, then marks done', async () => {
@@ -309,4 +337,74 @@ test('M-2: a master/tab group\'s googleSheetGid (456789) is threaded into delete
   await reconcileSheetRow('job-1', deps);
 
   assert.equal((deleteArgs as { googleSheetGid: number | null | undefined }).googleSheetGid, 456789);
+});
+
+// --- Gender summary refresh after a reconciliation mutation ---
+
+test('reconcileSheetRow recomputes and writes the gender summary after a reassign', async () => {
+  const { deps, calls, writeGenderSummaryArgs } = buildDeps({
+    findGroup: async () => masterTabGroup(456789),
+    findActiveCanonicalLink: async () => sampleLink('new-msg'),
+  });
+
+  await reconcileSheetRow('job-1', deps);
+
+  assert.equal(calls.computeGenderStats, 1);
+  assert.equal(calls.writeGenderSummary, 1);
+  assert.equal(writeGenderSummaryArgs[0]?.spreadsheetId, 'sheet-for-group-1');
+  assert.equal(writeGenderSummaryArgs[0]?.googleSheetGid, 456789);
+});
+
+test('reconcileSheetRow recomputes and writes the gender summary after a delete (no current canonical)', async () => {
+  const { deps, calls } = buildDeps({
+    findGroup: async () => masterTabGroup(456789),
+    findActiveCanonicalLink: async () => null,
+  });
+
+  await reconcileSheetRow('job-1', deps);
+
+  assert.equal(calls.computeGenderStats, 1);
+  assert.equal(calls.writeGenderSummary, 1);
+});
+
+test('reconcileSheetRow recomputes and writes the gender summary after a merge-sourced delete', async () => {
+  const { deps, calls } = buildDeps({
+    claim: async (id) => ({ ...SAMPLE_JOB, id, sourceOperation: 'merge' }),
+    findGroup: async () => masterTabGroup(456789),
+    findActiveCanonicalLink: async () => sampleLink('some-other-already-synced-message'),
+  });
+
+  await reconcileSheetRow('job-1', deps);
+
+  assert.equal(calls.computeGenderStats, 1);
+  assert.equal(calls.writeGenderSummary, 1);
+});
+
+test('a gender summary write failure never flips an already-done reconciliation job back to failed', async () => {
+  const { deps, calls } = buildDeps({
+    findGroup: async () => masterTabGroup(456789),
+    findActiveCanonicalLink: async () => null,
+    writeGenderSummary: async () => {
+      throw new Error('Google Sheets API error: quota exceeded');
+    },
+  });
+
+  await reconcileSheetRow('job-1', deps);
+
+  assert.equal(calls.markDone, 1);
+  assert.equal(calls.markFailed, 0, 'the row mutation already succeeded -- a secondary summary write failure must never re-fail the job');
+});
+
+test('reconcileSheetRow logs and skips the gender summary refresh (without throwing) when the group cannot be found', async () => {
+  const { deps, calls } = buildDeps({
+    findGroup: async () => null,
+    findActiveCanonicalLink: async () => null,
+  });
+
+  await reconcileSheetRow('job-1', deps);
+
+  assert.equal(calls.markDone, 1);
+  assert.equal(calls.markFailed, 0);
+  assert.equal(calls.computeGenderStats, 0);
+  assert.equal(calls.writeGenderSummary, 0);
 });

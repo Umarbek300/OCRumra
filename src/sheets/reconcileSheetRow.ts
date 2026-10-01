@@ -1,5 +1,6 @@
 import { findAgentById } from '../db/repositories/agents.repo.js';
-import { findGroupById } from '../db/repositories/groups.repo.js';
+import { findGroupById, type Group } from '../db/repositories/groups.repo.js';
+import { computeGroupGenderStats } from '../db/repositories/groupGenderStats.repo.js';
 import { findActiveCanonicalLink } from '../db/repositories/passportMessageLinks.repo.js';
 import { findPassportOcrResultByTelegramMessageId } from '../db/repositories/passportOcrResult.repo.js';
 import {
@@ -9,11 +10,13 @@ import {
   type SheetReconciliationJobRecord,
 } from '../db/repositories/sheetReconciliation.repo.js';
 import { findTelegramMessageById } from '../db/repositories/telegramMessages.repo.js';
+import { buildGenderSummaryBlock } from './buildGenderSummaryBlock.js';
 import { buildRowForMessage } from '../duplicates/processOperatorCommand.js';
 import { deleteCanonicalRow } from './deleteRowInSheet.js';
 import { ensureGroupSheet } from './ensureGroupSheet.js';
 import { reassignCanonicalRow } from './reassignCanonicalRowInSheet.js';
 import { computeSheetSyncBackoff } from './syncPassportRowToSheet.js';
+import { writeGroupGenderSummary } from './writeGroupGenderSummary.js';
 
 const MAX_ERROR_MESSAGE_LENGTH = 300;
 
@@ -34,6 +37,8 @@ export interface ReconcileSheetRowDependencies {
   findOcrResult: typeof findPassportOcrResultByTelegramMessageId;
   findAgent: typeof findAgentById;
   findGroup: typeof findGroupById;
+  computeGenderStats: typeof computeGroupGenderStats;
+  writeGenderSummary: typeof writeGroupGenderSummary;
 }
 
 const defaultDependencies: ReconcileSheetRowDependencies = {
@@ -48,7 +53,41 @@ const defaultDependencies: ReconcileSheetRowDependencies = {
   findOcrResult: findPassportOcrResultByTelegramMessageId,
   findAgent: findAgentById,
   findGroup: findGroupById,
+  computeGenderStats: computeGroupGenderStats,
+  writeGenderSummary: writeGroupGenderSummary,
 };
+
+/**
+ * Recomputes and rewrites the group's gender summary (O1:P5) after a
+ * reconciliation job has changed which row (if any) represents this
+ * (identity, group) canonical slot -- a delete (cancel/merge-retire) or a
+ * reassign (a different message now backs the same row) both change the
+ * set of rows actually present in the group's tab, which the summary must
+ * reflect. Isolated in its own try/catch, mirroring
+ * syncPassportRowToSheet.ts's own identical pattern: a reconciliation job
+ * that already succeeded in the Sheet (row deleted/reassigned, job marked
+ * done) must never be flipped back to failed just because this secondary
+ * summary write failed -- logged and swallowed instead, same as there.
+ */
+async function refreshGenderSummary_(
+  group: Pick<Group, 'id' | 'name' | 'departureDate' | 'googleSheetGid'> | null,
+  spreadsheetId: string,
+  jobId: string,
+  deps: Pick<ReconcileSheetRowDependencies, 'computeGenderStats' | 'writeGenderSummary'>,
+): Promise<void> {
+  if (!group) {
+    console.error(`[sheet-reconciliation] job ${jobId} done but its group was not found while writing the gender summary`);
+    return;
+  }
+  try {
+    const stats = await deps.computeGenderStats(group.id);
+    const summaryRows = buildGenderSummaryBlock(group, stats);
+    await deps.writeGenderSummary(spreadsheetId, summaryRows, group.googleSheetGid);
+  } catch (error) {
+    const message = sanitizeErrorMessage(error);
+    console.error(`[sheet-reconciliation] job ${jobId} done but the group gender summary update failed: ${message}`);
+  }
+}
 
 /**
  * Processes one sheet_reconciliation_jobs row: claim -> re-resolve the
@@ -95,8 +134,11 @@ export async function reconcileSheetRow(jobId: string, deps: ReconcileSheetRowDe
     // A master/tab group's stable gid (null/absent for a legacy group —
     // deleteCanonicalRow then falls back to its exact prior, unchanged
     // behavior). Never resolved to a title here — deleteCanonicalRow's own
-    // live gid -> title resolution handles that.
-    const googleSheetGid = (await deps.findGroup(claimed.groupId))?.googleSheetGid;
+    // live gid -> title resolution handles that. Fetched once and reused
+    // for the gender summary write below too, same as
+    // syncPassportRowToSheet.ts's own single-fetch-reused-twice pattern.
+    const group = await deps.findGroup(claimed.groupId);
+    const googleSheetGid = group?.googleSheetGid;
 
     if (claimed.sourceOperation === 'merge') {
       // Retire mode: a merge's same-group conflict resolution permanently
@@ -116,6 +158,7 @@ export async function reconcileSheetRow(jobId: string, deps: ReconcileSheetRowDe
       await deps.deleteRow({ spreadsheetId, expectedCanonicalTelegramMessageId: claimed.expectedOldCanonicalTelegramMessageId, googleSheetGid });
       await deps.markDone(claimed.id);
       console.log(`[sheet-reconciliation] job ${claimed.id} (${claimed.sourceOperation}) done`);
+      await refreshGenderSummary_(group, spreadsheetId, claimed.id, deps);
       return;
     }
 
@@ -146,6 +189,7 @@ export async function reconcileSheetRow(jobId: string, deps: ReconcileSheetRowDe
 
     await deps.markDone(claimed.id);
     console.log(`[sheet-reconciliation] job ${claimed.id} (${claimed.sourceOperation}) done`);
+    await refreshGenderSummary_(group, spreadsheetId, claimed.id, deps);
   } catch (error) {
     const message = sanitizeErrorMessage(error);
     const nextAttemptAt = computeSheetSyncBackoff(claimed.attempts);

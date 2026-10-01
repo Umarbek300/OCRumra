@@ -18,6 +18,54 @@ export function buildSpreadsheetTitle(group: Pick<Group, 'name' | 'departureDate
   return title.length > MAX_TITLE_LENGTH ? title.slice(0, MAX_TITLE_LENGTH) : title;
 }
 
+/** Google Sheets' own forbidden characters in a tab (sheet) title. */
+const FORBIDDEN_TAB_TITLE_CHARS = /[[\]*?:/\\]/g;
+const MAX_TAB_TITLE_LENGTH = 100;
+
+/**
+ * The visible tab title for a group's tab inside the master spreadsheet --
+ * deliberately just the Telegram group's own name, with NO departure-date
+ * suffix (unlike buildSpreadsheetTitle above, which is the legacy
+ * one-dedicated-file path's Drive FILE title, left completely unchanged by
+ * this function and still date-qualified). Only forbidden Sheets tab
+ * characters ([ ] * ? : / \) are replaced -- the name is otherwise used
+ * exactly as the group's own title, never reformatted or reworded.
+ *
+ * Never the addressing key for anything: exactly like every other tab
+ * title in this codebase (see sheetLayout.ts's own withSheetTitle doc
+ * comment), the group's stable gid is the only thing ever persisted or
+ * relied on afterward -- this function's result is used ONLY as the
+ * one-time value sent to Apps Script's ensureTab action at first
+ * provisioning.
+ *
+ * `existingTitles` is the CURRENT set of tab titles already present in the
+ * master spreadsheet at call time -- when the plain group-name title would
+ * collide with one of them (two different groups sharing the same human
+ * name, e.g. the same departure title reused a later year), a short,
+ * stable suffix derived from the group's own id is appended so the two
+ * tabs remain visually distinguishable. The suffix is deterministic (the
+ * same group always gets the same suffix on every call), so a retry after
+ * a partial provisioning failure (see ensureGroupTabInMasterSpreadsheet_'s
+ * own doc comment) computes the identical title again -- it is never
+ * randomized per call.
+ */
+export function buildTabTitle(group: Pick<Group, 'id' | 'name'>, existingTitles: readonly string[]): string {
+  const collapsed = group.name
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(FORBIDDEN_TAB_TITLE_CHARS, '-')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const base = (collapsed.length > 0 ? collapsed : 'Untitled group').slice(0, MAX_TAB_TITLE_LENGTH);
+
+  if (!existingTitles.includes(base)) {
+    return base;
+  }
+
+  const suffix = ` (${group.id.slice(0, 8)})`;
+  const truncatedBase = base.slice(0, Math.max(0, MAX_TAB_TITLE_LENGTH - suffix.length));
+  return `${truncatedBase}${suffix}`;
+}
+
 export interface SheetsProvisioningClient {
   createSpreadsheet(title: string, requestId: string, folderId: string): Promise<{ spreadsheetId: string }>;
   /**
@@ -191,6 +239,25 @@ export interface EnsureGroupSheetDependencies {
   getDriveFolderId: () => string | null;
   /** A function, not a pre-resolved value — only called for a brand-new group that has no spreadsheet yet. */
   getMasterSpreadsheetId: () => string | null;
+  /**
+   * The CURRENT set of tab titles already present in the master
+   * spreadsheet, read live at call time — only ever called for a brand-new
+   * group about to be provisioned onto the master (never on the
+   * already-has-a-spreadsheet fast path), so this collision check is
+   * always against up-to-date data, never a stale/cached list.
+   */
+  listMasterSpreadsheetTabTitles: (masterSpreadsheetId: string) => Promise<string[]>;
+}
+
+async function listMasterSpreadsheetTabTitlesReal(masterSpreadsheetId: string): Promise<string[]> {
+  const { sheets } = getSheetsClients();
+  const response = await sheets.spreadsheets.get(
+    { spreadsheetId: masterSpreadsheetId, fields: 'sheets.properties(title)' },
+    { timeout: getConfiguredApiTimeoutMs() },
+  );
+  return (response.data.sheets ?? [])
+    .map((sheet) => sheet.properties?.title)
+    .filter((title): title is string => typeof title === 'string');
 }
 
 const defaultDependencies: EnsureGroupSheetDependencies = {
@@ -201,6 +268,7 @@ const defaultDependencies: EnsureGroupSheetDependencies = {
   provisionTab: provisionTabViaAppsScript,
   getDriveFolderId: getConfiguredDriveFolderId,
   getMasterSpreadsheetId: getConfiguredMasterSpreadsheetId,
+  listMasterSpreadsheetTabTitles: listMasterSpreadsheetTabTitlesReal,
 };
 
 export interface EnsureGroupSheetResult {
@@ -210,10 +278,13 @@ export interface EnsureGroupSheetResult {
 /**
  * Returns the group's spreadsheet, creating it once if this is the first
  * time. Never sends the group's passport data anywhere — only the
- * spreadsheet/tab title (built from group.name/departureDate, never
- * passport/OCR content) and the fixed header row (both paths write it now —
- * see ensureGroupTabInMasterSpreadsheet_'s own doc comment for the
- * master/tab path's header-write ordering and idempotency story).
+ * spreadsheet/tab title (the legacy path's Drive file title is
+ * group.name + departureDate via buildSpreadsheetTitle; the master/tab
+ * path's tab title is the group's name alone via buildTabTitle — see that
+ * function's own doc comment for why — neither ever includes passport/OCR
+ * content) and the fixed header row (both paths write it now — see
+ * ensureGroupTabInMasterSpreadsheet_'s own doc comment for the master/tab
+ * path's header-write ordering and idempotency story).
  *
  * Dual-path, dispatched on whether the group already has a google_sheet_id
  * and, for a brand-new group, on whether a master spreadsheet is
@@ -321,7 +392,8 @@ async function ensureGroupTabInMasterSpreadsheet_(
   masterSpreadsheetId: string,
   deps: EnsureGroupSheetDependencies,
 ): Promise<EnsureGroupSheetResult> {
-  const tabTitle = buildSpreadsheetTitle(group);
+  const existingTitles = await deps.listMasterSpreadsheetTabTitles(masterSpreadsheetId);
+  const tabTitle = buildTabTitle(group, existingTitles);
   const tab = await deps.provisionTab({ masterSpreadsheetId, tabTitle, requestId: group.id });
 
   await deps.provisioningClient.writeHeaderRow(tab.spreadsheetId, tab.title);

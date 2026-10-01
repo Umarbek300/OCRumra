@@ -208,6 +208,96 @@ test('a duplicate Telegram message, blocked by telegram_messages own UNIQUE(tele
   }
 });
 
+/** Adds one passenger AND its passport_message_links row, so tests can exercise role/link_status filtering. */
+async function addLinkedPassenger(
+  fixture: GroupFixture,
+  gender: OcrGenderValue | null,
+  role: 'canonical' | 'duplicate',
+  linkStatus: 'active' | 'cancelled' | 'removed' | 'moved',
+  linkGroupId: string = fixture.groupId,
+): Promise<{ messageId: string; identityId: string }> {
+  const messageId = await addPassenger(fixture, gender);
+  const {
+    rows: [identity],
+  } = await pool.query<{ id: string }>(
+    `INSERT INTO passport_identity (passport_number_normalized, date_of_birth) VALUES ($1, $2) RETURNING id`,
+    [`GENDERSTATS-${messageId}`, '1990-01-01'],
+  );
+  assert.ok(identity);
+  await pool.query(
+    `INSERT INTO passport_message_links (passport_identity_id, telegram_message_id, group_id, agent_id, role, link_status, match_confidence_tier)
+     VALUES ($1, $2, $3, NULL, $4, $5, 'high')`,
+    [identity.id, messageId, linkGroupId, role, linkStatus],
+  );
+  return { messageId, identityId: identity.id };
+}
+
+test('computeGroupGenderStats never counts a role=duplicate link (an auto-merged repeat send within the same group)', async () => {
+  const fixture = await createGroup();
+  try {
+    await addLinkedPassenger(fixture, 'male', 'canonical', 'active');
+    await addLinkedPassenger(fixture, 'male', 'duplicate', 'active');
+    await addLinkedPassenger(fixture, 'male', 'duplicate', 'active');
+
+    const stats = await computeGroupGenderStats(fixture.groupId);
+    assert.equal(stats.male, 1, 'only the canonical link counts -- the two duplicate sends must not inflate the total');
+    assert.equal(stats.total, 1);
+  } finally {
+    await cleanupGroup(fixture);
+  }
+});
+
+test('computeGroupGenderStats never counts a cancelled or removed link', async () => {
+  const fixture = await createGroup();
+  try {
+    await addLinkedPassenger(fixture, 'male', 'canonical', 'active');
+    await addLinkedPassenger(fixture, 'female', 'canonical', 'cancelled');
+    await addLinkedPassenger(fixture, 'female', 'canonical', 'removed');
+
+    const stats = await computeGroupGenderStats(fixture.groupId);
+    assert.equal(stats.male, 1);
+    assert.equal(stats.female, 0, 'cancelled/removed canonicals must never count');
+    assert.equal(stats.total, 1);
+  } finally {
+    await cleanupGroup(fixture);
+  }
+});
+
+test('computeGroupGenderStats follows a MOVE_TO_GROUP relocation: counts in the destination group, never the origin, even though telegram_messages.group_id never changes', async () => {
+  const origin = await createGroup();
+  const destination = await createGroup();
+  try {
+    // reassignLinkToGroup only ever updates passport_message_links.group_id
+    // -- telegram_messages.group_id is fixed at ingest and never touched by
+    // a move (see that function's own doc comment) -- so the link's
+    // group_id here is deliberately the DESTINATION while the message's own
+    // group_id (set via addPassenger) stays the ORIGIN, exactly reproducing
+    // real post-move state.
+    await addLinkedPassenger(origin, 'male', 'canonical', 'active', destination.groupId);
+
+    const originStats = await computeGroupGenderStats(origin.groupId);
+    const destinationStats = await computeGroupGenderStats(destination.groupId);
+
+    assert.deepEqual(originStats, { male: 0, female: 0, unspecified: 0, total: 0 }, 'the origin group must not keep counting a moved-away passenger');
+    assert.deepEqual(destinationStats, { male: 1, female: 0, unspecified: 0, total: 1 }, 'the destination group must count it');
+  } finally {
+    await cleanupGroup(origin);
+    await cleanupGroup(destination);
+  }
+});
+
+test('computeGroupGenderStats: a message with no passport_message_links row at all falls back to telegram_messages.group_id (pre-feature behavior preserved)', async () => {
+  const fixture = await createGroup();
+  try {
+    await addPassenger(fixture, 'male'); // no link row created
+
+    const stats = await computeGroupGenderStats(fixture.groupId);
+    assert.deepEqual(stats, { male: 1, female: 0, unspecified: 0, total: 1 });
+  } finally {
+    await cleanupGroup(fixture);
+  }
+});
+
 after(async () => {
   await pool.end();
 });

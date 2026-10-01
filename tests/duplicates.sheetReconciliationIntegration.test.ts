@@ -29,6 +29,7 @@ import { findActiveCanonicalLink as findActiveCanonicalLinkReal, findActiveDupli
 import { claimPassportOperatorCommand, markPassportOperatorCommandCompleted, markPassportOperatorCommandFailed } from '../src/db/repositories/passportOperatorCommands.repo.js';
 import { retireCanonicalAndPromoteReplacement, promoteReplacementAndRelocateLink } from '../src/duplicates/applyIdentityStateChange.js';
 import { findGroupById } from '../src/db/repositories/groups.repo.js';
+import { computeGroupGenderStats } from '../src/db/repositories/groupGenderStats.repo.js';
 
 let idCounter = 0;
 function uniqueChatId(): number {
@@ -140,10 +141,12 @@ function fakeReconcileDeps(overrides: Partial<ReconcileSheetRowDependencies> = {
   deleteCalls: { spreadsheetId: string; expectedCanonicalTelegramMessageId: string }[];
   reassignCalls: { spreadsheetId: string; oldCanonicalTelegramMessageId: string; newCanonicalTelegramMessageId: string }[];
   ensureSheetCalls: string[];
+  writeGenderSummaryCalls: { spreadsheetId: string }[];
 } {
   const deleteCalls: { spreadsheetId: string; expectedCanonicalTelegramMessageId: string }[] = [];
   const reassignCalls: { spreadsheetId: string; oldCanonicalTelegramMessageId: string; newCanonicalTelegramMessageId: string }[] = [];
   const ensureSheetCalls: string[] = [];
+  const writeGenderSummaryCalls: { spreadsheetId: string }[] = [];
 
   const deps: ReconcileSheetRowDependencies = {
     claim: claimReconciliationJob,
@@ -166,10 +169,17 @@ function fakeReconcileDeps(overrides: Partial<ReconcileSheetRowDependencies> = {
     findOcrResult: findPassportOcrResultByTelegramMessageId,
     findAgent: findAgentById,
     findGroup: findGroupById,
+    // Real DB-backed stats (matches this file's own "real DB repos
+    // throughout" philosophy) -- only the actual Sheets write is faked,
+    // same as deleteRow/reassignRow/ensureSheet above.
+    computeGenderStats: computeGroupGenderStats,
+    writeGenderSummary: async (spreadsheetId) => {
+      writeGenderSummaryCalls.push({ spreadsheetId });
+    },
     ...overrides,
   };
 
-  return { deps, deleteCalls, reassignCalls, ensureSheetCalls };
+  return { deps, deleteCalls, reassignCalls, ensureSheetCalls, writeGenderSummaryCalls };
 }
 
 /** processPassportOperatorCommand with the Sheets-touching parts faked (destination append for MOVE only -- origin cleanup is entirely reconciliation-driven now). */

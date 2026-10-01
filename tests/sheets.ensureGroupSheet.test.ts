@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import {
   buildRealProvisioningClient,
   buildSpreadsheetTitle,
+  buildTabTitle,
   ensureGroupSheet,
   getConfiguredMasterSpreadsheetId,
   type EnsureGroupSheetDependencies,
@@ -122,6 +123,7 @@ function buildDeps(
     },
     getDriveFolderId: () => 'folder-xyz',
     getMasterSpreadsheetId: () => null,
+    listMasterSpreadsheetTabTitles: async () => [],
     ...overrides,
   };
   return { deps, calls, createSpreadsheetCalls, provisionTabCalls, setGroupSheetTabCalls, writeHeaderRowCalls, callOrder };
@@ -135,6 +137,55 @@ test('buildSpreadsheetTitle combines name and departure date, stripping embedded
 test('buildSpreadsheetTitle caps an absurdly long name to a bounded length', () => {
   const title = buildSpreadsheetTitle({ name: 'X'.repeat(500), departureDate: '2026-09-20' });
   assert.ok(title.length <= 200);
+});
+
+// --- buildTabTitle: the master/tab path's tab title -- group name alone, no date suffix ---
+
+test('buildTabTitle uses the group name alone, with no departure-date suffix', () => {
+  const title = buildTabTitle({ id: 'group-1', name: '6 Oktyabr 2026' }, []);
+  assert.equal(title, '6 Oktyabr 2026');
+});
+
+test('buildTabTitle strips embedded newlines/tabs and collapses whitespace, same as buildSpreadsheetTitle', () => {
+  const title = buildTabTitle({ id: 'group-1', name: '6\nOktyabr\t2026' }, []);
+  assert.equal(title, '6 Oktyabr 2026');
+});
+
+test('buildTabTitle replaces Google Sheets\' forbidden tab-title characters ([ ] * ? : / \\) with a safe character', () => {
+  const title = buildTabTitle({ id: 'group-1', name: 'Group [A]: Tour/Trip? *Special*' }, []);
+  for (const forbidden of ['[', ']', '*', '?', ':', '/', '\\']) {
+    assert.ok(!title.includes(forbidden), `must not contain "${forbidden}"`);
+  }
+});
+
+test('buildTabTitle falls back to a placeholder name when the group name is empty or whitespace-only', () => {
+  assert.equal(buildTabTitle({ id: 'group-1', name: '   ' }, []), 'Untitled group');
+  assert.equal(buildTabTitle({ id: 'group-1', name: '' }, []), 'Untitled group');
+});
+
+test('buildTabTitle caps an absurdly long name to Google Sheets\' 100-character tab-title limit', () => {
+  const title = buildTabTitle({ id: 'group-1', name: 'X'.repeat(500) }, []);
+  assert.ok(title.length <= 100);
+});
+
+test('buildTabTitle appends a short, stable, group-id-derived suffix only when the plain name collides with an existing tab title', () => {
+  const noCollision = buildTabTitle({ id: 'group-1', name: '6 Oktyabr 2026' }, ['Some other tab']);
+  assert.equal(noCollision, '6 Oktyabr 2026', 'no collision -- plain name used as-is');
+
+  const collision = buildTabTitle({ id: 'abcdef12-3456-7890-abcd-ef1234567890', name: '6 Oktyabr 2026' }, ['6 Oktyabr 2026']);
+  assert.equal(collision, '6 Oktyabr 2026 (abcdef12)');
+});
+
+test('buildTabTitle\'s collision suffix is deterministic -- the same group always gets the same suffix, never randomized per call', () => {
+  const group = { id: 'abcdef12-3456-7890-abcd-ef1234567890', name: '6 Oktyabr 2026' };
+  const first = buildTabTitle(group, ['6 Oktyabr 2026']);
+  const second = buildTabTitle(group, ['6 Oktyabr 2026']);
+  assert.equal(first, second);
+});
+
+test('buildTabTitle never uses the departure date as a disambiguating suffix, even on collision', () => {
+  const title = buildTabTitle({ id: 'group-1', name: '6 Oktyabr 2026' }, ['6 Oktyabr 2026']);
+  assert.ok(!title.includes('2026-'), 'must never contain an ISO-style date suffix');
 });
 
 test('ensureGroupSheet returns the existing spreadsheet id without any provisioning calls', async () => {
@@ -276,7 +327,7 @@ test('A.3: existing legacy group is never migrated onto the master architecture 
 
 // --- B. MASTER/TAB ---
 
-test('B.4/5/6: a brand-new group with master env set calls provisionTab with the correct masterSpreadsheetId and tab title', async () => {
+test('B.4/5/6: a brand-new group with master env set calls provisionTab with the correct masterSpreadsheetId and tab title (the group name alone, no date suffix)', async () => {
   const { deps, provisionTabCalls } = buildDeps({ getMasterSpreadsheetId: () => 'master-abc' });
 
   await ensureGroupSheet('group-1', deps);
@@ -284,9 +335,23 @@ test('B.4/5/6: a brand-new group with master env set calls provisionTab with the
   assert.equal(provisionTabCalls.length, 1);
   assert.deepEqual(provisionTabCalls[0], {
     masterSpreadsheetId: 'master-abc',
-    tabTitle: '20 September 2026 — 2026-09-20',
+    tabTitle: '20 September 2026',
     requestId: 'group-1',
   });
+});
+
+test('B.4b: when the plain group-name tab title collides with an existing tab in the master spreadsheet, ensureGroupSheet sends the disambiguated (suffixed) title to provisionTab', async () => {
+  const { deps, provisionTabCalls } = buildDeps({
+    getMasterSpreadsheetId: () => 'master-abc',
+    listMasterSpreadsheetTabTitles: async (masterSpreadsheetId) => {
+      assert.equal(masterSpreadsheetId, 'master-abc');
+      return ['20 September 2026', 'Some other tab'];
+    },
+  });
+
+  await ensureGroupSheet('group-1', deps);
+
+  assert.equal(provisionTabCalls[0]!.tabTitle, `20 September 2026 (${'group-1'.slice(0, 8)})`);
 });
 
 test('B.7/8: a successful ensureTab response is persisted via setGroupSheetTab with spreadsheetId + sheetId, and returned', async () => {
