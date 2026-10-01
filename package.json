@@ -22,6 +22,7 @@
     "operator-command:worker": "tsx src/duplicates/start.ts",
     "queue:worker": "tsx src/worker/start.ts",
     "sheets:worker": "tsx src/sheets/start.ts",
+    "visa:worker": "tsx src/visa/start.ts",
     "test": "node --import tsx --test --test-concurrency=1 tests/*.test.ts"
   },
   "dependencies": {

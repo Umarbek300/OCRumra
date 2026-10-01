@@ -2,6 +2,7 @@ import { pool } from '../db/pool.js';
 import type { PassportLinkStatus } from '../db/repositories/passportMessageLinks.repo.js';
 import type { PassportIdentityEventType } from '../db/repositories/passportIdentityEvents.repo.js';
 import { insertReconciliationJobWithClient } from '../db/repositories/sheetReconciliation.repo.js';
+import { updateActiveAssignmentsStatusWithClient } from '../db/repositories/visaBatches.repo.js';
 
 export interface RetireAndPromoteInput {
   oldCanonicalLinkId: string;
@@ -76,6 +77,18 @@ export async function retireCanonicalAndPromoteReplacement(input: RetireAndPromo
       sourceOperation: input.retireEventType,
       sourceEventId: retireEventRows[0]?.id ?? null,
     });
+
+    // Visa automation Phase 1: CANCEL_PASSPORT/REMOVE_FROM_GROUP must also
+    // retire any active visa_batch_applicants assignment for this (identity,
+    // group), in the SAME transaction as the domain change -- a crash right
+    // after COMMIT can never leave a cancelled/removed passport still
+    // "active" in a pending (or worse, already-submitted) visa batch. Never
+    // called for 'moved' (MOVE_TO_GROUP uses promoteReplacementAndRelocateLink
+    // instead, which does not yet touch visa assignments at all -- see
+    // this feature's own specification for that open edge case).
+    if (input.oldCanonicalRetiredStatus !== 'moved') {
+      await updateActiveAssignmentsStatusWithClient(client, input.groupId, input.passportIdentityId, input.oldCanonicalRetiredStatus);
+    }
 
     await client.query('COMMIT');
   } catch (error) {
