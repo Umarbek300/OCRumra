@@ -25,6 +25,7 @@ import { findAgentById } from '../src/db/repositories/agents.repo.js';
 import { findPassportOcrResultByTelegramMessageId } from '../src/db/repositories/passportOcrResult.repo.js';
 import { findTelegramMessageById } from '../src/db/repositories/telegramMessages.repo.js';
 import { findReconciliationJobsForIdentityGroup } from '../src/db/repositories/sheetReconciliation.repo.js';
+import { createVisaBatch, createVisaBatchAssignment, findActiveAssignment } from '../src/db/repositories/visaBatches.repo.js';
 
 let idCounter = 0;
 function uniqueChatId(): number {
@@ -103,7 +104,33 @@ async function createOcrResult(telegramMessageId: string): Promise<void> {
   });
 }
 
+/** Creates one active visa_batch_applicants assignment (portal='visitsaudi', batch 1, position 1) for (groupId, identityId) -- the minimal fixture the visa-lifecycle-hook tests below need, via the same repo functions assignVisaBatch.ts itself calls. */
+async function createVisaAssignment(groupId: string, identityId: string): Promise<string> {
+  const batch = await createVisaBatch({ groupId, portal: 'visitsaudi', batchNumber: 1, batchName: 'test-batch-1' });
+  const result = await createVisaBatchAssignment({
+    batchId: batch.id,
+    groupId,
+    passportIdentityId: identityId,
+    portal: 'visitsaudi',
+    positionInBatch: 1,
+  });
+  assert.equal(result.outcome, 'inserted');
+  if (result.outcome !== 'inserted') throw new Error('unreachable');
+  return result.assignment.id;
+}
+
+async function getVisaAssignmentStatus(assignmentId: string): Promise<string | null> {
+  const { rows } = await pool.query<{ status: string }>(`SELECT status FROM visa_batch_applicants WHERE id = $1`, [assignmentId]);
+  return rows[0]?.status ?? null;
+}
+
 async function cleanupAll(groupIds: string[], agentIds: string[], identityIds: string[]): Promise<void> {
+  // Visa cleanup first -- visa_batch_applicants/visa_batches FK-reference
+  // groups(id), which is deleted further down in this same function.
+  for (const groupId of groupIds) {
+    await pool.query(`DELETE FROM visa_batch_applicants WHERE group_id = $1`, [groupId]);
+    await pool.query(`DELETE FROM visa_batches WHERE group_id = $1`, [groupId]);
+  }
   for (const identityId of identityIds) {
     await pool.query(`DELETE FROM sheet_reconciliation_jobs WHERE passport_identity_id = $1`, [identityId]);
     await pool.query(`DELETE FROM passport_message_links WHERE passport_identity_id = $1`, [identityId]);
@@ -630,6 +657,178 @@ test('move_to_group: a destination-append Sheets failure marks the command faile
 
     const jobs = await findReconciliationJobsForIdentityGroup(identity.id, fromGroupId);
     assert.equal(jobs.length, 1, 'the origin cleanup job was already durably committed too, independent of the destination append failing');
+  } finally {
+    await cleanupAll([fromGroupId, toGroupId], [agentId], [identity.id]);
+  }
+});
+
+// Visa Phase 1 lifecycle integration: retireCanonicalAndPromoteReplacement's
+// additive hook into updateActiveAssignmentsStatusWithClient (see
+// src/duplicates/applyIdentityStateChange.ts). Exercised end-to-end through
+// processPassportOperatorCommand, same as every other case in this file --
+// never unit-tested against retireCanonicalAndPromoteReplacement in
+// isolation, to keep this covering the REAL caller path /remove and the
+// admin:operator-command CLI both actually go through.
+
+test('remove_from_group also retires an active visa batch assignment for (identity, group) -- status becomes removed', async () => {
+  const groupId = await createGroup();
+  const agentId = await createAgent();
+  const messageId = await createMessage(groupId, agentId);
+  await createOcrResult(messageId);
+  const identity = await createPassportIdentity(uniquePassportNumber(), '1990-01-01');
+  assert.ok(identity);
+  const link = await createPassportMessageLink({
+    passportIdentityId: identity.id,
+    telegramMessageId: messageId,
+    groupId,
+    agentId,
+    role: 'canonical',
+    matchConfidenceTier: 'new_identity',
+  });
+  assert.ok(link);
+  const assignmentId = await createVisaAssignment(groupId, identity.id);
+
+  try {
+    const command = await createCancelOrRemoveCommand({
+      commandType: 'remove_from_group',
+      passportIdentityId: identity.id,
+      groupId,
+      telegramMessageId: messageId,
+      operatorId: 'operator-1',
+    });
+    const { deps } = fakeDeps();
+    await processPassportOperatorCommand(command.id, deps);
+
+    assert.equal(await getVisaAssignmentStatus(assignmentId), 'removed');
+    assert.equal(
+      await findActiveAssignment(groupId, identity.id, 'visitsaudi'),
+      null,
+      'no longer returned as an active assignment',
+    );
+  } finally {
+    await cleanupAll([groupId], [agentId], [identity.id]);
+  }
+});
+
+test('cancel_passport also retires an active visa batch assignment for (identity, group) -- status becomes cancelled', async () => {
+  const groupId = await createGroup();
+  const agentId = await createAgent();
+  const messageId = await createMessage(groupId, agentId);
+  await createOcrResult(messageId);
+  const identity = await createPassportIdentity(uniquePassportNumber(), '1990-01-01');
+  assert.ok(identity);
+  const link = await createPassportMessageLink({
+    passportIdentityId: identity.id,
+    telegramMessageId: messageId,
+    groupId,
+    agentId,
+    role: 'canonical',
+    matchConfidenceTier: 'new_identity',
+  });
+  assert.ok(link);
+  const assignmentId = await createVisaAssignment(groupId, identity.id);
+
+  try {
+    const command = await createCancelOrRemoveCommand({
+      commandType: 'cancel_passport',
+      passportIdentityId: identity.id,
+      groupId,
+      telegramMessageId: messageId,
+      operatorId: 'operator-1',
+    });
+    const { deps } = fakeDeps();
+    await processPassportOperatorCommand(command.id, deps);
+
+    assert.equal(await getVisaAssignmentStatus(assignmentId), 'cancelled');
+    assert.equal(
+      await findActiveAssignment(groupId, identity.id, 'visitsaudi'),
+      null,
+      'no longer returned as an active assignment',
+    );
+  } finally {
+    await cleanupAll([groupId], [agentId], [identity.id]);
+  }
+});
+
+test('cancel_passport with no visa batch assignment at all completes normally -- no error from the no-op hook', async () => {
+  const groupId = await createGroup();
+  const agentId = await createAgent();
+  const messageId = await createMessage(groupId, agentId);
+  await createOcrResult(messageId);
+  const identity = await createPassportIdentity(uniquePassportNumber(), '1990-01-01');
+  assert.ok(identity);
+  const link = await createPassportMessageLink({
+    passportIdentityId: identity.id,
+    telegramMessageId: messageId,
+    groupId,
+    agentId,
+    role: 'canonical',
+    matchConfidenceTier: 'new_identity',
+  });
+  assert.ok(link);
+  // Deliberately NO createVisaAssignment call -- this identity has never
+  // been assigned to any visa batch, the common case today.
+
+  try {
+    const command = await createCancelOrRemoveCommand({
+      commandType: 'cancel_passport',
+      passportIdentityId: identity.id,
+      groupId,
+      telegramMessageId: messageId,
+      operatorId: 'operator-1',
+    });
+    const { deps } = fakeDeps();
+    await processPassportOperatorCommand(command.id, deps);
+
+    const finalCommand = await findPassportOperatorCommandById(command.id);
+    assert.equal(finalCommand?.status, 'completed', 'the 0-row UPDATE inside updateActiveAssignmentsStatusWithClient never throws and never blocks the domain change');
+
+    const updatedLink = await findPassportMessageLinkById(link.id);
+    assert.equal(updatedLink?.linkStatus, 'cancelled');
+  } finally {
+    await cleanupAll([groupId], [agentId], [identity.id]);
+  }
+});
+
+test('move_to_group does NOT touch an active visa batch assignment\'s status -- stays active (documented open edge case)', async () => {
+  const fromGroupId = await createGroup();
+  const toGroupId = await createGroup();
+  const agentId = await createAgent();
+  const messageId = await createMessage(fromGroupId, agentId);
+  await createOcrResult(messageId);
+  const identity = await createPassportIdentity(uniquePassportNumber(), '1990-01-01');
+  assert.ok(identity);
+  const link = await createPassportMessageLink({
+    passportIdentityId: identity.id,
+    telegramMessageId: messageId,
+    groupId: fromGroupId,
+    agentId,
+    role: 'canonical',
+    matchConfidenceTier: 'new_identity',
+  });
+  assert.ok(link);
+  const assignmentId = await createVisaAssignment(fromGroupId, identity.id);
+
+  try {
+    const command = await createMoveToGroupCommand({
+      passportIdentityId: identity.id,
+      fromGroupId,
+      toGroupId,
+      telegramMessageId: messageId,
+      operatorId: 'operator-1',
+    });
+    const { deps } = fakeDeps();
+    await processPassportOperatorCommand(command.id, deps);
+
+    assert.equal(
+      await getVisaAssignmentStatus(assignmentId),
+      'active',
+      'promoteReplacementAndRelocateLink never calls updateActiveAssignmentsStatusWithClient -- move_to_group leaves visa assignments untouched by design (see applyIdentityStateChange.ts\'s own doc comment on this open edge case)',
+    );
+    assert.ok(
+      await findActiveAssignment(fromGroupId, identity.id, 'visitsaudi'),
+      'still active and still scoped to the OLD (from) group -- not relocated to the new group either',
+    );
   } finally {
     await cleanupAll([fromGroupId, toGroupId], [agentId], [identity.id]);
   }
