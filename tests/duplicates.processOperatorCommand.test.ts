@@ -790,7 +790,7 @@ test('cancel_passport with no visa batch assignment at all completes normally --
   }
 });
 
-test('move_to_group does NOT touch an active visa batch assignment\'s status -- stays active (documented open edge case)', async () => {
+test('move_to_group retires the active visa batch assignment in the ORIGIN group -- status becomes removed, no new assignment in the destination', async () => {
   const fromGroupId = await createGroup();
   const toGroupId = await createGroup();
   const agentId = await createAgent();
@@ -822,13 +822,122 @@ test('move_to_group does NOT touch an active visa batch assignment\'s status -- 
 
     assert.equal(
       await getVisaAssignmentStatus(assignmentId),
-      'active',
-      'promoteReplacementAndRelocateLink never calls updateActiveAssignmentsStatusWithClient -- move_to_group leaves visa assignments untouched by design (see applyIdentityStateChange.ts\'s own doc comment on this open edge case)',
+      'removed',
+      'promoteReplacementAndRelocateLink now retires the origin group\'s active assignment via updateActiveAssignmentsStatusWithClient, scoped to fromGroupId',
     );
-    assert.ok(
+    assert.equal(
       await findActiveAssignment(fromGroupId, identity.id, 'visitsaudi'),
-      'still active and still scoped to the OLD (from) group -- not relocated to the new group either',
+      null,
+      'no longer returned as an active assignment in the origin group',
     );
+    assert.equal(
+      await findActiveAssignment(toGroupId, identity.id, 'visitsaudi'),
+      null,
+      'no new assignment is ever auto-created in the destination group -- that stays an explicit, separate /visa_assign step',
+    );
+  } finally {
+    await cleanupAll([fromGroupId, toGroupId], [agentId], [identity.id]);
+  }
+});
+
+test('move_to_group with no visa batch assignment at all completes normally -- no error from the no-op visa retirement', async () => {
+  const fromGroupId = await createGroup();
+  const toGroupId = await createGroup();
+  const agentId = await createAgent();
+  const messageId = await createMessage(fromGroupId, agentId);
+  await createOcrResult(messageId);
+  const identity = await createPassportIdentity(uniquePassportNumber(), '1990-01-01');
+  assert.ok(identity);
+  const link = await createPassportMessageLink({
+    passportIdentityId: identity.id,
+    telegramMessageId: messageId,
+    groupId: fromGroupId,
+    agentId,
+    role: 'canonical',
+    matchConfidenceTier: 'new_identity',
+  });
+  assert.ok(link);
+  // Deliberately NO createVisaAssignment call -- this identity has never
+  // been assigned to any visa batch, the common case today.
+
+  try {
+    const command = await createMoveToGroupCommand({
+      passportIdentityId: identity.id,
+      fromGroupId,
+      toGroupId,
+      telegramMessageId: messageId,
+      operatorId: 'operator-1',
+    });
+    const { deps } = fakeDeps();
+    await processPassportOperatorCommand(command.id, deps);
+
+    const finalCommand = await findPassportOperatorCommandById(command.id);
+    assert.equal(
+      finalCommand?.status,
+      'completed',
+      'the 0-row UPDATE inside updateActiveAssignmentsStatusWithClient never throws and never blocks the move',
+    );
+
+    const movedLink = await findPassportMessageLinkById(link.id);
+    assert.equal(movedLink?.groupId, toGroupId, 'the move itself still completed correctly');
+  } finally {
+    await cleanupAll([fromGroupId, toGroupId], [agentId], [identity.id]);
+  }
+});
+
+test('move_to_group with a remaining duplicate promoted as replacement ALSO retires the visa batch assignment in the origin group', async () => {
+  const fromGroupId = await createGroup();
+  const toGroupId = await createGroup();
+  const agentId = await createAgent();
+  const movedMessageId = await createMessage(fromGroupId, agentId);
+  const remainingMessageId = await createMessage(fromGroupId, agentId);
+  await createOcrResult(movedMessageId);
+  await createOcrResult(remainingMessageId);
+  const identity = await createPassportIdentity(uniquePassportNumber(), '1990-01-01');
+  assert.ok(identity);
+  const movedLink = await createPassportMessageLink({
+    passportIdentityId: identity.id,
+    telegramMessageId: movedMessageId,
+    groupId: fromGroupId,
+    agentId,
+    role: 'canonical',
+    matchConfidenceTier: 'new_identity',
+  });
+  const remainingLink = await createPassportMessageLink({
+    passportIdentityId: identity.id,
+    telegramMessageId: remainingMessageId,
+    groupId: fromGroupId,
+    agentId,
+    role: 'duplicate',
+    matchConfidenceTier: 'high',
+  });
+  assert.ok(movedLink);
+  assert.ok(remainingLink);
+  const assignmentId = await createVisaAssignment(fromGroupId, identity.id);
+
+  try {
+    const command = await createMoveToGroupCommand({
+      passportIdentityId: identity.id,
+      fromGroupId,
+      toGroupId,
+      telegramMessageId: movedMessageId,
+      operatorId: 'operator-1',
+    });
+    const { deps } = fakeDeps();
+    await processPassportOperatorCommand(command.id, deps);
+
+    // The replacement-promotion path (a remaining duplicate becomes the new
+    // canonical in fromGroupId) must not interfere with -- or suppress --
+    // the visa retirement call, since the MOVED identity's own visa
+    // assignment is retired regardless of what happens to the link.
+    assert.equal(
+      await getVisaAssignmentStatus(assignmentId),
+      'removed',
+      'the visa assignment is retired exactly the same whether or not a replacement canonical was promoted',
+    );
+
+    const canonicalInSource = await findActiveCanonicalLink(identity.id, fromGroupId);
+    assert.equal(canonicalInSource?.id, remainingLink.id, 'the remaining duplicate still correctly becomes fromGroup\'s new canonical');
   } finally {
     await cleanupAll([fromGroupId, toGroupId], [agentId], [identity.id]);
   }

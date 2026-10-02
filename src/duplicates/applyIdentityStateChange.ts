@@ -83,9 +83,11 @@ export async function retireCanonicalAndPromoteReplacement(input: RetireAndPromo
     // group), in the SAME transaction as the domain change -- a crash right
     // after COMMIT can never leave a cancelled/removed passport still
     // "active" in a pending (or worse, already-submitted) visa batch. Never
-    // called for 'moved' (MOVE_TO_GROUP uses promoteReplacementAndRelocateLink
-    // instead, which does not yet touch visa assignments at all -- see
-    // this feature's own specification for that open edge case).
+    // called for 'moved' -- a MOVE_TO_GROUP never reaches this function at
+    // all (it goes through promoteReplacementAndRelocateLink below instead,
+    // which has its own, equivalent visa-retirement call for fromGroupId);
+    // this guard exists purely because oldCanonicalRetiredStatus's own type
+    // still includes 'moved' as a possible PassportLinkStatus value.
     if (input.oldCanonicalRetiredStatus !== 'moved') {
       await updateActiveAssignmentsStatusWithClient(client, input.groupId, input.passportIdentityId, input.oldCanonicalRetiredStatus);
     }
@@ -169,6 +171,28 @@ export async function promoteReplacementAndRelocateLink(input: PromoteReplacemen
       sourceOperation: 'move_to_group',
       sourceEventId: transferEventRows[0]?.id ?? null,
     });
+
+    // Visa automation Phase 1: MOVE_TO_GROUP must also retire any active
+    // visa_batch_applicants assignment the passport held in fromGroupId --
+    // it no longer belongs to that group's VisitSaudi batch once moved, and
+    // leaving it "active" there would be stale data a future batch
+    // submission could wrongly include. Scoped to fromGroupId ONLY (never
+    // toGroupId) -- updateActiveAssignmentsStatusWithClient's own
+    // WHERE group_id = $1 AND passport_identity_id = $2 AND status = 'active'
+    // guarantees this touches nothing in toGroupId and is a safe no-op when
+    // no assignment exists yet (the common case today). 'removed' is used
+    // because visa_batch_applicant_status has no 'moved' value -- from the
+    // ORIGIN group's own perspective this passport is simply no longer
+    // present, the same semantics REMOVE_FROM_GROUP's own hook already uses.
+    //
+    // Deliberately does NOT create a new assignment in toGroupId: that
+    // group's own Sheet data may not be verified/ready yet, and doing so
+    // here would silently re-run the Sheet-read/validate pipeline outside
+    // the operator's own explicit /visa_assign trigger. An operator who
+    // wants the moved applicant batched in toGroupId runs /visa_assign
+    // there afterward -- assignVisaBatch is already idempotent, so this is
+    // always a safe, explicit, separate step.
+    await updateActiveAssignmentsStatusWithClient(client, input.fromGroupId, input.passportIdentityId, 'removed');
 
     await client.query('COMMIT');
   } catch (error) {

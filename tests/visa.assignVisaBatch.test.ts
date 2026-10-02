@@ -5,6 +5,7 @@ import { assignVisaBatch } from '../src/visa/assignVisaBatch.js';
 import { createPassportIdentity } from '../src/db/repositories/passportIdentity.repo.js';
 import {
   countActiveApplicantsInBatch,
+  findActiveAssignment,
   findLastBatchForGroup,
   updateActiveAssignmentsStatusWithClient,
   updateBatchStatus,
@@ -309,5 +310,53 @@ test('11 applicants assigned truly CONCURRENTLY (Promise.all, not sequentially) 
     assert.equal(batchNumbers.size, 2, 'exactly 2 batches were ever created under this concurrent load, never more');
   } finally {
     await cleanupAll([groupId], identityIds);
+  }
+});
+
+// Pre-implementation contract verification for the MOVE_TO_GROUP fix in
+// applyIdentityStateChange.ts's promoteReplacementAndRelocateLink(): proves
+// updateActiveAssignmentsStatusWithClient scopes strictly to the EXACT
+// (groupId, passportIdentityId) pair it is given, never leaks into a
+// different group's row for the same identity, and is a true no-op (no
+// error, no row touched) when nothing is active -- the three properties
+// that call site relies on without needing any new locking/architecture.
+test('updateActiveAssignmentsStatusWithClient: affects ONLY the exact (groupId, passportIdentityId) pair, never a different group, and no-ops when nothing is active', async () => {
+  const groupA = await createGroup();
+  const groupB = await createGroup();
+  const identityId = await createIdentity();
+  try {
+    const assignmentInGroupA = await assignVisaBatch(groupA, identityId, 'visitsaudi', '2026-10-05');
+    const assignmentInGroupB = await assignVisaBatch(groupB, identityId, 'visitsaudi', '2026-10-05');
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      // No-op check first: a group/identity pair with nothing active yet.
+      const neverAssignedIdentity = await createIdentity();
+      try {
+        await updateActiveAssignmentsStatusWithClient(client, groupA, neverAssignedIdentity, 'removed');
+      } finally {
+        await pool.query(`DELETE FROM passport_identity WHERE id = $1`, [neverAssignedIdentity]);
+      }
+
+      await updateActiveAssignmentsStatusWithClient(client, groupA, identityId, 'removed');
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    const statusInGroupA = await countActiveApplicantsInBatch(assignmentInGroupA.batchId);
+    assert.equal(statusInGroupA, 0, 'the targeted (groupA, identity) assignment was retired');
+
+    const statusInGroupB = await countActiveApplicantsInBatch(assignmentInGroupB.batchId);
+    assert.equal(statusInGroupB, 1, 'the SAME identity\'s assignment in a DIFFERENT group (groupB) was never touched');
+
+    const winnerInB = await findActiveAssignment(groupB, identityId, 'visitsaudi');
+    assert.ok(winnerInB, 'groupB\'s assignment is still active');
+  } finally {
+    await cleanupAll([groupA, groupB], [identityId]);
   }
 });
