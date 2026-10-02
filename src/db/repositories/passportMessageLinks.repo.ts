@@ -128,6 +128,27 @@ export async function findActiveCanonicalLink(
   return row ? mapRow(row) : null;
 }
 
+/**
+ * Every applicant CURRENTLY in a group -- i.e. every active canonical link
+ * for groupId, one per distinct passport identity. This is the enumeration
+ * primitive visa automation needs (see visaAssignCommand.ts) to discover
+ * "who is in this group right now" without the caller having to already
+ * know each passport_identity_id individually, the way every other lookup
+ * in this file requires. A duplicate-role or non-active link is excluded
+ * for the identical reason computeGroupGenderStats excludes them: it has no
+ * physical row of its own in the group's Sheet, so there is nothing for
+ * visa automation to read or assign for it either.
+ */
+export async function findActiveCanonicalLinksForGroup(groupId: string): Promise<PassportMessageLinkRecord[]> {
+  const { rows } = await pool.query<PassportMessageLinkRow>(
+    `SELECT ${SELECT_COLUMNS} FROM passport_message_links
+     WHERE group_id = $1 AND role = 'canonical' AND link_status = 'active'
+     ORDER BY created_at ASC`,
+    [groupId],
+  );
+  return rows.map(mapRow);
+}
+
 export interface CanonicalReassignmentCandidate {
   linkId: string;
   telegramMessageId: string;

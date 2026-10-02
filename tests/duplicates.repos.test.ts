@@ -11,6 +11,7 @@ import {
 import {
   createPassportMessageLink,
   findActiveCanonicalLink,
+  findActiveCanonicalLinksForGroup,
   findActiveDuplicateCandidates,
   findAllLinksForIdentity,
   findPassportMessageLinkByTelegramMessageId,
@@ -270,6 +271,117 @@ test('createPassportMessageLink creates a canonical link and findActiveCanonical
   } finally {
     await cleanupIdentity(identity.id);
     await cleanupAgents([agentId]);
+    await cleanupGroups([groupId]);
+  }
+});
+
+test('findActiveCanonicalLinksForGroup lists every active canonical in a group, excludes duplicates/cancelled/removed/other groups', async () => {
+  const { groupId } = await createGroup();
+  const { groupId: otherGroupId } = await createGroup();
+  const agentId = await createAgent();
+
+  const identityA = await createPassportIdentity(uniquePassportNumber(), '1990-01-01');
+  const identityB = await createPassportIdentity(uniquePassportNumber(), '1991-02-02');
+  const identityC = await createPassportIdentity(uniquePassportNumber(), '1992-03-03');
+  const identityD = await createPassportIdentity(uniquePassportNumber(), '1993-04-04');
+  const identityOther = await createPassportIdentity(uniquePassportNumber(), '1994-05-05');
+  assert.ok(identityA && identityB && identityC && identityD && identityOther);
+
+  const messageA = await createLinkedTelegramMessage(groupId, agentId);
+  const messageBCanonical = await createLinkedTelegramMessage(groupId, agentId);
+  const messageBDuplicate = await createLinkedTelegramMessage(groupId, agentId);
+  const messageC = await createLinkedTelegramMessage(groupId, agentId);
+  const messageD = await createLinkedTelegramMessage(groupId, agentId);
+  const messageOther = await createLinkedTelegramMessage(otherGroupId, agentId);
+
+  try {
+    // A: one ordinary active canonical -- must be included.
+    const linkA = await createPassportMessageLink({
+      passportIdentityId: identityA.id,
+      telegramMessageId: messageA.telegramMessageId,
+      groupId,
+      agentId,
+      role: 'canonical',
+      matchConfidenceTier: 'new_identity',
+    });
+    assert.ok(linkA);
+
+    // B: an active canonical PLUS an active duplicate for the same identity
+    // -- only the canonical one must appear, never the duplicate.
+    const linkBCanonical = await createPassportMessageLink({
+      passportIdentityId: identityB.id,
+      telegramMessageId: messageBCanonical.telegramMessageId,
+      groupId,
+      agentId,
+      role: 'canonical',
+      matchConfidenceTier: 'new_identity',
+    });
+    assert.ok(linkBCanonical);
+    const linkBDuplicate = await createPassportMessageLink({
+      passportIdentityId: identityB.id,
+      telegramMessageId: messageBDuplicate.telegramMessageId,
+      groupId,
+      agentId,
+      role: 'duplicate',
+      matchConfidenceTier: 'high',
+    });
+    assert.ok(linkBDuplicate);
+
+    // C: a cancelled canonical -- must be excluded entirely.
+    const linkC = await createPassportMessageLink({
+      passportIdentityId: identityC.id,
+      telegramMessageId: messageC.telegramMessageId,
+      groupId,
+      agentId,
+      role: 'canonical',
+      matchConfidenceTier: 'new_identity',
+    });
+    assert.ok(linkC);
+    await setPassportMessageLinkStatus(linkC.id, 'cancelled');
+
+    // D: a removed canonical -- must be excluded entirely.
+    const linkD = await createPassportMessageLink({
+      passportIdentityId: identityD.id,
+      telegramMessageId: messageD.telegramMessageId,
+      groupId,
+      agentId,
+      role: 'canonical',
+      matchConfidenceTier: 'new_identity',
+    });
+    assert.ok(linkD);
+    await setPassportMessageLinkStatus(linkD.id, 'removed');
+
+    // Other: an active canonical in a DIFFERENT group -- must never leak in.
+    const linkOther = await createPassportMessageLink({
+      passportIdentityId: identityOther.id,
+      telegramMessageId: messageOther.telegramMessageId,
+      groupId: otherGroupId,
+      agentId,
+      role: 'canonical',
+      matchConfidenceTier: 'new_identity',
+    });
+    assert.ok(linkOther);
+
+    const results = await findActiveCanonicalLinksForGroup(groupId);
+    const resultIds = results.map((link) => link.id).sort();
+    assert.deepEqual(resultIds, [linkA.id, linkBCanonical.id].sort());
+  } finally {
+    await cleanupIdentity(identityA.id);
+    await cleanupIdentity(identityB.id);
+    await cleanupIdentity(identityC.id);
+    await cleanupIdentity(identityD.id);
+    await cleanupIdentity(identityOther.id);
+    await cleanupAgents([agentId]);
+    await cleanupGroups([groupId, otherGroupId]);
+  }
+});
+
+test('findActiveCanonicalLinksForGroup returns an empty array for a group with no applicants', async () => {
+  const { groupId } = await createGroup();
+  try {
+    const results = await findActiveCanonicalLinksForGroup(groupId);
+    assert.deepEqual(results, []);
+  } finally {
     await cleanupGroups([groupId]);
   }
 });

@@ -3,6 +3,7 @@ import { env } from '../config/env.js';
 import { evaluateDocumentUpload } from './resolveDocumentUpload.js';
 import { ingestPhotoMessage } from '../telegram/ingestPhotoMessage.js';
 import { removePassportCommand } from './removePassportCommand.js';
+import { visaAssignCommand, type VisaAssignApplicantResult } from '../visa/visaAssignCommand.js';
 
 export const bot = new Bot(env.TELEGRAM_BOT_TOKEN);
 
@@ -91,6 +92,84 @@ bot.command('remove', async (ctx) => {
           ? "Bu pasportni olib tashlash buyrug'i allaqachon navbatda."
           : "✅ Qabul qilindi — pasport bir necha soniyada shu guruh jadvalidan olib tashlanadi.",
       );
+      return;
+  }
+});
+
+// Operator-triggered VisitSaudi batch assignment for the WHOLE group (not a
+// single replied-to message, unlike /remove) -- see visaAssignCommand.ts
+// for the actual Sheet-read -> validate -> assignVisaBatch pipeline this
+// handler only does Telegram-specific plumbing (permission check via the
+// SAME creator/administrator rule /remove uses, resolving the group from
+// ctx.chat.id, phrasing the per-applicant summary reply) around.
+function summarizeVisaAssignResults(results: readonly VisaAssignApplicantResult[]): string {
+  const assigned = results.filter((r) => r.result.status === 'ASSIGNED');
+  const notReady = results.filter((r) => r.result.status === 'NOT_READY');
+  const sheetIssues = results.filter((r) => r.result.status === 'SHEET_ROW_NOT_FOUND' || r.result.status === 'SHEET_READ_FAILED');
+  const assignmentFailed = results.filter((r) => r.result.status === 'ASSIGNMENT_FAILED');
+
+  const lines = [
+    `Jami arizachilar: ${results.length}`,
+    `✅ Batchga tayinlandi: ${assigned.length}`,
+    `⏳ Hali tayyor emas: ${notReady.length}`,
+  ];
+  if (sheetIssues.length > 0) {
+    lines.push(`⚠️ Sheet'dan o'qib bo'lmadi: ${sheetIssues.length}`);
+  }
+  if (assignmentFailed.length > 0) {
+    lines.push(`❌ Tayinlashda xatolik: ${assignmentFailed.length}`);
+  }
+
+  if (notReady.length > 0) {
+    lines.push('');
+    lines.push("Tayyor emaslik sabablari:");
+    for (const r of notReady) {
+      if (r.result.status !== 'NOT_READY') continue;
+      const detail = r.result.missingFields && r.result.missingFields.length > 0 ? r.result.missingFields.join(', ') : r.result.reason;
+      lines.push(`- ${detail}`);
+    }
+  }
+
+  return lines.join('\n');
+}
+
+bot.command('visa_assign', async (ctx) => {
+  if (ctx.chat.type !== 'group' && ctx.chat.type !== 'supergroup') {
+    return;
+  }
+
+  if (!ctx.from) {
+    await ctx.reply('Bu buyruqni anonim administrator sifatida emas, oddiy foydalanuvchi sifatida yozing.');
+    return;
+  }
+
+  let authorStatus: string;
+  try {
+    const author = await ctx.getAuthor();
+    authorStatus = author.status;
+  } catch (error) {
+    console.error('[bot] /visa_assign: failed to verify sender permissions', error);
+    await ctx.reply("Ruxsatni tekshirishda xatolik yuz berdi, birozdan so'ng qayta urinib ko'ring.");
+    return;
+  }
+
+  const outcome = await visaAssignCommand({
+    telegramChatId: ctx.chat.id,
+    authorStatus,
+  });
+
+  switch (outcome.kind) {
+    case 'UNAUTHORIZED':
+      await ctx.reply('Bu buyruqni faqat guruh administratorlari ishlata oladi.');
+      return;
+    case 'GROUP_NOT_FOUND':
+      await ctx.reply('Bu guruh tizimda ro\'yxatdan o\'tmagan.');
+      return;
+    case 'EMPTY_GROUP':
+      await ctx.reply('Bu guruhda hozircha birorta ham faol pasport yo\'q.');
+      return;
+    case 'COMPLETED':
+      await ctx.reply(summarizeVisaAssignResults(outcome.results));
       return;
   }
 });

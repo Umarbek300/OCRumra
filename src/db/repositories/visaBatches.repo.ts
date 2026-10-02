@@ -70,6 +70,13 @@ export async function findActiveAssignment(
   return row ? mapApplicant(row) : null;
 }
 
+/** A batch by its own id -- used by callers (e.g. visaAssignCommand.ts) that already hold a VisaBatchApplicant and need its batch's own batchName/status for reporting, without relying on "the last batch" as a proxy (which is only guaranteed correct for the single most recent assignment in a group, not for an arbitrary earlier one). */
+export async function findVisaBatchById(id: string): Promise<VisaBatch | null> {
+  const { rows } = await pool.query<VisaBatchRow>(`SELECT ${BATCH_COLUMNS} FROM visa_batches WHERE id = $1`, [id]);
+  const row = rows[0];
+  return row ? mapBatch(row) : null;
+}
+
 /** The most recently created batch for this (group, portal) -- the only one a new applicant could still be added to. */
 export async function findLastBatchForGroup(groupId: string, portal: VisaPortal): Promise<VisaBatch | null> {
   const { rows } = await pool.query<VisaBatchRow>(
