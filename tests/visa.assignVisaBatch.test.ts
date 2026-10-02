@@ -242,3 +242,72 @@ test("a new applicant can take over the position vacated by a removed applicant 
     await cleanupAll([groupId], identityIds);
   }
 });
+
+test('a cancelled applicant no longer counts toward the active total (symmetry with removed)', async () => {
+  const groupId = await createGroup();
+  const identityId = await createIdentity();
+  try {
+    const assignment = await assignVisaBatch(groupId, identityId, 'visitsaudi', '2026-10-05');
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await updateActiveAssignmentsStatusWithClient(client, groupId, identityId, 'cancelled');
+      await client.query('COMMIT');
+    } finally {
+      client.release();
+    }
+    const count = await countActiveApplicantsInBatch(assignment.batchId);
+    assert.equal(count, 0);
+  } finally {
+    await cleanupAll([groupId], [identityId]);
+  }
+});
+
+test('11 applicants assigned truly CONCURRENTLY (Promise.all, not sequentially) all succeed with no duplicate position and no unhandled error', async () => {
+  // Regression test for the race window between findFreePositionInBatch's
+  // read and createVisaBatchAssignment's INSERT: createVisaBatchAssignment's
+  // own ON CONFLICT only suppresses a violation of
+  // idx_visa_batch_applicants_one_active_assignment (the identity-uniqueness
+  // index) -- a violation of the OTHER partial unique index,
+  // idx_visa_batch_applicants_position_active, is a different arbiter and
+  // is NOT suppressed by that clause, so it still raises a real Postgres
+  // error when two DIFFERENT applicants race for the same computed free
+  // position in the same batch. Every earlier test in this file calls
+  // assignVisaBatch sequentially (awaited one at a time), which can never
+  // exercise this window at all -- only genuine concurrent callers (via
+  // Promise.all, as here) can trigger it.
+  const groupId = await createGroup();
+  const identityIds: string[] = [];
+  try {
+    for (let i = 0; i < 11; i += 1) {
+      identityIds.push(await createIdentity());
+    }
+
+    const assignments = await Promise.all(
+      identityIds.map((identityId) => assignVisaBatch(groupId, identityId, 'visitsaudi', '2026-10-05')),
+    );
+
+    assert.equal(assignments.length, 11, 'every concurrent call resolved -- none threw an unhandled unique_violation');
+
+    const batch1 = await findLastBatchForGroup(groupId, 'visitsaudi');
+    assert.ok(batch1);
+
+    const { rows } = await pool.query<{ batch_id: string; position_in_batch: number; count: string }>(
+      `SELECT batch_id, position_in_batch, count(*)::text AS count
+       FROM visa_batch_applicants
+       WHERE group_id = $1 AND status = 'active'
+       GROUP BY batch_id, position_in_batch
+       HAVING count(*) > 1`,
+      [groupId],
+    );
+    assert.equal(rows.length, 0, 'no (batch_id, position_in_batch) pair was ever double-assigned under real concurrency');
+
+    const distinctIdentities = new Set(assignments.map((a) => a.passportIdentityId));
+    assert.equal(distinctIdentities.size, 11, 'all 11 applicants got their own distinct assignment, none silently merged/lost');
+
+    const batchNumbers = new Set(assignments.map((a) => a.batchId));
+    assert.equal(batchNumbers.size, 2, 'exactly 2 batches were ever created under this concurrent load, never more');
+  } finally {
+    await cleanupAll([groupId], identityIds);
+  }
+});

@@ -7,7 +7,7 @@ import {
   findLastBatchForGroup,
 } from '../db/repositories/visaBatches.repo.js';
 import { buildVisaBatchName } from './buildVisaBatchName.js';
-import type { VisaBatchApplicant, VisaPortal } from './types.js';
+import type { VisaBatchApplicant } from './types.js';
 
 const MAX_BATCH_SIZE = 10;
 /** Same shared-attempt-budget convention as MAX_RECONCILIATION_ATTEMPTS elsewhere in this codebase -- real-world concurrency here is a handful of workers at most, never thousands. */
@@ -40,9 +40,13 @@ function isUniqueViolation(error: unknown): boolean {
 
 /**
  * Idempotently assigns ONE applicant to a batch of at most 10 ACTIVE
- * applicants each. Only ever called for portal='visitsaudi' -- KSA Visa
- * never batches at all (see ksaVisaPackageBuilder.ts), one applicant per
- * package, independently of this function entirely.
+ * applicants each. The portal parameter is narrowed to the 'visitsaudi'
+ * literal (not the general VisaPortal union) so that passing 'ksavisa'
+ * here is a COMPILE-TIME error, not just a documented convention -- KSA
+ * Visa never batches at all (see ksaVisaPackageBuilder.ts), one applicant
+ * per package, independently of this function entirely, and nothing about
+ * this function's own logic (batch numbering, 10-slot cap) makes sense for
+ * that flow.
  *
  * A batch_number, once created, is NEVER reassigned or renumbered: this
  * function only ever either (a) adds to the single most-recent PENDING
@@ -60,13 +64,17 @@ function isUniqueViolation(error: unknown): boolean {
  * application-level checks at the same time. A rejected attempt is not an
  * error to the caller -- it triggers a bounded retry with a fresh read, so
  * two workers racing to assign the same applicant always converge on the
- * SAME single assignment, and two workers racing to open the 11th slot
- * always converge on exactly one new batch being created.
+ * SAME single assignment, two workers racing to open the 11th slot always
+ * converge on exactly one new batch being created, and two workers racing
+ * to claim the SAME free position for two DIFFERENT applicants in the same
+ * batch (a read-then-write gap between findFreePositionInBatch and this
+ * INSERT) always have exactly one of them retry onto a different position
+ * rather than one of them throwing an unhandled unique_violation.
  */
 export async function assignVisaBatch(
   groupId: string,
   passportIdentityId: string,
-  portal: VisaPortal,
+  portal: 'visitsaudi',
   departureDateIso: string,
   deps: AssignVisaBatchDependencies = defaultDependencies,
 ): Promise<VisaBatchApplicant> {
@@ -110,13 +118,32 @@ export async function assignVisaBatch(
       continue; // the batch filled up between our count and now -- retry (will open a new batch)
     }
 
-    const result = await deps.createVisaBatchAssignment({
-      batchId: targetBatchId,
-      groupId,
-      passportIdentityId,
-      portal,
-      positionInBatch: position,
-    });
+    let result: Awaited<ReturnType<typeof deps.createVisaBatchAssignment>>;
+    try {
+      result = await deps.createVisaBatchAssignment({
+        batchId: targetBatchId,
+        groupId,
+        passportIdentityId,
+        portal,
+        positionInBatch: position,
+      });
+    } catch (error) {
+      // This INSERT's own ON CONFLICT only targets
+      // idx_visa_batch_applicants_one_active_assignment (the identity-
+      // uniqueness index) -- a violation of the OTHER partial unique index,
+      // idx_visa_batch_applicants_position_active, is a DIFFERENT arbiter
+      // and is NOT suppressed by that ON CONFLICT clause, so it still
+      // raises here. This happens when a concurrent caller, assigning a
+      // DIFFERENT applicant, won the race for the SAME (batchId, position)
+      // computed by our own findFreePositionInBatch just above (the
+      // classic read-then-write gap). Retrying with a fresh read is always
+      // safe: the DB never actually persists the conflicting duplicate
+      // row, this is purely a losing-side retry, not a correctness issue.
+      if (isUniqueViolation(error)) {
+        continue;
+      }
+      throw error;
+    }
 
     if (result.outcome === 'inserted') {
       return result.assignment;
