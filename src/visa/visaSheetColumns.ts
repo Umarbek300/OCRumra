@@ -14,15 +14,26 @@ export const VISA_EMAIL_COLUMN = 'R';
 export const VISA_ARRIVAL_DATE_COLUMN = 'S';
 export const VISA_PERSONAL_PHOTO_URL_COLUMN = 'T';
 export const VISA_PASSPORT_SCAN_URL_COLUMN = 'U';
+/**
+ * The applicant's CROPPED portrait URL (the face-detected photo region
+ * only) — deliberately NOT column U: U is already an operator-entered
+ * field (VISA_PASSPORT_SCAN_URL_COLUMN / passportScanUrl, read by
+ * readVerifiedApplicantData.ts for the VisitSaudi/KSA Visa draft-building
+ * flow). Writing the auto-generated cropped-portrait URL there would
+ * silently corrupt that unrelated feature. V is the next free column after
+ * the existing Q:U visa block.
+ */
+export const VISA_PERSONAL_PORTRAIT_URL_COLUMN = 'V';
 
 export const VISA_FIRST_COLUMN_LETTER = VISA_NATIONALITY_COLUMN;
-export const VISA_LAST_COLUMN_LETTER = VISA_PASSPORT_SCAN_URL_COLUMN;
+export const VISA_LAST_COLUMN_LETTER = VISA_PERSONAL_PORTRAIT_URL_COLUMN;
 
-/** 0-indexed position within a row array read from A:U (A=0, ..., M=12, N=13, O=14, P=15, Q=16, R=17, S=18, T=19, U=20). */
+/** 0-indexed position within a row array read from A:V (A=0, ..., M=12, N=13, O=14, P=15, Q=16, R=17, S=18, T=19, U=20, V=21). */
 export const VISA_COLUMN_INDEX = {
   nationality: 16,
   email: 17,
   arrivalDate: 18,
   personalPhotoUrl: 19,
   passportScanUrl: 20,
+  personalPortraitUrl: 21,
 } as const;

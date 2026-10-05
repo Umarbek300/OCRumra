@@ -49,6 +49,10 @@ function ocrField<T extends string = string>(value: T | null) {
 const OCR_RESULT: PassportOcrResultRecord = {
   id: 'ocr-1',
   telegramMessageId: 'msg-1',
+  personalPhotoObjectPath: null,
+  personalPhotoToken: null,
+  personalPortraitObjectPath: null,
+  personalPortraitToken: null,
   firstName: ocrField('ANNA'),
   middleName: ocrField(null),
   surname: ocrField('ERIKSSON'),
@@ -104,8 +108,8 @@ interface Calls {
   computeGenderStats: number;
   writeGenderSummary: number;
   markConfirmationSent: number;
-  clearConfirmationSent: number;
   sendConfirmation: number;
+  writePhotoUrl: number;
 }
 
 interface BuildDepsOptions {
@@ -117,8 +121,14 @@ interface BuildDepsOptions {
   claimResult?: SheetSyncQueueRecord | null;
   upsertRowImpl?: SyncPassportRowToSheetDependencies['upsertRow'];
   writeGenderSummaryImpl?: SyncPassportRowToSheetDependencies['writeGenderSummary'];
-  /** null simulates "a confirmation was already sent for this job" (the atomic claim losing/no-op). */
-  confirmationClaimResult?: SheetSyncQueueRecord | null;
+  /**
+   * true simulates re-processing a job whose confirmation was ALREADY
+   * recorded as sent on a prior attempt (e.g. a crash-recovered retry) —
+   * sets the claimed job's own confirmationSentAt, which is what
+   * syncPassportRowToSheet now reads to decide whether to (re)send at all.
+   * Ignored if `claimResult` is also given (that takes full control instead).
+   */
+  confirmationAlreadySent?: boolean;
   sendConfirmationImpl?: SyncPassportRowToSheetDependencies['sendConfirmation'];
   messageLink?: Awaited<ReturnType<SyncPassportRowToSheetDependencies['findMessageLink']>>;
   activeCanonicalLink?: Awaited<ReturnType<SyncPassportRowToSheetDependencies['findActiveCanonicalLink']>>;
@@ -126,6 +136,8 @@ interface BuildDepsOptions {
   findTelegramMessageImpl?: SyncPassportRowToSheetDependencies['findTelegramMessage'];
   /** id-aware override, same reason as findTelegramMessageImpl. */
   findOcrResultImpl?: SyncPassportRowToSheetDependencies['findOcrResult'];
+  photoPublicBaseUrl?: string | null;
+  writePhotoUrlImpl?: SyncPassportRowToSheetDependencies['writePhotoUrl'];
 }
 
 function buildDeps(options: BuildDepsOptions = {}): {
@@ -135,6 +147,7 @@ function buildDeps(options: BuildDepsOptions = {}): {
   failedArgs: unknown[];
   sendConfirmationArgs: unknown[];
   writeGenderSummaryArgs: unknown[];
+  writePhotoUrlArgs: unknown[];
 } {
   const calls: Calls = {
     markStarted: 0,
@@ -149,18 +162,22 @@ function buildDeps(options: BuildDepsOptions = {}): {
     computeGenderStats: 0,
     writeGenderSummary: 0,
     markConfirmationSent: 0,
-    clearConfirmationSent: 0,
     sendConfirmation: 0,
+    writePhotoUrl: 0,
   };
   const syncedArgs: unknown[] = [];
   const failedArgs: unknown[] = [];
   const sendConfirmationArgs: unknown[] = [];
   const writeGenderSummaryArgs: unknown[] = [];
+  const writePhotoUrlArgs: unknown[] = [];
 
   const deps: SyncPassportRowToSheetDependencies = {
     markStarted: async () => {
       calls.markStarted += 1;
-      return options.claimResult !== undefined ? options.claimResult : CLAIMED_JOB;
+      if (options.claimResult !== undefined) return options.claimResult;
+      return options.confirmationAlreadySent
+        ? { ...CLAIMED_JOB, confirmationSentAt: '2025-12-31T00:00:00.000Z' }
+        : CLAIMED_JOB;
     },
     markSynced: async (id, sheetRowNumber) => {
       calls.markSynced += 1;
@@ -214,11 +231,7 @@ function buildDeps(options: BuildDepsOptions = {}): {
       }),
     markConfirmationSent: async (id) => {
       calls.markConfirmationSent += 1;
-      if (options.confirmationClaimResult !== undefined) return options.confirmationClaimResult;
       return { ...CLAIMED_JOB, status: 'synced', confirmationSentAt: '2026-01-01T00:00:00.000Z' };
-    },
-    clearConfirmationSent: async () => {
-      calls.clearConfirmationSent += 1;
     },
     sendConfirmation:
       options.sendConfirmationImpl ??
@@ -234,10 +247,23 @@ function buildDeps(options: BuildDepsOptions = {}): {
     findMessageLink: options.messageLink !== undefined ? async () => options.messageLink! : async () => null,
     findActiveCanonicalLink:
       options.activeCanonicalLink !== undefined ? async () => options.activeCanonicalLink! : async () => null,
+    // Defaults to a stable fake base URL so every pre-existing test in
+    // this file (none of which set personalPhotoObjectPath) still exercises
+    // the "no photo uploaded yet" branch (OCR_RESULT.personalPhotoObjectPath
+    // is null by default) without needing every test to opt out explicitly.
+    resolveSheetTitle: async () => 'unused-tab-title',
+    photoPublicBaseUrl: options.photoPublicBaseUrl !== undefined ? options.photoPublicBaseUrl : 'https://visa.mahbubtour.uz',
+    writePhotoUrl:
+      options.writePhotoUrlImpl ??
+      (async (spreadsheetId, rowNumber, url, column, sheetTitle) => {
+        calls.writePhotoUrl += 1;
+        writePhotoUrlArgs.push({ spreadsheetId, rowNumber, url, column, sheetTitle });
+        return 'written';
+      }),
     now: () => new Date('2026-01-01T00:00:00.000Z'),
   };
 
-  return { deps, calls, syncedArgs, failedArgs, sendConfirmationArgs, writeGenderSummaryArgs };
+  return { deps, calls, syncedArgs, failedArgs, sendConfirmationArgs, writeGenderSummaryArgs, writePhotoUrlArgs };
 }
 
 test('syncPassportRowToSheet: happy path syncs the row and marks the job synced', async () => {
@@ -539,17 +565,39 @@ test('syncPassportRowToSheet never sends a confirmation when the Sheets write it
   assert.equal(calls.sendConfirmation, 0);
 });
 
-test('syncPassportRowToSheet skips sending when the confirmation claim reports it was already sent (duplicate-prevention)', async () => {
-  const { deps, calls } = buildDeps({ confirmationClaimResult: null });
+test('syncPassportRowToSheet skips sending entirely when this job\'s own claim already shows a confirmation was sent (crash-recovery retry safety)', async () => {
+  const { deps, calls } = buildDeps({ confirmationAlreadySent: true });
 
   await syncPassportRowToSheet('job-1', deps);
 
   assert.equal(calls.markSynced, 1, 'the sheet sync itself still succeeds and is recorded');
-  assert.equal(calls.markConfirmationSent, 1, 'still attempts the atomic claim...');
-  assert.equal(calls.sendConfirmation, 0, '...but sends nothing once the claim reports it lost/already-sent');
+  assert.equal(calls.sendConfirmation, 0, 'must never resend a confirmation already recorded as delivered');
+  assert.equal(calls.markConfirmationSent, 0, 'must not even re-attempt marking an already-sent confirmation');
 });
 
-test('syncPassportRowToSheet rolls back the confirmation claim and does not affect job status when the Telegram send itself throws', async () => {
+test('syncPassportRowToSheet marks confirmation_sent_at ONLY AFTER the Telegram send has actually succeeded — never before (crash-safety regression guard)', async () => {
+  const order: string[] = [];
+  const { deps } = buildDeps({
+    sendConfirmationImpl: async () => {
+      order.push('send');
+    },
+  });
+  const realMarkConfirmationSent = deps.markConfirmationSent;
+  deps.markConfirmationSent = async (id) => {
+    order.push('mark');
+    return realMarkConfirmationSent(id);
+  };
+
+  await syncPassportRowToSheet('job-1', deps);
+
+  assert.deepEqual(
+    order,
+    ['send', 'mark'],
+    'marking confirmation_sent_at before the send completes would let a worker crash in between record a confirmation that was never actually delivered to Telegram',
+  );
+});
+
+test('syncPassportRowToSheet never marks confirmation_sent_at when the Telegram send itself throws, so a later attempt can still try again', async () => {
   const { deps, calls } = buildDeps({
     sendConfirmationImpl: async () => {
       throw new Error('Telegram API error: bot was blocked by the user');
@@ -560,7 +608,7 @@ test('syncPassportRowToSheet rolls back the confirmation claim and does not affe
 
   assert.equal(calls.markSynced, 1, 'the job is still recorded as synced — a notification failure must never look like a Sheets failure');
   assert.equal(calls.markFailed, 0, 'must never flip an already-synced job back to failed just because the confirmation send failed');
-  assert.equal(calls.clearConfirmationSent, 1, 'rolls back the claim so a later attempt could still try again');
+  assert.equal(calls.markConfirmationSent, 0, 'confirmation_sent_at must stay null when the send never actually succeeded, so a future retry still attempts it');
 });
 
 test('syncPassportRowToSheet never logs raw OCR/passport field values when the confirmation send fails', async () => {
@@ -801,4 +849,214 @@ test('findGroup is called exactly once per sync, reused for both upsertRow and t
 
   assert.equal(calls.findGroup, 1);
   assert.equal(calls.writeGenderSummary, 1, 'the gender summary still gets written, using the same already-fetched group');
+});
+
+// --- personal photo URL (column T, see writePersonalPhotoUrlIfBlank.ts) ---
+
+test('syncPassportRowToSheet writes the durable photo URL, built from the dedicated token, when a photo was uploaded and a public base URL is configured', async () => {
+  const { deps, calls, writePhotoUrlArgs } = buildDeps({
+    ocrResult: { ...OCR_RESULT, personalPhotoObjectPath: 'visa-photos/msg-1.jpg', personalPhotoToken: 'random-opaque-token-value' },
+  });
+
+  await syncPassportRowToSheet('job-1', deps);
+
+  assert.equal(calls.writePhotoUrl, 1);
+  assert.deepEqual(writePhotoUrlArgs[0], {
+    spreadsheetId: 'sheet-abc',
+    rowNumber: 5,
+    url: 'https://visa.mahbubtour.uz/visa-photos/random-opaque-token-value',
+    column: 'T',
+    sheetTitle: undefined,
+  });
+});
+
+test('syncPassportRowToSheet never builds the URL from telegramMessageId — only from personalPhotoToken', async () => {
+  const { deps, writePhotoUrlArgs } = buildDeps({
+    ocrResult: { ...OCR_RESULT, telegramMessageId: 'msg-1', personalPhotoObjectPath: 'visa-photos/msg-1.jpg', personalPhotoToken: 'totally-different-value' },
+  });
+
+  await syncPassportRowToSheet('job-1', deps);
+
+  const writtenUrl = (writePhotoUrlArgs[0] as { url: string }).url;
+  assert.ok(writtenUrl.endsWith('/totally-different-value'));
+  assert.ok(!writtenUrl.includes('msg-1'), 'the URL must never contain the telegram_message_id');
+});
+
+test('syncPassportRowToSheet never attempts a photo URL write when no photo has been uploaded yet (personalPhotoToken null)', async () => {
+  const { deps, calls } = buildDeps({
+    ocrResult: { ...OCR_RESULT, personalPhotoObjectPath: null, personalPhotoToken: null },
+  });
+
+  await syncPassportRowToSheet('job-1', deps);
+
+  assert.equal(calls.writePhotoUrl, 0);
+});
+
+test('syncPassportRowToSheet never attempts a photo URL write when VISA_PHOTOS_PUBLIC_BASE_URL is not configured', async () => {
+  const { deps, calls } = buildDeps({
+    ocrResult: { ...OCR_RESULT, personalPhotoObjectPath: 'visa-photos/msg-1.jpg', personalPhotoToken: 'random-opaque-token-value' },
+    photoPublicBaseUrl: null,
+  });
+
+  await syncPassportRowToSheet('job-1', deps);
+
+  assert.equal(calls.writePhotoUrl, 0);
+});
+
+test('syncPassportRowToSheet resolves the master/tab group\'s current tab title for the photo URL write', async () => {
+  let resolvedArgs: unknown;
+  const { deps, calls } = buildDeps({
+    ocrResult: { ...OCR_RESULT, personalPhotoObjectPath: 'visa-photos/msg-1.jpg', personalPhotoToken: 'random-opaque-token-value' },
+    group: { ...GROUP, googleSheetGid: 918273645 },
+  });
+  deps.resolveSheetTitle = async (spreadsheetId, gid) => {
+    resolvedArgs = { spreadsheetId, gid };
+    return 'Live Tab Title';
+  };
+
+  await syncPassportRowToSheet('job-1', deps);
+
+  assert.deepEqual(resolvedArgs, { spreadsheetId: 'sheet-abc', gid: 918273645 });
+  assert.equal(calls.writePhotoUrl, 1);
+});
+
+test('a photo URL write failure never flips an already-synced job back to failed', async () => {
+  const { deps, calls } = buildDeps({
+    ocrResult: { ...OCR_RESULT, personalPhotoObjectPath: 'visa-photos/msg-1.jpg', personalPhotoToken: 'random-opaque-token-value' },
+    writePhotoUrlImpl: async () => {
+      throw new Error('Google Sheets API error: quota exceeded');
+    },
+  });
+
+  await syncPassportRowToSheet('job-1', deps);
+
+  assert.equal(calls.markSynced, 1, 'a photo-URL write failure must never look like a sheet sync failure');
+  assert.equal(calls.markFailed, 0);
+});
+
+test('syncPassportRowToSheet never attempts a photo URL write when the sheet write itself fails', async () => {
+  const { deps, calls } = buildDeps({
+    ocrResult: { ...OCR_RESULT, personalPhotoObjectPath: 'visa-photos/msg-1.jpg', personalPhotoToken: 'random-opaque-token-value' },
+    upsertRowImpl: async () => {
+      throw new Error('Google Sheets API error: quota exceeded');
+    },
+  });
+
+  await syncPassportRowToSheet('job-1', deps);
+
+  assert.equal(calls.markSynced, 0);
+  assert.equal(calls.writePhotoUrl, 0, 'must never attempt a column write for a row that never synced');
+});
+
+// --- personal portrait URL (column V, see writePersonalPhotoUrlIfBlank.ts) ---
+// Deliberately NOT column U: U already holds an operator-entered "passport
+// scan URL" for the unrelated VisitSaudi/KSA Visa draft-building flow (see
+// visaSheetColumns.ts's own doc comment on VISA_PERSONAL_PORTRAIT_URL_COLUMN).
+
+test('syncPassportRowToSheet writes the durable portrait URL, built from the dedicated portrait token, to column V, independent of the photo/column-T write', async () => {
+  const { deps, calls, writePhotoUrlArgs } = buildDeps({
+    ocrResult: {
+      ...OCR_RESULT,
+      personalPhotoObjectPath: 'visa-photos/msg-1.jpg',
+      personalPhotoToken: 'photo-token-value',
+      personalPortraitObjectPath: 'visa-photos/msg-1-portrait.jpg',
+      personalPortraitToken: 'portrait-token-value',
+    },
+  });
+
+  await syncPassportRowToSheet('job-1', deps);
+
+  assert.equal(calls.writePhotoUrl, 2, 'both the T write and the V write happen');
+  const photoCall = writePhotoUrlArgs.find((a) => (a as { column: string }).column === 'T');
+  const portraitCall = writePhotoUrlArgs.find((a) => (a as { column: string }).column === 'V');
+  assert.deepEqual(photoCall, {
+    spreadsheetId: 'sheet-abc',
+    rowNumber: 5,
+    url: 'https://visa.mahbubtour.uz/visa-photos/photo-token-value',
+    column: 'T',
+    sheetTitle: undefined,
+  });
+  assert.deepEqual(portraitCall, {
+    spreadsheetId: 'sheet-abc',
+    rowNumber: 5,
+    url: 'https://visa.mahbubtour.uz/visa-photos/portrait-token-value',
+    column: 'V',
+    sheetTitle: undefined,
+  });
+});
+
+test('syncPassportRowToSheet never attempts a portrait URL write when no portrait was uploaded yet (personalPortraitToken null)', async () => {
+  const { deps, calls, writePhotoUrlArgs } = buildDeps({
+    ocrResult: {
+      ...OCR_RESULT,
+      personalPhotoObjectPath: 'visa-photos/msg-1.jpg',
+      personalPhotoToken: 'photo-token-value',
+      personalPortraitObjectPath: null,
+      personalPortraitToken: null,
+    },
+  });
+
+  await syncPassportRowToSheet('job-1', deps);
+
+  assert.equal(calls.writePhotoUrl, 1, 'only the T write happens');
+  assert.equal((writePhotoUrlArgs[0] as { column: string }).column, 'T');
+});
+
+test('syncPassportRowToSheet never attempts a portrait URL write when VISA_PHOTOS_PUBLIC_BASE_URL is not configured', async () => {
+  const { deps, calls } = buildDeps({
+    ocrResult: {
+      ...OCR_RESULT,
+      personalPortraitObjectPath: 'visa-photos/msg-1-portrait.jpg',
+      personalPortraitToken: 'portrait-token-value',
+    },
+    photoPublicBaseUrl: null,
+  });
+
+  await syncPassportRowToSheet('job-1', deps);
+
+  assert.equal(calls.writePhotoUrl, 0);
+});
+
+test('a portrait URL write failure never flips an already-synced job back to failed, and never affects the photo (column T) write', async () => {
+  const attemptedColumns: string[] = [];
+  const { deps, calls } = buildDeps({
+    ocrResult: {
+      ...OCR_RESULT,
+      personalPhotoObjectPath: 'visa-photos/msg-1.jpg',
+      personalPhotoToken: 'photo-token-value',
+      personalPortraitObjectPath: 'visa-photos/msg-1-portrait.jpg',
+      personalPortraitToken: 'portrait-token-value',
+    },
+    writePhotoUrlImpl: async (spreadsheetId, rowNumber, url, column) => {
+      attemptedColumns.push(column);
+      if (column === 'V') {
+        throw new Error('Google Sheets API error: quota exceeded');
+      }
+      return 'written';
+    },
+  });
+
+  await syncPassportRowToSheet('job-1', deps);
+
+  assert.equal(calls.markSynced, 1, 'a portrait-URL write failure must never look like a sheet sync failure');
+  assert.equal(calls.markFailed, 0);
+  assert.deepEqual(attemptedColumns, ['T', 'V'], 'the T write completes successfully before the throwing V write is attempted');
+});
+
+test('syncPassportRowToSheet never attempts a portrait URL write when the sheet write itself fails', async () => {
+  const { deps, calls } = buildDeps({
+    ocrResult: {
+      ...OCR_RESULT,
+      personalPortraitObjectPath: 'visa-photos/msg-1-portrait.jpg',
+      personalPortraitToken: 'portrait-token-value',
+    },
+    upsertRowImpl: async () => {
+      throw new Error('Google Sheets API error: quota exceeded');
+    },
+  });
+
+  await syncPassportRowToSheet('job-1', deps);
+
+  assert.equal(calls.markSynced, 0);
+  assert.equal(calls.writePhotoUrl, 0, 'must never attempt a column write for a row that never synced');
 });

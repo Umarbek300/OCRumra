@@ -437,6 +437,10 @@ test('two concurrent syncPassportRowToSheet calls for the same real queue row ca
       findOcrResult: async () => ({
         id: 'ocr-1',
         telegramMessageId: fixture.telegramMessageId,
+        personalPhotoObjectPath: null,
+        personalPhotoToken: null,
+        personalPortraitObjectPath: null,
+        personalPortraitToken: null,
         firstName: { value: 'ANNA', confidence: 'high' },
         middleName: { value: null, confidence: null },
         surname: { value: 'ERIKSSON', confidence: 'high' },
@@ -466,13 +470,15 @@ test('two concurrent syncPassportRowToSheet calls for the same real queue row ca
       computeGenderStats: async () => ({ male: 0, female: 0, unspecified: 0, total: 0 }),
       writeGenderSummary: async () => {},
       markConfirmationSent: sheetSyncQueueRepo.markSheetSyncConfirmationSent,
-      clearConfirmationSent: sheetSyncQueueRepo.clearSheetSyncConfirmationSent,
       sendConfirmation: async () => {},
       // Duplicate-passport canonical resolution (src/duplicates/) — no link
       // for this fixture, so it resolves to the job's own message, exactly
       // preserving this test's pre-feature behavior.
       findMessageLink: async () => null,
       findActiveCanonicalLink: async () => null,
+      resolveSheetTitle: async () => 'unused-tab-title',
+      writePhotoUrl: async () => 'skipped-not-blank',
+      photoPublicBaseUrl: null,
       now: () => new Date(),
     };
 

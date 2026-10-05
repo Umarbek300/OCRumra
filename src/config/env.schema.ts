@@ -78,6 +78,23 @@ export const envSchema = z.object({
   // only — nothing in this codebase reads this value yet, and no existing
   // provisioning/sync logic is affected by setting or leaving it unset.
   GOOGLE_SHEETS_MASTER_SPREADSHEET_ID: z.string().min(1).optional(),
+  // Private GCS bucket for applicant personal photos (see
+  // src/visa/uploadApplicantPhoto.ts). Optional here for the same reason
+  // as every other Google credential var above — the OCR worker enforces
+  // its presence itself, only once a photo upload is actually attempted,
+  // and treats "not configured" as "skip photo storage" rather than an
+  // error (this feature is opt-in per environment).
+  GCS_VISA_PHOTOS_BUCKET: z.string().min(1).optional(),
+  // Path to the DEDICATED visa-photos service account's JSON key file —
+  // deliberately a separate credential from GOOGLE_SHEETS_SERVICE_ACCOUNT_
+  // KEY_FILE (least-privilege: this one can only touch the one photos
+  // bucket, never Sheets/Drive, and vice versa).
+  GCS_VISA_PHOTOS_SERVICE_ACCOUNT_KEY_FILE: z.string().min(1).optional(),
+  // This server's own public base URL (e.g. "https://visa.mahbubtour.uz"),
+  // used only to build the durable /visa-photos/:token link written into
+  // Sheet column T (see src/visa/applicantPhotoUrl.ts) — never used to
+  // reach the bucket itself. No trailing slash expected.
+  VISA_PHOTOS_PUBLIC_BASE_URL: z.string().url().optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;

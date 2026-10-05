@@ -114,6 +114,10 @@ function buildDeps(overrides: Partial<ReconcileSheetRowDependencies> = {}): {
     findOcrResult: async () => ({
       id: 'ocr-1',
       telegramMessageId: 'irrelevant',
+      personalPhotoObjectPath: null,
+      personalPhotoToken: null,
+      personalPortraitObjectPath: null,
+      personalPortraitToken: null,
       firstName: { value: 'JOHN', confidence: 'high' },
       middleName: { value: null, confidence: null },
       surname: { value: 'DOE', confidence: 'high' },

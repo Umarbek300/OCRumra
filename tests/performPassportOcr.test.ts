@@ -40,9 +40,34 @@ function sampleExtraction(): PassportExtractionResult {
 
 function buildDeps(overrides: Partial<PerformPassportOcrDependencies> = {}): {
   deps: PerformPassportOcrDependencies;
-  calls: { findExisting: number; download: number; extract: number; save: number; enqueueSheetSync: number; resolveIdentity: number };
+  calls: {
+    findExisting: number;
+    download: number;
+    extract: number;
+    upload: number;
+    extractPhotoCrop: number;
+    uploadPortrait: number;
+    generateToken: number;
+    save: number;
+    enqueueSheetSync: number;
+    resolveIdentity: number;
+  };
+  savedInputs: Array<Parameters<PerformPassportOcrDependencies['saveResult']>[0]>;
 } {
-  const calls = { findExisting: 0, download: 0, extract: 0, save: 0, enqueueSheetSync: 0, resolveIdentity: 0 };
+  const calls = {
+    findExisting: 0,
+    download: 0,
+    extract: 0,
+    upload: 0,
+    extractPhotoCrop: 0,
+    uploadPortrait: 0,
+    generateToken: 0,
+    save: 0,
+    enqueueSheetSync: 0,
+    resolveIdentity: 0,
+  };
+  const savedInputs: Array<Parameters<PerformPassportOcrDependencies['saveResult']>[0]> = [];
+  let tokenCounter = 0;
   const deps: PerformPassportOcrDependencies = {
     // Duplicate-passport identity resolution is a separate feature with
     // its own dedicated test suite (tests/duplicates.*.test.ts) — these
@@ -65,8 +90,30 @@ function buildDeps(overrides: Partial<PerformPassportOcrDependencies> = {}): {
       calls.extract += 1;
       return sampleExtraction();
     },
+    uploadPhoto: async () => {
+      calls.upload += 1;
+      return 'visa-photos/11111111-1111-1111-1111-111111111111.jpg';
+    },
+    extractPhotoCrop: async () => {
+      calls.extractPhotoCrop += 1;
+      return Buffer.from('fake-cropped-portrait-bytes');
+    },
+    uploadPortrait: async () => {
+      calls.uploadPortrait += 1;
+      return 'visa-photos/11111111-1111-1111-1111-111111111111-portrait.jpg';
+    },
+    // Called independently for the original photo's token and the
+    // portrait's token — a shared fake counter lets tests distinguish
+    // "called once" from "called twice" without the two calls colliding
+    // on the exact same returned string.
+    generateToken: () => {
+      calls.generateToken += 1;
+      tokenCounter += 1;
+      return `fake-token-${tokenCounter}`;
+    },
     saveResult: async (input) => {
       calls.save += 1;
+      savedInputs.push(input);
       return { id: 'result-id', createdAt: 'now', updatedAt: 'now', ...input } as PassportOcrResultRecord;
     },
     enqueueSheetSync: async (telegramMessageId) => {
@@ -75,7 +122,7 @@ function buildDeps(overrides: Partial<PerformPassportOcrDependencies> = {}): {
     },
     ...overrides,
   };
-  return { deps, calls };
+  return { deps, calls, savedInputs };
 }
 
 test('performPassportOcr downloads, extracts, and saves for a message with no existing result', async () => {
@@ -262,4 +309,301 @@ test('performPassportOcr passes the existing result\'s passport/DOB fields to id
 
   assert.deepEqual(receivedPassportNumber, { value: 'X1234567', confidence: 'high' });
   assert.deepEqual(receivedDob, { value: '1990-05-15', confidence: 'high' });
+});
+
+// --- ORIGINAL passport image upload (src/visa/uploadApplicantPhoto.ts's uploadApplicantPhoto) ---
+// This is the SAME buffer downloadPhoto returned — never cropped, never
+// replaced by the portrait artifact (see the portrait section further
+// below, which is a fully separate, independent flow).
+
+test('performPassportOcr uploads the ORIGINAL buffer — the exact same bytes downloadPhoto returned, never a cropped copy', async () => {
+  const uploadedBuffers: Buffer[] = [];
+  const { deps, calls } = buildDeps({
+    uploadPhoto: async (input) => {
+      calls.upload += 1;
+      uploadedBuffers.push(input.buffer);
+      return 'visa-photos/11111111-1111-1111-1111-111111111111.jpg';
+    },
+  });
+
+  await performPassportOcr(CONTEXT, deps);
+
+  assert.equal(calls.upload, 1);
+  assert.equal(uploadedBuffers.length, 1);
+  assert.equal(uploadedBuffers[0]?.toString(), 'fake-image-bytes', 'the uploaded buffer must be the exact original buffer');
+});
+
+test('performPassportOcr always attempts the original-photo upload, even when extractPhotoCrop finds no reliable portrait region', async () => {
+  const { deps, calls, savedInputs } = buildDeps({
+    extractPhotoCrop: async () => {
+      calls.extractPhotoCrop += 1;
+      return null;
+    },
+  });
+
+  await performPassportOcr(CONTEXT, deps);
+
+  assert.equal(calls.upload, 1, 'the original passport image must still be uploaded regardless of portrait crop outcome');
+  assert.ok(savedInputs[0]?.personalPhotoObjectPath, 'the original photo path must still be saved');
+});
+
+test('a photo upload failure never fails performPassportOcr — the OCR result is still saved, with a null photo path', async () => {
+  const { deps, calls, savedInputs } = buildDeps({
+    uploadPhoto: async () => {
+      calls.upload += 1;
+      throw new Error('GCS upload failed: service unavailable');
+    },
+  });
+
+  await assert.doesNotReject(() => performPassportOcr(CONTEXT, deps));
+  assert.equal(calls.upload, 1);
+  assert.equal(calls.save, 1, 'OCR must still succeed even though the photo upload failed');
+  assert.equal(savedInputs[0]?.personalPhotoObjectPath, null);
+});
+
+test('performPassportOcr saves a null photo object path when photo storage is not configured (uploadPhoto resolves null)', async () => {
+  const { deps, savedInputs } = buildDeps({
+    uploadPhoto: async () => null,
+  });
+
+  await performPassportOcr(CONTEXT, deps);
+
+  assert.equal(savedInputs[0]?.personalPhotoObjectPath, null);
+});
+
+test('performPassportOcr never attempts a photo upload on the idempotent (already-exists) path', async () => {
+  const { deps, calls } = buildDeps({
+    findExistingResult: async () => {
+      calls.findExisting += 1;
+      return { id: 'existing', telegramMessageId: CONTEXT.telegramMessageId } as unknown as PassportOcrResultRecord;
+    },
+  });
+
+  await performPassportOcr(CONTEXT, deps);
+
+  assert.equal(calls.upload, 0, 'must not re-upload a photo for a message whose OCR result already exists');
+});
+
+test('performPassportOcr persists the uploaded photo object path on the saved OCR result', async () => {
+  const { deps, savedInputs } = buildDeps({
+    uploadPhoto: async () => 'visa-photos/11111111-1111-1111-1111-111111111111.jpg',
+  });
+
+  await performPassportOcr(CONTEXT, deps);
+
+  assert.equal(savedInputs[0]?.personalPhotoObjectPath, 'visa-photos/11111111-1111-1111-1111-111111111111.jpg');
+});
+
+test('performPassportOcr generates a photo token ONLY when the original-photo upload actually succeeds, and persists it alongside the object path', async () => {
+  const { deps, calls, savedInputs } = buildDeps({
+    uploadPhoto: async () => 'visa-photos/11111111-1111-1111-1111-111111111111.jpg',
+  });
+
+  await performPassportOcr(CONTEXT, deps);
+
+  assert.ok(savedInputs[0]?.personalPhotoToken, 'a token must have been generated');
+  assert.equal(savedInputs[0]?.personalPhotoObjectPath, 'visa-photos/11111111-1111-1111-1111-111111111111.jpg');
+});
+
+test('performPassportOcr never generates a photo token when the original-photo upload fails', async () => {
+  const { deps, savedInputs } = buildDeps({
+    uploadPhoto: async () => {
+      throw new Error('GCS upload failed: service unavailable');
+    },
+  });
+
+  await assert.doesNotReject(() => performPassportOcr(CONTEXT, deps));
+  assert.equal(savedInputs[0]?.personalPhotoToken, null);
+});
+
+test('performPassportOcr never generates a photo token when photo storage is not configured (uploadPhoto resolves null)', async () => {
+  const { deps, savedInputs } = buildDeps({
+    uploadPhoto: async () => null,
+  });
+
+  await performPassportOcr(CONTEXT, deps);
+
+  assert.equal(savedInputs[0]?.personalPhotoToken, null);
+});
+
+test('performPassportOcr never derives the photo token from telegramMessageId or any other identifier — it is exactly whatever generateToken returns', async () => {
+  const { deps, savedInputs } = buildDeps({
+    uploadPhoto: async () => 'visa-photos/11111111-1111-1111-1111-111111111111.jpg',
+    generateToken: () => 'totally-unrelated-opaque-value',
+  });
+
+  await performPassportOcr(CONTEXT, deps);
+
+  assert.equal(savedInputs[0]?.personalPhotoToken, 'totally-unrelated-opaque-value');
+  assert.notEqual(savedInputs[0]?.personalPhotoToken, CONTEXT.telegramMessageId);
+});
+
+// --- CROPPED applicant portrait crop + upload (src/visa/extractApplicantPhotoCrop.ts, src/visa/uploadApplicantPhoto.ts's uploadApplicantPortrait) ---
+// Fully independent from the original-photo upload above: its own buffer
+// source (the same downloaded buffer, cropped), its own object path, its
+// own token, its own DB fields. Never replaces, and is never replaced by,
+// the original passport image.
+
+test('performPassportOcr crops the portrait from the SAME downloaded buffer — never downloads a second time', async () => {
+  const receivedBuffers: Buffer[] = [];
+  const { deps, calls } = buildDeps({
+    extractPhotoCrop: async (buffer) => {
+      calls.extractPhotoCrop += 1;
+      receivedBuffers.push(buffer);
+      return Buffer.from('fake-cropped-portrait-bytes');
+    },
+  });
+
+  await performPassportOcr(CONTEXT, deps);
+
+  assert.equal(calls.download, 1, 'must download the photo exactly once');
+  assert.equal(calls.extractPhotoCrop, 1);
+  assert.equal(receivedBuffers.length, 1);
+  assert.equal(receivedBuffers[0]?.toString(), 'fake-image-bytes', 'extractPhotoCrop must receive the exact buffer downloadPhoto returned');
+});
+
+test('performPassportOcr uploads the CROPPED portrait buffer via uploadPortrait, never via uploadPhoto', async () => {
+  const uploadedBuffers: Buffer[] = [];
+  const { deps, calls } = buildDeps({
+    extractPhotoCrop: async () => {
+      calls.extractPhotoCrop += 1;
+      return Buffer.from('fake-cropped-portrait-bytes');
+    },
+    uploadPortrait: async (input) => {
+      calls.uploadPortrait += 1;
+      uploadedBuffers.push(input.buffer);
+      return 'visa-photos/11111111-1111-1111-1111-111111111111-portrait.jpg';
+    },
+  });
+
+  await performPassportOcr(CONTEXT, deps);
+
+  assert.equal(calls.uploadPortrait, 1);
+  assert.equal(calls.upload, 1, 'the original-photo upload still happens independently');
+  assert.equal(uploadedBuffers.length, 1);
+  assert.equal(uploadedBuffers[0]?.toString(), 'fake-cropped-portrait-bytes', 'uploadPortrait must receive the CROPPED buffer');
+});
+
+test('performPassportOcr never calls uploadPortrait when extractPhotoCrop finds no reliable portrait region (returns null), but still uploads the original photo', async () => {
+  const { deps, calls, savedInputs } = buildDeps({
+    extractPhotoCrop: async () => {
+      calls.extractPhotoCrop += 1;
+      return null;
+    },
+  });
+
+  await performPassportOcr(CONTEXT, deps);
+
+  assert.equal(calls.extractPhotoCrop, 1);
+  assert.equal(calls.uploadPortrait, 0, 'must never upload a portrait when no reliable crop was found');
+  assert.equal(calls.upload, 1, 'the original photo upload is unaffected');
+  assert.equal(savedInputs[0]?.personalPortraitObjectPath, null);
+  assert.equal(savedInputs[0]?.personalPortraitToken, null);
+  assert.ok(savedInputs[0]?.personalPhotoObjectPath, 'the original photo path must still be saved');
+});
+
+test('a portrait crop failure (extractPhotoCrop throws, e.g. a Vision API infra error) never fails performPassportOcr, and never affects the original-photo upload', async () => {
+  const { deps, calls, savedInputs } = buildDeps({
+    extractPhotoCrop: async () => {
+      calls.extractPhotoCrop += 1;
+      throw new Error('Google Vision face detection call failed: 7 PERMISSION_DENIED');
+    },
+  });
+
+  await assert.doesNotReject(() => performPassportOcr(CONTEXT, deps));
+  assert.equal(calls.extractPhotoCrop, 1);
+  assert.equal(calls.uploadPortrait, 0, 'must never fall back to uploading the original buffer as a portrait when cropping fails');
+  assert.equal(calls.upload, 1, 'the original photo upload still happens independently');
+  assert.equal(calls.save, 1, 'OCR must still succeed even though the portrait crop failed');
+  assert.equal(savedInputs[0]?.personalPortraitObjectPath, null);
+  assert.ok(savedInputs[0]?.personalPhotoObjectPath, 'the original photo path is unaffected by the portrait failure');
+});
+
+test('a portrait UPLOAD failure never fails performPassportOcr, and never affects the original-photo upload', async () => {
+  const { deps, calls, savedInputs } = buildDeps({
+    uploadPortrait: async () => {
+      calls.uploadPortrait += 1;
+      throw new Error('GCS upload failed: service unavailable');
+    },
+  });
+
+  await assert.doesNotReject(() => performPassportOcr(CONTEXT, deps));
+  assert.equal(calls.uploadPortrait, 1);
+  assert.equal(calls.upload, 1, 'the original photo upload still happens independently');
+  assert.equal(calls.save, 1);
+  assert.equal(savedInputs[0]?.personalPortraitObjectPath, null);
+  assert.ok(savedInputs[0]?.personalPhotoObjectPath, 'the original photo path is unaffected by the portrait failure');
+});
+
+test('performPassportOcr never attempts a portrait crop/upload on the idempotent (already-exists) path', async () => {
+  const { deps, calls } = buildDeps({
+    findExistingResult: async () => {
+      calls.findExisting += 1;
+      return { id: 'existing', telegramMessageId: CONTEXT.telegramMessageId } as unknown as PassportOcrResultRecord;
+    },
+  });
+
+  await performPassportOcr(CONTEXT, deps);
+
+  assert.equal(calls.extractPhotoCrop, 0, 'must not re-crop/re-upload a portrait for a message whose OCR result already exists');
+  assert.equal(calls.uploadPortrait, 0);
+});
+
+test('performPassportOcr persists the uploaded portrait object path on the saved OCR result, independent from the photo object path', async () => {
+  const { deps, savedInputs } = buildDeps();
+
+  await performPassportOcr(CONTEXT, deps);
+
+  assert.equal(savedInputs[0]?.personalPortraitObjectPath, 'visa-photos/11111111-1111-1111-1111-111111111111-portrait.jpg');
+  assert.equal(savedInputs[0]?.personalPhotoObjectPath, 'visa-photos/11111111-1111-1111-1111-111111111111.jpg');
+  assert.notEqual(
+    savedInputs[0]?.personalPortraitObjectPath,
+    savedInputs[0]?.personalPhotoObjectPath,
+    'the portrait and the original photo must be two distinct objects',
+  );
+});
+
+test('performPassportOcr generates a portrait token ONLY when the portrait upload actually succeeds, independent from the photo token', async () => {
+  const { deps, savedInputs } = buildDeps();
+
+  await performPassportOcr(CONTEXT, deps);
+
+  assert.ok(savedInputs[0]?.personalPortraitToken, 'a portrait token must have been generated');
+  assert.ok(savedInputs[0]?.personalPhotoToken, 'a photo token must also have been generated, independently');
+  assert.notEqual(
+    savedInputs[0]?.personalPortraitToken,
+    savedInputs[0]?.personalPhotoToken,
+    'the portrait token and the photo token must be two distinct, independently generated values',
+  );
+});
+
+test('performPassportOcr never generates a portrait token when the portrait upload fails', async () => {
+  const { deps, savedInputs } = buildDeps({
+    uploadPortrait: async () => {
+      throw new Error('GCS upload failed: service unavailable');
+    },
+  });
+
+  await assert.doesNotReject(() => performPassportOcr(CONTEXT, deps));
+  assert.equal(savedInputs[0]?.personalPortraitToken, null);
+});
+
+test('performPassportOcr never generates a portrait token when no reliable portrait region was found', async () => {
+  const { deps, savedInputs } = buildDeps({
+    extractPhotoCrop: async () => null,
+  });
+
+  await performPassportOcr(CONTEXT, deps);
+
+  assert.equal(savedInputs[0]?.personalPortraitToken, null);
+});
+
+test('performPassportOcr never derives the portrait token from telegramMessageId or any other identifier', async () => {
+  const { deps, savedInputs } = buildDeps({
+    generateToken: () => 'totally-unrelated-portrait-value',
+  });
+
+  await performPassportOcr(CONTEXT, deps);
+
+  assert.notEqual(savedInputs[0]?.personalPortraitToken, CONTEXT.telegramMessageId);
 });
