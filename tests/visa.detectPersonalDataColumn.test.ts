@@ -169,3 +169,150 @@ test('detectPersonalDataColumn returns null for zero/negative page dimensions', 
   assert.equal(detectPersonalDataColumn(REAL_PERSONAL_COLUMN_PARAGRAPHS_381, FACE_381, EXPANDED_FACE_REGION_381, 0, PAGE_HEIGHT_381), null);
   assert.equal(detectPersonalDataColumn(REAL_PERSONAL_COLUMN_PARAGRAPHS_381, FACE_381, EXPANDED_FACE_REGION_381, PAGE_WIDTH_381, 0), null);
 });
+
+// --- DISPERSION_BAD_FRACTION recalibration regression (408/409/410/414) ---
+// Real production passport geometry, transcribed verbatim from this
+// engagement's own read-only production diagnostic (a verbose script that
+// re-implements this module's exact clustering/scoring logic and logs
+// every intermediate value — never fabricated). These 4 real post-deploy
+// passports revealed DISPERSION_BAD_FRACTION=0.05 (calibrated against only
+// one real sample, 381) was too strict for normal real-world column
+// printing variance (13-51px x0 range), leaving the right-edge constraint
+// inert for most real passports. Raised to 0.10 — see the constant's own
+// doc comment in detectPersonalDataColumn.ts for the exact before/after
+// per passport.
+
+function paragraph(text: string, x0: number, y0: number, x1: number, y1: number): LayoutParagraph {
+  return { text, x0, y0, x1, y1 };
+}
+
+test('real passport 414 (896x1280): a noisier OCR read (x0Range=51px, includes garbled OCR fragments) improves from LOW to MEDIUM, not all the way to HIGH', () => {
+  const face: FaceBox = { x0: 88, y0: 784, x1: 266, y1: 991 };
+  const expandedFaceRegion: FaceBox = { x0: 0, y0: 598, x1: 364, y1: 1136 };
+  const paragraphs: LayoutParagraph[] = [
+    paragraph('buf-', 323, 310, 475, 405),
+    paragraph('SHAXSIY IMZO / HOLDERS SI', 285, 567, 545, 593),
+    paragraph('UZB', 602, 439, 679, 466),
+    paragraph('DAYEXT WEEK / COUNTRY COD', 393, 660, 569, 683),
+    paragraph('UZB', 467, 684, 502, 698),
+    paragraph('PASPORT SAGAN PASSPORT N', 596, 650, 781, 670),
+    paragraph('FA7811218', 638, 672, 770, 696),
+    paragraph('TOSHMATOVA', 300, 731, 451, 760),
+    paragraph('BAKHROMOVNA', 307, 810, 472, 840),
+    paragraph('FUGAOLATIONALITY UZBEKIST', 295, 833, 447, 877),
+    paragraph('ENGAN SANAS TE P', 312, 869, 460, 892),
+    paragraph('11 04 1964', 311, 885, 463, 914),
+    paragraph('TASHKENT', 440, 918, 561, 945),
+    paragraph('GAN SANAM DATE OF LE', 336, 963, 498, 986),
+    paragraph('25 05 2023 AMAL QILISH MI', 307, 980, 533, 1053),
+    paragraph('MIA 26291', 584, 963, 723, 994),
+  ];
+
+  const result = detectPersonalDataColumn(paragraphs, face, expandedFaceRegion, 896, 1280);
+
+  assert.ok(result);
+  assert.equal(result!.columnX0, 285);
+  assert.equal(result!.memberCount, 9);
+  assert.equal(result!.confidence, 'MEDIUM', 'genuine OCR-garbage members keep this below HIGH even after the recalibration');
+});
+
+test('real passport 410 (960x1280): a clean 12-member cluster (x0Range=22px) now reaches HIGH (was MEDIUM before recalibration)', () => {
+  const face: FaceBox = { x0: 151, y0: 805, x1: 322, y1: 1004 };
+  const expandedFaceRegion: FaceBox = { x0: 57, y0: 626, x1: 416, y1: 1143 };
+  const paragraphs: LayoutParagraph[] = [
+    paragraph('SHAXSIY IMZO / HOLDERS SI', 355, 598, 623, 617),
+    paragraph('UZB', 685, 466, 767, 493),
+    paragraph('DAVLAT KODI / COUNTRY COR', 464, 699, 648, 715),
+    paragraph('UZB', 540, 722, 574, 734),
+    paragraph('PASEORT RAQAMI / PASSPORT', 675, 690, 884, 708),
+    paragraph('FB1836969', 713, 717, 851, 740),
+    paragraph('FAMILIYASI SURNAME', 355, 753, 481, 768),
+    paragraph('ABDUVALIEVA', 361, 768, 529, 790),
+    paragraph("OTASINING ISMI FATHER'S N", 359, 832, 543, 847),
+    paragraph('RASHIDOVNA', 365, 849, 516, 868),
+    paragraph('FUQAROLIGI / NATIONALITY', 362, 872, 512, 886),
+    paragraph('UZBEKISTAN', 363, 889, 487, 903),
+    paragraph("TUG'ILGAN SANASI / DATE O", 363, 905, 560, 919),
+    paragraph('13 07 1969', 371, 920, 518, 937),
+    paragraph("TUG'ILGAN JOYI / PLACE OF", 484, 939, 672, 951),
+    paragraph('TASHKENT', 497, 956, 616, 974),
+    paragraph('BERILGAN SANASI / DATE OF', 370, 993, 559, 1006),
+    paragraph('08 11 2025', 377, 1009, 522, 1027),
+    paragraph('AMAL QILISH MUDDATI DATE ', 371, 1026, 591, 1062),
+    paragraph('KIM TOMONIDAN BERILGAN AU', 629, 997, 857, 1006),
+    paragraph('PSC 60001', 640, 1015, 778, 1031),
+  ];
+
+  const result = detectPersonalDataColumn(paragraphs, face, expandedFaceRegion, 960, 1280);
+
+  assert.ok(result);
+  assert.equal(result!.columnX0, 355);
+  assert.equal(result!.memberCount, 12);
+  assert.equal(result!.confidence, 'HIGH', 'a clean 22px-dispersion cluster must reach HIGH after the recalibration');
+});
+
+test('real passport 409 (960x1280): a tight 7-member cluster (x0Range=13px) stays HIGH, even more comfortably than before', () => {
+  const face: FaceBox = { x0: 115, y0: 809, x1: 332, y1: 1061 };
+  const expandedFaceRegion: FaceBox = { x0: 0, y0: 582, x1: 451, y1: 1237 };
+  const paragraphs: LayoutParagraph[] = [
+    paragraph('SHAXSIY IMZO / HOLDERS SI', 364, 598, 654, 615),
+    paragraph('UZB', 720, 463, 813, 491),
+    paragraph('DAVLAT KODI / COUNTRY COD', 482, 705, 676, 722),
+    paragraph('UZB', 564, 730, 601, 742),
+    paragraph('PASPORT RAQAMI / PASSPORT', 707, 697, 918, 715),
+    paragraph('FB1836966', 744, 722, 884, 746),
+    paragraph("OTASINING ISMI FATHER'S N", 363, 844, 563, 865),
+    paragraph("TUG'ILGAN SANASI / DATE O", 366, 919, 576, 939),
+    paragraph('14 12 1965', 373, 934, 533, 959),
+    paragraph("TUG'ILGAN JOYI / PLACE OF", 494, 949, 690, 968),
+    paragraph('TASHKENT', 508, 966, 634, 989),
+    paragraph('BERILGAN SANASI / DATE OF', 369, 1007, 570, 1028),
+    paragraph('08 11 2025', 376, 1024, 533, 1048),
+    paragraph('AMAL QILISH MUDDATI / DAT', 370, 1041, 601, 1083),
+    paragraph('2035', 471, 1060, 534, 1078),
+    paragraph('KIM TOMONIDAN BERILGAN / ', 642, 995, 867, 1038),
+  ];
+
+  const result = detectPersonalDataColumn(paragraphs, face, expandedFaceRegion, 960, 1280);
+
+  assert.ok(result);
+  assert.equal(result!.columnX0, 363);
+  assert.equal(result!.memberCount, 7);
+  assert.equal(result!.confidence, 'HIGH');
+});
+
+test('real passport 408 (960x1280): a 14-member cluster (x0Range=30px) reaches HIGH at D=0.11 (was LOW at D=0.05, MEDIUM at D=0.10)', () => {
+  const face: FaceBox = { x0: 135, y0: 770, x1: 312, y1: 975 };
+  const expandedFaceRegion: FaceBox = { x0: 38, y0: 586, x1: 410, y1: 1119 };
+  const paragraphs: LayoutParagraph[] = [
+    paragraph('SHAXSIY IMZO / HOLDERS SI', 346, 581, 622, 603),
+    paragraph('UZB', 676, 445, 761, 472),
+    paragraph('FB1836885', 822, 109, 896, 564),
+    paragraph('DAVLAT KODI / COUNTRY COD', 462, 678, 648, 700),
+    paragraph('PASPORT RAQAMI PASSPORT N', 678, 665, 888, 688),
+    paragraph('FB1836885', 715, 693, 855, 718),
+    paragraph('FAMILIYASI / SURNAME', 350, 737, 480, 756),
+    paragraph('NODIROV', 355, 756, 467, 779),
+    paragraph('AVAZKHON', 358, 795, 484, 819),
+    paragraph("OTASINING ISMI FATHER'S N", 354, 819, 545, 839),
+    paragraph('BOSITKHON UGLI', 360, 832, 581, 862),
+    paragraph('FUQAROLIGI / NATIONALITY', 358, 861, 515, 879),
+    paragraph('UZBEKISTAN', 359, 878, 487, 898),
+    paragraph("TUG'ILGAN SANASI / DATE O", 359, 896, 564, 914),
+    paragraph('06 08 1990', 366, 912, 520, 935),
+    paragraph("TUG'ILGAN JOYI / ACE OF B", 485, 926, 681, 969),
+    paragraph('BERILGAN SANASI / DATE OF', 366, 990, 563, 1008),
+    paragraph('08 11 2025', 372, 1007, 526, 1029),
+    paragraph('AMAL QILISH MUDDATI DATE ', 369, 1027, 597, 1044),
+    paragraph('07 11 2035', 376, 1045, 529, 1067),
+    paragraph('KIM TOMONIDAN BERILGAN / ', 636, 982, 870, 1000),
+    paragraph('PSC 60001', 648, 1001, 789, 1023),
+  ];
+
+  const result = detectPersonalDataColumn(paragraphs, face, expandedFaceRegion, 960, 1280);
+
+  assert.ok(result);
+  assert.equal(result!.columnX0, 346);
+  assert.equal(result!.memberCount, 14);
+  assert.equal(result!.confidence, 'HIGH', 'D=0.11 was chosen specifically to clear 408\'s dispersionScore=0.7 cutoff with a small margin');
+});

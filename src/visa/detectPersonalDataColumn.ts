@@ -30,17 +30,42 @@ export interface PersonalDataColumnResult {
   memberCount: number;
 }
 
-// Real-passport-calibrated constants (406/381/382/380 — see the engagement's
-// own read-only geometry diagnostics). First-pass heuristic values, not a
-// measured standard; retune against more real samples if a shadow-mode
-// rollout surfaces systematic misses.
+// Real-passport-calibrated constants (406/381/382/380, and — for
+// DISPERSION_BAD_FRACTION specifically — a second calibration pass against
+// 408/409/410/414; see the engagement's own read-only geometry
+// diagnostics). First-pass heuristic values, not a measured standard;
+// retune against more real samples if a shadow-mode rollout surfaces
+// systematic misses.
 const MIN_TEXT_LENGTH = 2;
 const HEADER_BAND_FRACTION = 0.06;
 const MAX_PARAGRAPH_WIDTH_FRACTION = 0.4;
 const CLUSTER_TOLERANCE_FRACTION = 0.03;
 const MIN_FIELD_COUNT = 4;
 const MIN_VERTICAL_SPAN_FRACTION = 0.2;
-const DISPERSION_BAD_FRACTION = 0.05;
+/**
+ * Originally 0.05, calibrated against a single real sample (381, x0Range=13px)
+ * — too strict for realistic column printing variance. A second real-data
+ * pass (408: x0Range=30px, 409: 13px, 410: 22px, 414: 51px with genuine
+ * OCR-garbage members) showed 0.05 forces HIGH confidence to require
+ * x0Range <= 14.4px, which most real passports exceed even with a
+ * perfectly legitimate column — leaving the right-edge constraint inert in
+ * practice.
+ *
+ * 0.10 was tried first but left 408 (a clean, legitimate 30px-dispersion
+ * cluster) just under the HIGH cutoff (dispersionScore=0.6875 < 0.7). The
+ * exact minimum needed for 408 to reach dispersionScore=0.7 is D such that
+ * 1 - 30/(D*960) = 0.7, i.e. D = 30/(0.3*960) = 0.10417 — raised to 0.11
+ * (a small margin above that exact minimum, not an arbitrary round number)
+ * so 408 clears it with a small buffer (dispersionScore=0.716) rather than
+ * sitting exactly on the boundary. At 0.11: 409/410 (13-22px) stay/improve
+ * to HIGH; 408 (30px) now also reaches HIGH; 414 (51px, genuine OCR-garbage
+ * members) stays at MEDIUM (dispersionScore=0.483) — still correctly not
+ * trusted, confirming this loosening is not so large that a genuinely
+ * noisy read also gets waved through. A one-directional loosening from
+ * 0.05: can only raise a previously MEDIUM/LOW result, never lower a
+ * previously HIGH one.
+ */
+const DISPERSION_BAD_FRACTION = 0.11;
 const GAP_MIN_FRACTION = 0.02;
 const GAP_MAX_FRACTION = 0.08;
 const HIGH_CONFIDENCE_THRESHOLD = 0.7;
