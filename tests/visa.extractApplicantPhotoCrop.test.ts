@@ -273,3 +273,204 @@ test('extractApplicantPhotoCrop never throws when textDetectionPages is malforme
   assert.ok(base && withMalformed);
   assert.deepEqual(base!.toString('base64'), withMalformed!.toString('base64'));
 });
+
+// --- document boundary detection (passport-only / background / hand-held / tilted) ---
+// See src/visa/detectDocumentBoundary.ts. These scenarios exercise the
+// NEW pre-OCR document-isolation layer end to end, on top of the already
+// real-passport-verified D=0.11 layout-aware crop (unchanged). No real
+// production images exist yet for background/hand-held/tilted Telegram
+// photos in this engagement -- these fixtures are deliberately synthetic,
+// built from first principles (text/face clustering vs. empty background),
+// clearly flagged as such rather than presented as real-passport-derived.
+
+async function makeImage(width: number, height: number): Promise<Buffer> {
+  return sharp({ create: { width, height, channels: 3, background: { r: 220, g: 220, b: 220 } } })
+    .jpeg()
+    .toBuffer();
+}
+
+test('document boundary: a passport-only image (text/face spanning nearly the whole frame) is a complete no-op', async () => {
+  const width = 960;
+  const height = 1280;
+  const original = await makeImage(width, height);
+  const faces = [{ boundingPoly: box(151, 805, 322, 1004), detectionConfidence: 0.95 }];
+  const deps = buildDeps(faces);
+
+  // Paragraphs spanning nearly edge-to-edge, as a real full-page Vision
+  // response for a passport that fills the frame would.
+  const fullPageParagraphs: VisionPage[] = [
+    {
+      blocks: [
+        {
+          paragraphs: [
+            paragraphFixture('HEADER TEXT ROW', 20, 80, 940, 120),
+            paragraphFixture('FAMILIYASI SURNAME', 355, 753, 481, 768),
+            paragraphFixture('ABDUVALIEVA', 361, 768, 529, 790),
+            paragraphFixture("OTASINING ISMI FATHER'S NAME", 359, 832, 543, 847),
+            paragraphFixture('RASHIDOVNA', 365, 849, 516, 868),
+            paragraphFixture('MRZ LINE SIMULATED LONG TEXT ROW HERE', 20, 1230, 940, 1260),
+          ],
+        },
+      ],
+    },
+  ];
+
+  const withoutPages = await extractApplicantPhotoCrop(original, 'image/jpeg', deps);
+  const withPages = await extractApplicantPhotoCrop(original, 'image/jpeg', deps, fullPageParagraphs);
+
+  assert.ok(withoutPages && withPages);
+  const faceOnlyMeta = await sharp(withoutPages!).metadata();
+  const boundaryMeta = await sharp(withPages!).metadata();
+  // Document boundary alone (no HIGH-confidence column/MRZ in this sparse
+  // fixture) must not shrink the crop below the pure face-only size --
+  // a passport filling the frame has no meaningful background to exclude.
+  assert.equal(boundaryMeta.width, faceOnlyMeta.width);
+  assert.equal(boundaryMeta.height, faceOnlyMeta.height);
+});
+
+test('document boundary: a passport photographed with real surrounding background is isolated from that background', async () => {
+  const width = 1200;
+  const height = 1600;
+  const original = await makeImage(width, height);
+  // Passport's own face, positioned in the lower-center of the frame.
+  const faces = [{ boundingPoly: box(320, 950, 520, 1200), detectionConfidence: 0.95 }];
+  const deps = buildDeps(faces);
+
+  const backgroundPages: VisionPage[] = [
+    {
+      blocks: [
+        {
+          paragraphs: [
+            paragraphFixture('FAMILIYASI SURNAME', 550, 900, 750, 930),
+            paragraphFixture('TESTPERSON', 550, 935, 750, 960),
+            paragraphFixture('ISMI GIVEN NAMES', 550, 970, 730, 995),
+            paragraphFixture('EXAMPLE', 550, 1000, 730, 1025),
+            paragraphFixture("OTASINING ISMI FATHER'S NAME", 550, 1040, 800, 1065),
+            paragraphFixture('TESTOVICH', 550, 1075, 750, 1100),
+            paragraphFixture('P<UZBTESTPERSON<<EXAMPLE<<<<<<<<<<<<<<<<<<<', 400, 1450, 1050, 1490),
+            paragraphFixture('FA12345678UZB9001014M30010123456789012345', 400, 1495, 1050, 1530),
+          ],
+        },
+      ],
+    },
+  ];
+
+  const withoutPages = await extractApplicantPhotoCrop(original, 'image/jpeg', deps);
+  const withPages = await extractApplicantPhotoCrop(original, 'image/jpeg', deps, backgroundPages);
+
+  assert.ok(withoutPages && withPages);
+  const faceOnlyMeta = await sharp(withoutPages!).metadata();
+  const boundaryMeta = await sharp(withPages!).metadata();
+
+  // The face-only crop (no document awareness) on this large canvas would
+  // extend well above the real document region into pure background --
+  // the boundary-aware crop must be meaningfully shorter/narrower.
+  assert.ok(boundaryMeta.height! < faceOnlyMeta.height!, 'boundary-aware crop must exclude background above the document');
+});
+
+test('document boundary: a passport held in a hand (a second, larger, unrelated face elsewhere in frame) does not let that face win face selection', async () => {
+  const width = 1000;
+  const height = 1400;
+  const original = await makeImage(width, height);
+  // The hand-holder's own face: large, confident, positioned well above
+  // the passport -- without document-boundary awareness, this is LARGER
+  // in area than the passport's own printed photo and would normally win
+  // computeApplicantPhotoCropRegion's "largest confident face" selection.
+  const holderFace = { boundingPoly: box(500, 60, 900, 460), detectionConfidence: 0.97 }; // 400x400
+  // The passport's own printed photo face: smaller, positioned beside the personal-data column.
+  const passportFace = { boundingPoly: box(300, 850, 480, 1100), detectionConfidence: 0.9 }; // 180x250
+  const deps = buildDeps([holderFace, passportFace]);
+
+  const handHeldPages: VisionPage[] = [
+    {
+      blocks: [
+        {
+          paragraphs: [
+            paragraphFixture('FAMILIYASI SURNAME', 480, 850, 700, 880),
+            paragraphFixture('HOLDERNAME', 480, 890, 700, 915),
+            paragraphFixture('ISMI GIVEN NAMES', 480, 925, 680, 955),
+            paragraphFixture('SAMPLE', 480, 960, 680, 985),
+            paragraphFixture("OTASINING ISMI FATHER'S NAME", 480, 1000, 760, 1030),
+            paragraphFixture('EXAMPLEVICH', 480, 1040, 700, 1070),
+          ],
+        },
+      ],
+    },
+  ];
+
+  // Sanity check: WITHOUT document-boundary awareness (no pages), the
+  // larger holder face wins face selection, anchoring the crop near the
+  // TOP of the frame (around the holder's face), not the passport.
+  const withoutPages = await extractApplicantPhotoCrop(original, 'image/jpeg', deps);
+  assert.ok(withoutPages);
+  const withoutPagesMeta = await sharp(withoutPages!).metadata();
+
+  // WITH document-boundary awareness, the holder's face must be excluded
+  // from selection (it is far from the text cluster), so the crop is
+  // anchored around the SMALLER passport face instead.
+  const withPages = await extractApplicantPhotoCrop(original, 'image/jpeg', deps, handHeldPages);
+  assert.ok(withPages);
+
+  // Re-crop using ONLY the passport face (ground truth for "correct" selection) for comparison.
+  const correctOnlyDeps = buildDeps([passportFace]);
+  const correctOnly = await extractApplicantPhotoCrop(original, 'image/jpeg', correctOnlyDeps, handHeldPages);
+  assert.ok(correctOnly);
+
+  const withPagesMeta = await sharp(withPages!).metadata();
+  const correctOnlyMeta = await sharp(correctOnly!).metadata();
+
+  // The boundary-aware crop (both faces offered) must match the crop
+  // produced when ONLY the correct (passport) face was ever offered --
+  // proving the holder's face was excluded from selection, not merely
+  // outscored by chance.
+  assert.equal(withPagesMeta.width, correctOnlyMeta.width);
+  assert.equal(withPagesMeta.height, correctOnlyMeta.height);
+  // And it must differ from the naive (no-boundary) result, which anchored on the wrong (holder's) face.
+  assert.notEqual(withPagesMeta.height, withoutPagesMeta.height);
+});
+
+test('document boundary: a tilted/perspective-distorted passport still gets isolated from background (region isolation, NOT perspective rectification)', async () => {
+  const width = 1200;
+  const height = 1600;
+  const original = await makeImage(width, height);
+  const faces = [{ boundingPoly: box(340, 1000, 520, 1230), detectionConfidence: 0.93 }];
+  const deps = buildDeps(faces);
+
+  // Simulates a tilted photo: paragraph bounding boxes drift diagonally
+  // (each row shifted right as it goes down) rather than forming a clean
+  // axis-aligned block, the way Vision's own bounding boxes behave for
+  // rotated/skewed printed text. This module does NOT dewarp the image --
+  // it only computes an axis-aligned union around this tilted cluster, so
+  // the resulting boundary is necessarily looser than a true perspective
+  // rectification would be. That is a known, reported limitation (see
+  // detectDocumentBoundary.ts's own doc comment), not something this test
+  // claims to fully solve.
+  const tiltedPages: VisionPage[] = [
+    {
+      blocks: [
+        {
+          paragraphs: [
+            paragraphFixture('FAMILIYASI SURNAME', 560, 940, 760, 975),
+            paragraphFixture('TILTEDPERSON', 575, 985, 775, 1020),
+            paragraphFixture('ISMI GIVEN NAMES', 590, 1030, 770, 1065),
+            paragraphFixture('SKEWED', 605, 1075, 785, 1110),
+            paragraphFixture("OTASINING ISMI FATHER'S NAME", 615, 1120, 865, 1155),
+            paragraphFixture('EXAMPLEOVNA', 630, 1165, 830, 1200),
+          ],
+        },
+      ],
+    },
+  ];
+
+  const withoutPages = await extractApplicantPhotoCrop(original, 'image/jpeg', deps);
+  const withPages = await extractApplicantPhotoCrop(original, 'image/jpeg', deps, tiltedPages);
+
+  assert.ok(withoutPages && withPages);
+  const faceOnlyMeta = await sharp(withoutPages!).metadata();
+  const boundaryMeta = await sharp(withPages!).metadata();
+
+  // Even for a tilted cluster, the boundary-aware crop must still exclude
+  // the large empty background above/around it -- isolation still works
+  // even though the tilt angle itself is never corrected.
+  assert.ok(boundaryMeta.height! < faceOnlyMeta.height!, 'boundary-aware crop must still exclude background even for a tilted document cluster');
+});

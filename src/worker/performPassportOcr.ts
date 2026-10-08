@@ -8,6 +8,9 @@ import { enqueueSheetSync } from '../db/repositories/sheetSyncQueue.repo.js';
 import { resolveAndLinkIdentity } from '../duplicates/resolveAndLinkIdentity.js';
 import { selectProvider, type OcrProvider } from '../ocr/providers/index.js';
 import { downloadTelegramPhoto } from '../telegram/downloadTelegramPhoto.js';
+import { buildCanonicalPassportImage } from '../visa/buildCanonicalPassportImage.js';
+import type { VisionFaceAnnotation } from '../visa/computeApplicantPhotoCropRegion.js';
+import { detectFacesReal, type DetectFacesFn } from '../visa/detectApplicantFaces.js';
 import { extractApplicantPhotoCrop } from '../visa/extractApplicantPhotoCrop.js';
 import { generateApplicantPhotoToken } from '../visa/generateApplicantPhotoToken.js';
 import { uploadApplicantPhoto, uploadApplicantPortrait } from '../visa/uploadApplicantPhoto.js';
@@ -23,7 +26,27 @@ export interface PerformPassportOcrDependencies {
   findExistingResult: typeof findPassportOcrResultByTelegramMessageId;
   downloadPhoto: typeof downloadTelegramPhoto;
   extract: OcrProvider['extract'];
-  /** Uploads the ORIGINAL, full, uncropped passport image buffer — the same buffer extract() above received, never a modified/cropped copy. Returns null (never throws past this call site) when photo storage isn't configured, or the upload itself failed. */
+  /**
+   * ONE shared Vision FACE_DETECTION call (on the EXIF-normalized
+   * downloaded buffer), reused by BOTH buildCanonicalImage below (the
+   * T-column canonical image) and extractPhotoCrop (the V-column portrait
+   * crop) via its precomputedFaces parameter — avoids making the same
+   * Vision call twice for one message. A failure here is caught locally;
+   * both downstream steps already treat "no faces" as a safe degraded mode
+   * (see buildCanonicalPassportImage.ts, computeApplicantPhotoCropRegion.ts),
+   * so it never fails OCR itself.
+   */
+  detectFaces: DetectFacesFn;
+  /**
+   * Builds the single canonical passport-only image (document-boundary
+   * isolation, EXIF-normalized — see buildCanonicalPassportImage.ts) that
+   * is now uploaded for the T column instead of the untouched original
+   * buffer. NEVER throws; falls back to the full normalized (or, in a
+   * total-failure case, the completely untouched original) image when no
+   * reliable boundary can be determined.
+   */
+  buildCanonicalImage: typeof buildCanonicalPassportImage;
+  /** Uploads the CANONICAL passport-only image buffer (see buildCanonicalImage above) — no longer necessarily byte-identical to the raw Telegram download; see buildCanonicalPassportImage.ts for when it is (safe fallback) and when it is a genuine crop. Returns null (never throws past this call site) when photo storage isn't configured, or the upload itself failed. */
   uploadPhoto: typeof uploadApplicantPhoto;
   /**
    * Crops the applicant's printed photo region out of the SAME buffer
@@ -50,6 +73,8 @@ const defaultDependencies: PerformPassportOcrDependencies = {
   findExistingResult: findPassportOcrResultByTelegramMessageId,
   downloadPhoto: downloadTelegramPhoto,
   extract: defaultProvider.extract,
+  detectFaces: detectFacesReal,
+  buildCanonicalImage: buildCanonicalPassportImage,
   uploadPhoto: uploadApplicantPhoto,
   extractPhotoCrop: extractApplicantPhotoCrop,
   uploadPortrait: uploadApplicantPortrait,
@@ -150,13 +175,37 @@ export async function performPassportOcr(
   const { buffer, mimeType } = await deps.downloadPhoto(context.telegramPhotoFileId);
   const extraction = await deps.extract(buffer, mimeType);
 
-  // Uploads the ORIGINAL, full, uncropped passport image buffer — the
-  // SAME buffer already downloaded above, never a second Telegram fetch,
-  // and never a cropped copy (that is a SEPARATE artifact, uploaded
-  // independently below). An upload failure (or photo storage simply not
-  // being configured) must never fail OCR itself — it only ever means no
-  // photo URL is available yet (see syncPassportRowToSheet.ts, which
-  // treats a null path here as "nothing to sync" rather than an error).
+  // ONE shared Vision FACE_DETECTION call (deps.detectFaces EXIF-normalizes
+  // internally — see detectApplicantFaces.ts), reused below by BOTH
+  // buildCanonicalImage (T column) and extractPhotoCrop (V column) — see
+  // PerformPassportOcrDependencies.detectFaces. A failure here is never
+  // fatal: sharedFaces stays undefined, buildCanonicalImage falls back to
+  // its own safe "no boundary" behavior, and extractPhotoCrop falls back to
+  // making its own independent FACE_DETECTION call exactly as it did before
+  // this call existed.
+  let sharedFaces: VisionFaceAnnotation[] | undefined;
+  try {
+    ({ faces: sharedFaces } = await deps.detectFaces(buffer));
+  } catch (error) {
+    console.error(
+      `[passport-ocr] shared face detection failed for message ${context.telegramMessageId}; ` +
+        'proceeding without a precomputed face (the canonical image will have no face-based boundary expansion, and the portrait-crop step will attempt its own independent detection)',
+      error,
+    );
+    sharedFaces = undefined;
+  }
+
+  // Builds the canonical passport-only image (document-boundary isolation
+  // over the original Telegram photo — see buildCanonicalPassportImage.ts)
+  // and uploads THAT, instead of the untouched original buffer, for the
+  // T column. Never a second Telegram fetch; never throws past this call
+  // (buildCanonicalPassportImage.ts falls back to the full EXIF-normalized,
+  // or in the worst case the fully untouched, original image on its own).
+  //
+  // An upload failure (or photo storage simply not being configured) must
+  // never fail OCR itself — it only ever means no photo URL is available
+  // yet (see syncPassportRowToSheet.ts, which treats a null path here as
+  // "nothing to sync" rather than an error).
   //
   // The public token is generated ONLY when the upload actually succeeded
   // (personalPhotoObjectPath is non-null) — never derived from
@@ -165,9 +214,10 @@ export async function performPassportOcr(
   let personalPhotoObjectPath: string | null = null;
   let personalPhotoToken: string | null = null;
   try {
+    const canonical = await deps.buildCanonicalImage(buffer, sharedFaces ?? [], extraction.visionPages);
     personalPhotoObjectPath = await deps.uploadPhoto({
       telegramMessageId: context.telegramMessageId,
-      buffer,
+      buffer: canonical.buffer,
       mimeType,
     });
     if (personalPhotoObjectPath) {
@@ -197,7 +247,9 @@ export async function performPassportOcr(
     // passportExtractionSchema.ts) -- undefined for every other provider,
     // which extractApplicantPhotoCrop.ts already treats as "no layout data
     // available", falling back to its original pure face-only crop.
-    const croppedPortrait = await deps.extractPhotoCrop(buffer, mimeType, undefined, extraction.visionPages);
+    // sharedFaces (5th arg) reuses the ONE face-detection call above,
+    // skipping extractApplicantPhotoCrop's own internal call when present.
+    const croppedPortrait = await deps.extractPhotoCrop(buffer, mimeType, undefined, extraction.visionPages, sharedFaces);
     if (croppedPortrait) {
       personalPortraitObjectPath = await deps.uploadPortrait({
         telegramMessageId: context.telegramMessageId,

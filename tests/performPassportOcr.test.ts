@@ -44,6 +44,8 @@ function buildDeps(overrides: Partial<PerformPassportOcrDependencies> = {}): {
     findExisting: number;
     download: number;
     extract: number;
+    detectFaces: number;
+    buildCanonicalImage: number;
     upload: number;
     extractPhotoCrop: number;
     uploadPortrait: number;
@@ -58,6 +60,8 @@ function buildDeps(overrides: Partial<PerformPassportOcrDependencies> = {}): {
     findExisting: 0,
     download: 0,
     extract: 0,
+    detectFaces: 0,
+    buildCanonicalImage: 0,
     upload: 0,
     extractPhotoCrop: 0,
     uploadPortrait: 0,
@@ -89,6 +93,21 @@ function buildDeps(overrides: Partial<PerformPassportOcrDependencies> = {}): {
     extract: async () => {
       calls.extract += 1;
       return sampleExtraction();
+    },
+    // Default: no faces found (an empty array, same shape a real "no face
+    // in this photo" Vision response has — never a guess). Individual
+    // tests override this to simulate a successful detection.
+    detectFaces: async () => {
+      calls.detectFaces += 1;
+      return { faces: [] };
+    },
+    // Default: echoes the buffer it was given back unchanged — the same
+    // "safe fallback, no boundary detected" behavior the REAL
+    // buildCanonicalPassportImage has when it can't confidently isolate the
+    // passport. Individual tests override this to simulate a genuine crop.
+    buildCanonicalImage: async (buffer) => {
+      calls.buildCanonicalImage += 1;
+      return { buffer, width: 0, height: 0, boundary: null };
     },
     uploadPhoto: async () => {
       calls.upload += 1;
@@ -311,12 +330,51 @@ test('performPassportOcr passes the existing result\'s passport/DOB fields to id
   assert.deepEqual(receivedDob, { value: '1990-05-15', confidence: 'high' });
 });
 
-// --- ORIGINAL passport image upload (src/visa/uploadApplicantPhoto.ts's uploadApplicantPhoto) ---
-// This is the SAME buffer downloadPhoto returned — never cropped, never
-// replaced by the portrait artifact (see the portrait section further
-// below, which is a fully separate, independent flow).
+// --- CANONICAL passport-only image upload (src/visa/uploadApplicantPhoto.ts's
+// uploadApplicantPhoto, src/visa/buildCanonicalPassportImage.ts) ---
+// T column no longer stores the raw, untouched Telegram buffer: it stores
+// whatever buildCanonicalImage produces (document-boundary isolation, EXIF-
+// normalized — a genuine crop when a background/hand-held photo is reliably
+// detected, or the full normalized image as a safe fallback otherwise). This
+// is independent of, and never replaced by, the portrait artifact (see the
+// portrait section further below, which is a fully separate, independent
+// flow) and never a second Telegram fetch.
 
-test('performPassportOcr uploads the ORIGINAL buffer — the exact same bytes downloadPhoto returned, never a cropped copy', async () => {
+test('performPassportOcr uploads whatever buildCanonicalImage returns, not necessarily the raw original bytes', async () => {
+  const uploadedBuffers: Buffer[] = [];
+  const canonicalBuffer = Buffer.from('canonical-passport-only-bytes');
+  const receivedCanonicalInputs: Array<{ buffer: Buffer; faces: unknown; pages: unknown }> = [];
+  const { deps, calls } = buildDeps({
+    extract: async () => ({ ...sampleExtraction(), visionPages: [{ width: 100, height: 100 }] }) as PassportExtractionResult,
+    detectFaces: async () => {
+      calls.detectFaces += 1;
+      return { faces: [{ detectionConfidence: 0.9 }] };
+    },
+    buildCanonicalImage: async (buffer, faces, pages) => {
+      calls.buildCanonicalImage += 1;
+      receivedCanonicalInputs.push({ buffer, faces, pages });
+      return { buffer: canonicalBuffer, width: 10, height: 10, boundary: null };
+    },
+    uploadPhoto: async (input) => {
+      calls.upload += 1;
+      uploadedBuffers.push(input.buffer);
+      return 'visa-photos/11111111-1111-1111-1111-111111111111.jpg';
+    },
+  });
+
+  await performPassportOcr(CONTEXT, deps);
+
+  assert.equal(calls.detectFaces, 1, 'face detection must happen exactly once (shared, never duplicated)');
+  assert.equal(calls.buildCanonicalImage, 1);
+  assert.equal(receivedCanonicalInputs[0]?.buffer.toString(), 'fake-image-bytes', 'buildCanonicalImage must receive the exact original downloaded buffer');
+  assert.deepEqual(receivedCanonicalInputs[0]?.faces, [{ detectionConfidence: 0.9 }], 'buildCanonicalImage must receive the SAME faces the shared detectFaces call found');
+  assert.deepEqual(receivedCanonicalInputs[0]?.pages, [{ width: 100, height: 100 }], 'buildCanonicalImage must receive extraction.visionPages');
+  assert.equal(calls.upload, 1);
+  assert.equal(uploadedBuffers.length, 1);
+  assert.equal(uploadedBuffers[0]?.toString(), 'canonical-passport-only-bytes', 'uploadPhoto must receive buildCanonicalImage\'s output, not the raw original buffer');
+});
+
+test('performPassportOcr falls back to uploading the full (buildCanonicalImage-returned) buffer when no reliable document boundary exists -- the default, safe-fallback mock behavior', async () => {
   const uploadedBuffers: Buffer[] = [];
   const { deps, calls } = buildDeps({
     uploadPhoto: async (input) => {
@@ -329,8 +387,45 @@ test('performPassportOcr uploads the ORIGINAL buffer — the exact same bytes do
   await performPassportOcr(CONTEXT, deps);
 
   assert.equal(calls.upload, 1);
-  assert.equal(uploadedBuffers.length, 1);
-  assert.equal(uploadedBuffers[0]?.toString(), 'fake-image-bytes', 'the uploaded buffer must be the exact original buffer');
+  assert.equal(uploadedBuffers[0]?.toString(), 'fake-image-bytes', 'with the default (pass-through) buildCanonicalImage mock, the fallback is byte-identical to the original');
+});
+
+test('performPassportOcr shares ONE detectFaces call between buildCanonicalImage and extractPhotoCrop -- never detects faces twice for the same message', async () => {
+  const { deps, calls } = buildDeps();
+
+  await performPassportOcr(CONTEXT, deps);
+
+  assert.equal(calls.detectFaces, 1, 'exactly one shared Vision FACE_DETECTION call per message');
+});
+
+test('a shared face-detection failure never fails performPassportOcr, never blocks the canonical-image or portrait steps, and both fall back safely', async () => {
+  const { deps, calls, savedInputs } = buildDeps({
+    detectFaces: async () => {
+      calls.detectFaces += 1;
+      throw new Error('Google Vision face detection call failed: 7 PERMISSION_DENIED');
+    },
+  });
+
+  await assert.doesNotReject(() => performPassportOcr(CONTEXT, deps));
+  assert.equal(calls.buildCanonicalImage, 1, 'the canonical-image step must still be attempted, with no precomputed faces');
+  assert.equal(calls.upload, 1, 'the photo upload must still be attempted');
+  assert.ok(savedInputs[0]?.personalPhotoObjectPath, 'a photo path must still be saved despite the face-detection failure');
+});
+
+test('performPassportOcr passes the shared detected faces through to extractPhotoCrop as its 5th argument', async () => {
+  const receivedFaces: unknown[] = [];
+  const sharedFaceList = [{ detectionConfidence: 0.95 }];
+  const { deps } = buildDeps({
+    detectFaces: async () => ({ faces: sharedFaceList }),
+    extractPhotoCrop: async (buffer, mimeType, depsArg, pages, faces) => {
+      receivedFaces.push(faces);
+      return Buffer.from('fake-cropped-portrait-bytes');
+    },
+  });
+
+  await performPassportOcr(CONTEXT, deps);
+
+  assert.deepEqual(receivedFaces[0], sharedFaceList);
 });
 
 test('performPassportOcr always attempts the original-photo upload, even when extractPhotoCrop finds no reliable portrait region', async () => {

@@ -1,4 +1,3 @@
-import { ImageAnnotatorClient, protos } from '@google-cloud/vision';
 import sharp from 'sharp';
 import { getImageDimensions } from '../ocr/mrz/getImageDimensions.js';
 import { locateMrzParagraphGeometry } from '../ocr/mrz/locateMrzParagraphGeometry.js';
@@ -11,16 +10,19 @@ import {
   type PixelCropRegion,
   type VisionFaceAnnotation,
 } from './computeApplicantPhotoCropRegion.js';
+import { detectFacesReal, type DetectFacesFn, type DetectFacesResult } from './detectApplicantFaces.js';
 import { detectPersonalDataColumn } from './detectPersonalDataColumn.js';
-import { flattenParagraphsToNormalizedSpace, type RawImageGeometry } from './transformVisionCoordinates.js';
+import {
+  clampRegionToBoundary,
+  detectDocumentBoundary,
+  filterFacesToBoundary,
+  filterParagraphsToBoundary,
+} from './detectDocumentBoundary.js';
+import { flattenParagraphsToNormalizedSpace, type NormalizedParagraph, type RawImageGeometry } from './transformVisionCoordinates.js';
 
 const MAX_ERROR_MESSAGE_LENGTH = 300;
 
-export interface DetectFacesResult {
-  faces: VisionFaceAnnotation[];
-}
-
-export type DetectFacesFn = (imageBuffer: Buffer) => Promise<DetectFacesResult>;
+export type { DetectFacesResult, DetectFacesFn };
 
 export interface ExtractApplicantPhotoCropDependencies {
   detectFaces: DetectFacesFn;
@@ -30,46 +32,6 @@ export interface ExtractApplicantPhotoCropDependencies {
 function sanitizeErrorReason(error: unknown): string {
   const message = error instanceof Error ? error.message : 'unknown error';
   return message.slice(0, MAX_ERROR_MESSAGE_LENGTH);
-}
-
-let realVisionClient: ImageAnnotatorClient | null = null;
-function getRealVisionClient(): ImageAnnotatorClient {
-  if (!realVisionClient) {
-    realVisionClient = new ImageAnnotatorClient();
-  }
-  return realVisionClient;
-}
-
-/**
- * Dedicated FACE_DETECTION-only Vision call, deliberately independent of
- * whichever text-extraction OCR_PROVIDER is configured (google-vision/
- * anthropic/local/compare) -- the applicant-photo crop must work the same
- * way regardless of that setting, since it answers a different question
- * ("where is the face in this image") than any text-extraction provider
- * does, and performPassportOcr.ts already calls uploadApplicantPhoto
- * unconditionally today, independent of OCR_PROVIDER.
- *
- * This IS a second Vision API call on top of googleVisionProvider.ts's own
- * DOCUMENT_TEXT_DETECTION call when OCR_PROVIDER=google-vision (Vision's
- * client does support combining multiple feature types into one
- * annotateImage()/batchAnnotateImages() request, which would avoid that --
- * but doing so here would mean threading Vision-specific face geometry back
- * out through the provider-agnostic OcrProvider interface, which every
- * other provider (anthropic/local) has no equivalent for, or wiring this
- * module's internals into googleVisionProvider.ts specifically and breaking
- * its independence from the configured provider. A second, cheap,
- * FACE_DETECTION-only call -- isolated so a failure here can never fail the
- * OCR job itself (see performPassportOcr.ts's own try/catch around this) --
- * is the smaller, safer change for the bounded message volumes this system
- * handles.
- */
-async function detectFacesReal(imageBuffer: Buffer): Promise<DetectFacesResult> {
-  const client = getRealVisionClient();
-  const [response]: [protos.google.cloud.vision.v1.IAnnotateImageResponse] = await client.faceDetection(imageBuffer);
-  if (response.error?.message) {
-    throw new Error(response.error.message);
-  }
-  return { faces: (response.faceAnnotations ?? []) as VisionFaceAnnotation[] };
 }
 
 const defaultDependencies: ExtractApplicantPhotoCropDependencies = {
@@ -92,37 +54,20 @@ const MIN_MARGIN_PIXELS = 8;
 
 /**
  * Builds the optional layout-aware crop constraints (personal-data column
- * -> right boundary, MRZ -> bottom boundary) from the SAME
- * DOCUMENT_TEXT_DETECTION `pages` googleVisionProvider.ts already computed
- * during OCR text extraction -- no second Vision API call. Returns
- * undefined (never throws past this point for a detection miss -- only a
- * genuine, unexpected error propagates to the caller's own try/catch) when
- * neither signal reaches HIGH confidence, which is exactly "fall back to
- * the pure face-only crop", never a guess.
- *
- * `rawImageBuffer` here is the ORIGINAL, pre-rotation buffer (the one
- * DOCUMENT_TEXT_DETECTION itself was called on in googleVisionProvider.ts)
- * -- its EXIF orientation tag is read via sharp's metadata() (cheap, no
- * full pixel decode) and used to transform Vision's raw-buffer paragraph
- * coordinates into the SAME EXIF-normalized space `faceBox`/`baseRegion`
- * already live in (see transformVisionCoordinates.ts's own doc comment for
- * why this transform is necessary at all).
+ * -> right boundary, MRZ -> bottom boundary) from already-flattened,
+ * EXIF-normalized paragraph geometry (see flattenParagraphsToNormalizedSpace
+ * / detectDocumentBoundary.ts's own optional pre-filtering of that same
+ * list) -- no Vision API call of its own, pure and synchronous. Returns
+ * undefined when neither signal reaches HIGH confidence, which is exactly
+ * "fall back to the pure face-only crop", never a guess.
  */
-async function buildLayoutConstraints(
-  rawImageBuffer: Buffer,
-  pages: readonly VisionPage[],
+function buildLayoutConstraintsFromParagraphs(
+  paragraphs: readonly NormalizedParagraph[],
   faceBox: PixelBox,
   baseRegion: PixelCropRegion,
   normalizedWidth: number,
   normalizedHeight: number,
-): Promise<LayoutConstraints | undefined> {
-  const rawMeta = await sharp(rawImageBuffer).metadata();
-  const rawWidth = rawMeta.width ?? 0;
-  const rawHeight = rawMeta.height ?? 0;
-  if (rawWidth <= 0 || rawHeight <= 0) return undefined;
-
-  const geometry: RawImageGeometry = { rawWidth, rawHeight, orientation: rawMeta.orientation };
-  const paragraphs = flattenParagraphsToNormalizedSpace(pages, geometry);
+): LayoutConstraints | undefined {
   if (paragraphs.length === 0) return undefined;
 
   const expandedFaceRegion = {
@@ -194,51 +139,108 @@ async function buildLayoutConstraints(
  * DOCUMENT_TEXT_DETECTION `pages` through from performPassportOcr.ts, at
  * zero extra Vision API cost), the crop is additionally constrained to
  * stop short of the passport's printed personal-data text column and MRZ
- * band (see buildLayoutConstraints above) -- but ONLY when that detection
- * independently reaches HIGH confidence AND keeps the detected face safely
- * contained; otherwise, or when this parameter is omitted entirely (every
- * other OCR provider, and every existing caller/test), this function's
- * behavior is exactly the original pure face-only crop.
+ * band (see buildLayoutConstraintsFromParagraphs above) -- but ONLY when
+ * that detection independently reaches HIGH confidence AND keeps the
+ * detected face safely contained; otherwise, or when this parameter is
+ * omitted entirely (every other OCR provider, and every existing
+ * caller/test), this function's behavior is exactly the original pure
+ * face-only crop.
+ *
+ * Also from the SAME `textDetectionPages`, at zero extra Vision API cost:
+ * an approximate document-boundary check (see detectDocumentBoundary.ts)
+ * that narrows face selection and clamps the final crop to the passport's
+ * own detected extent when the photo shows meaningful surrounding
+ * background or is held in a hand -- a bounding-box isolation, NOT a true
+ * document-edge/perspective-rectification step (this codebase has no
+ * computer-vision library capable of that; see detectDocumentBoundary.ts's
+ * own doc comment). When no such background is detected, or detection is
+ * not confident enough, this step is a complete no-op and behavior is
+ * identical to not having it at all.
  */
 export async function extractApplicantPhotoCrop(
   imageBuffer: Buffer,
   mimeType: string,
   deps: ExtractApplicantPhotoCropDependencies = defaultDependencies,
   textDetectionPages?: readonly VisionPage[],
+  precomputedFaces?: readonly VisionFaceAnnotation[],
 ): Promise<Buffer | null> {
   const normalizedBuffer = await sharp(imageBuffer).rotate().toBuffer();
 
+  // `precomputedFaces` is optional and purely additive: when the caller
+  // already made its own Vision FACE_DETECTION call on this SAME
+  // EXIF-normalized buffer for another purpose (performPassportOcr.ts
+  // shares one such call with buildCanonicalPassportImage.ts, to avoid a
+  // second Vision API call per message), it is reused here verbatim and
+  // deps.detectFaces is never invoked. Omitted (every existing caller/test)
+  // -> behavior is byte-identical to before this parameter existed.
   let faces: VisionFaceAnnotation[];
-  try {
-    ({ faces } = await deps.detectFaces(normalizedBuffer));
-  } catch (error) {
-    const reason = sanitizeErrorReason(error);
-    console.log(`[applicant-photo-crop] Vision face detection call failed: ${reason}`);
-    throw new Error(`Google Vision face detection call failed: ${reason}`);
+  if (precomputedFaces) {
+    faces = [...precomputedFaces];
+  } else {
+    try {
+      ({ faces } = await deps.detectFaces(normalizedBuffer));
+    } catch (error) {
+      const reason = sanitizeErrorReason(error);
+      console.log(`[applicant-photo-crop] Vision face detection call failed: ${reason}`);
+      throw new Error(`Google Vision face detection call failed: ${reason}`);
+    }
   }
 
   const { width, height } = await getImageDimensions(normalizedBuffer);
-  const baseRegion = computeApplicantPhotoCropRegion(faces, width, height);
+
+  // --- document boundary (optional, additive -- see detectDocumentBoundary.ts) ---
+  let documentBoundary: ReturnType<typeof detectDocumentBoundary> = null;
+  let normalizedParagraphs: NormalizedParagraph[] = [];
+  let effectiveFaces = faces;
+
+  if (textDetectionPages && textDetectionPages.length > 0) {
+    try {
+      const rawMeta = await sharp(imageBuffer).metadata();
+      const rawWidth = rawMeta.width ?? 0;
+      const rawHeight = rawMeta.height ?? 0;
+      if (rawWidth > 0 && rawHeight > 0) {
+        const geometry: RawImageGeometry = { rawWidth, rawHeight, orientation: rawMeta.orientation };
+        normalizedParagraphs = flattenParagraphsToNormalizedSpace(textDetectionPages, geometry);
+        documentBoundary = detectDocumentBoundary(normalizedParagraphs, faces, width, height);
+        if (documentBoundary) {
+          effectiveFaces = filterFacesToBoundary(faces, documentBoundary);
+        }
+      }
+    } catch (error) {
+      // Document boundary detection is a pure quality enhancement -- it
+      // must never block or fail the portrait pipeline. Falls back to the
+      // unfiltered face list exactly as if no boundary had been detected.
+      console.log(
+        `[applicant-photo-crop] document boundary detection failed, proceeding without it: ${sanitizeErrorReason(error)}`,
+      );
+      documentBoundary = null;
+      effectiveFaces = faces;
+    }
+  }
+
+  const baseRegion = computeApplicantPhotoCropRegion(effectiveFaces, width, height);
   if (!baseRegion) {
     console.log('[applicant-photo-crop] no reliable photo region found; skipping photo for this message');
     return null;
   }
 
   let region = baseRegion;
-  if (textDetectionPages && textDetectionPages.length > 0) {
-    const faceBox = selectBestFaceBox(faces);
+  if (normalizedParagraphs.length > 0) {
+    const faceBox = selectBestFaceBox(effectiveFaces);
     if (faceBox) {
       try {
-        const layoutConstraints = await buildLayoutConstraints(
-          imageBuffer,
-          textDetectionPages,
+        const paragraphsForLayout = documentBoundary
+          ? filterParagraphsToBoundary(normalizedParagraphs, documentBoundary)
+          : normalizedParagraphs;
+        const layoutConstraints = buildLayoutConstraintsFromParagraphs(
+          paragraphsForLayout,
           faceBox,
           baseRegion,
           width,
           height,
         );
         if (layoutConstraints) {
-          const constrainedRegion = computeApplicantPhotoCropRegion(faces, width, height, layoutConstraints);
+          const constrainedRegion = computeApplicantPhotoCropRegion(effectiveFaces, width, height, layoutConstraints);
           if (constrainedRegion) region = constrainedRegion;
         }
       } catch (error) {
@@ -250,6 +252,19 @@ export async function extractApplicantPhotoCrop(
           `[applicant-photo-crop] layout-aware constraint detection failed, using face-only crop: ${sanitizeErrorReason(error)}`,
         );
       }
+    }
+  }
+
+  if (documentBoundary) {
+    try {
+      const faceBox = selectBestFaceBox(effectiveFaces);
+      if (faceBox) {
+        region = clampRegionToBoundary(region, documentBoundary, faceBox);
+      }
+    } catch (error) {
+      console.log(
+        `[applicant-photo-crop] document boundary clamp failed, using unclamped region: ${sanitizeErrorReason(error)}`,
+      );
     }
   }
 
