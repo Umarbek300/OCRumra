@@ -318,6 +318,32 @@ test('extract leaves passportIssueDate null via the flat-text fallback when more
   assert.deepEqual(result.passportIssueDate, { value: null, confidence: null });
 });
 
+// --- visionPages threaded onto the extraction result (layout-aware portrait crop) ---
+// See src/visa/extractApplicantPhotoCrop.ts / performPassportOcr.ts — the
+// SAME DOCUMENT_TEXT_DETECTION response already fetched for MRZ/issue-date
+// extraction is additionally exposed on the result so the applicant
+// portrait crop can use its layout, at zero extra Vision API cost.
+
+test('extract attaches the real DOCUMENT_TEXT_DETECTION pages as visionPages on a successful (checksum-valid) extraction', async () => {
+  const fullText = [VALID_LINE_1, VALID_LINE_2].join('\n');
+  const pages: VisionPage[] = [{ width: 960, height: 1280, blocks: [] }];
+  const provider = buildProvider(() => Promise.resolve({ fullText, pages }));
+
+  const result = await provider.extract(Buffer.from('fake-image'), 'image/jpeg');
+
+  assert.equal(result.visionPages, pages, 'the exact same pages reference from the single Vision call must be attached');
+});
+
+test('extract attaches visionPages even on the "unreadable MRZ" (no checksum-valid candidate) path -- the layout data is still useful for the portrait crop', async () => {
+  const pages: VisionPage[] = [{ width: 960, height: 1280, blocks: [] }];
+  const provider = buildProvider(() => Promise.resolve({ fullText: 'REPUBLIC OF UTOPIA\nPASSPORT\nSurname: ERIKSSON', pages }));
+
+  const result = await provider.extract(Buffer.from('fake-image'), 'image/jpeg');
+
+  assert.equal(result.overallConfidence, 'low');
+  assert.equal(result.visionPages, pages, 'pages must still be attached even when no valid MRZ was found');
+});
+
 test('extract never logs the visual issue date value itself — only a found/not-found boolean', async () => {
   const fullText = [VALID_LINE_1, VALID_LINE_2].join('\n');
   const pages: VisionPage[] = [

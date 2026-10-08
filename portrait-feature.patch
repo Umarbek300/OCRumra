@@ -1,0 +1,1743 @@
+diff --git a/src/db/repositories/passportOcrResult.repo.ts b/src/db/repositories/passportOcrResult.repo.ts
+--- a/src/db/repositories/passportOcrResult.repo.ts
++++ b/src/db/repositories/passportOcrResult.repo.ts
+@@ -14,6 +14,10 @@
+   personalPhotoObjectPath?: string | null;
+   /** Dedicated, cryptographically random public URL token (see generateApplicantPhotoToken.ts) — generated ONLY alongside a successful upload, never derived from telegram_message_id or any other existing identifier. Null whenever personalPhotoObjectPath is null. */
+   personalPhotoToken?: string | null;
++  /** Stable GCS object path for the applicant's CROPPED portrait — a SEPARATE artifact from personalPhotoObjectPath (the original, full, uncropped passport image). See src/visa/uploadApplicantPhoto.ts's uploadApplicantPortrait and extractApplicantPhotoCrop.ts. Null when no reliable face region was found, photo storage isn't configured, or the upload failed. */
++  personalPortraitObjectPath?: string | null;
++  /** Dedicated, cryptographically random public URL token for the cropped portrait — independent from personalPhotoToken, generated ONLY alongside a successful portrait upload. Null whenever personalPortraitObjectPath is null. */
++  personalPortraitToken?: string | null;
+   firstName: OcrField;
+   middleName: OcrField;
+   surname: OcrField;
+@@ -38,6 +42,10 @@
+   personalPhotoObjectPath: string | null;
+   /** Always present (never undefined) on a record read back from the DB. */
+   personalPhotoToken: string | null;
++  /** Always present (never undefined) on a record read back from the DB — null simply means no portrait crop has been uploaded yet. */
++  personalPortraitObjectPath: string | null;
++  /** Always present (never undefined) on a record read back from the DB. */
++  personalPortraitToken: string | null;
+   createdAt: string;
+   updatedAt: string;
+ }
+@@ -47,6 +55,8 @@
+   telegram_message_id: string;
+   personal_photo_object_path: string | null;
+   personal_photo_token: string | null;
++  personal_portrait_object_path: string | null;
++  personal_portrait_token: string | null;
+   first_name: string | null;
+   first_name_confidence: OcrConfidenceLevel | null;
+   middle_name: string | null;
+@@ -85,6 +95,8 @@
+     telegramMessageId: row.telegram_message_id,
+     personalPhotoObjectPath: row.personal_photo_object_path,
+     personalPhotoToken: row.personal_photo_token,
++    personalPortraitObjectPath: row.personal_portrait_object_path,
++    personalPortraitToken: row.personal_portrait_token,
+     firstName: { value: row.first_name, confidence: row.first_name_confidence },
+     middleName: { value: row.middle_name, confidence: row.middle_name_confidence },
+     surname: { value: row.surname, confidence: row.surname_confidence },
+@@ -108,6 +120,7 @@
+ 
+ const SELECT_COLUMNS = `
+   id, telegram_message_id, personal_photo_object_path, personal_photo_token,
++  personal_portrait_object_path, personal_portrait_token,
+   first_name, first_name_confidence, middle_name, middle_name_confidence,
+   surname, surname_confidence, passport_number, passport_number_confidence,
+   date_of_birth, date_of_birth_confidence,
+@@ -130,6 +143,7 @@
+   const { rows } = await pool.query<PassportOcrResultRow>(
+     `INSERT INTO passport_ocr_results (
+        telegram_message_id, personal_photo_object_path, personal_photo_token,
++       personal_portrait_object_path, personal_portrait_token,
+        first_name, first_name_confidence, middle_name, middle_name_confidence,
+        surname, surname_confidence, passport_number, passport_number_confidence,
+        date_of_birth, date_of_birth_confidence,
+@@ -141,15 +155,16 @@
+        overall_confidence, raw_response, provider, model
+      ) VALUES (
+        $1,$2,$3,
+-       $4,$5,$6,$7,
+-       $8,$9,$10,$11,
+-       $12,$13,
++       $4,$5,
++       $6,$7,$8,$9,
++       $10,$11,$12,$13,
+        $14,$15,
+        $16,$17,
+-       $18,$19,$20,$21,
+-       $22,$23,
+-       $24,$25,$26,$27,
+-       $28,$29,$30,$31
++       $18,$19,
++       $20,$21,$22,$23,
++       $24,$25,
++       $26,$27,$28,$29,
++       $30,$31,$32,$33
+      )
+      ON CONFLICT (telegram_message_id) DO NOTHING
+      RETURNING ${SELECT_COLUMNS}`,
+@@ -157,6 +172,8 @@
+       input.telegramMessageId,
+       input.personalPhotoObjectPath ?? null,
+       input.personalPhotoToken ?? null,
++      input.personalPortraitObjectPath ?? null,
++      input.personalPortraitToken ?? null,
+       input.firstName.value,
+       input.firstName.confidence,
+       input.middleName.value,
+@@ -207,15 +224,23 @@
+  * (see applicantPhotoRoute.ts) — deliberately a separate function from
+  * findPassportOcrResultByTelegramMessageId above, so that route can never
+  * be refactored into accidentally accepting a telegram_message_id (or any
+- * other existing identifier) as the public token. A telegram_message_id,
+- * passport number, or any other value passed here simply won't match any
+- * row.
++ * other existing identifier) as the public token. Matches against
++ * personal_photo_token OR personal_portrait_token — the same opaque-token
++ * public route serves both the original passport image and the cropped
++ * portrait, since a token's value alone can never collide between the two
++ * (each is independently generated, see generateApplicantPhotoToken.ts) and
++ * the partial unique index on each column already guarantees no collision
++ * within a column. The caller (applicantPhotoRoute.ts) is responsible for
++ * checking which of the two token fields on the returned row actually
++ * equals the requested token, to pick the matching object path. A
++ * telegram_message_id, passport number, or any other value passed here
++ * simply won't match any row.
+  */
+ export async function findPassportOcrResultByPersonalPhotoToken(
+   token: string,
+ ): Promise<PassportOcrResultRecord | null> {
+   const { rows } = await pool.query<PassportOcrResultRow>(
+-    `SELECT ${SELECT_COLUMNS} FROM passport_ocr_results WHERE personal_photo_token = $1`,
++    `SELECT ${SELECT_COLUMNS} FROM passport_ocr_results WHERE personal_photo_token = $1 OR personal_portrait_token = $1`,
+     [token],
+   );
+   const row = rows[0];
+
+diff --git a/src/worker/performPassportOcr.ts b/src/worker/performPassportOcr.ts
+--- a/src/worker/performPassportOcr.ts
++++ b/src/worker/performPassportOcr.ts
+@@ -8,8 +8,9 @@
+ import { resolveAndLinkIdentity } from '../duplicates/resolveAndLinkIdentity.js';
+ import { selectProvider, type OcrProvider } from '../ocr/providers/index.js';
+ import { downloadTelegramPhoto } from '../telegram/downloadTelegramPhoto.js';
++import { extractApplicantPhotoCrop } from '../visa/extractApplicantPhotoCrop.js';
+ import { generateApplicantPhotoToken } from '../visa/generateApplicantPhotoToken.js';
+-import { uploadApplicantPhoto } from '../visa/uploadApplicantPhoto.js';
++import { uploadApplicantPhoto, uploadApplicantPortrait } from '../visa/uploadApplicantPhoto.js';
+ 
+ export interface OcrProcessingContext {
+   telegramMessageId: string;
+@@ -24,7 +25,18 @@
+   extract: OcrProvider['extract'];
+   /** Uploads the ORIGINAL, full, uncropped passport image buffer — the same buffer extract() above received, never a modified/cropped copy. Returns null (never throws past this call site) when photo storage isn't configured, or the upload itself failed. */
+   uploadPhoto: typeof uploadApplicantPhoto;
+-  /** Generates the dedicated public-URL token — called ONLY when the upload actually succeeds (see below), never derived from telegramMessageId or any other identifier. */
++  /**
++   * Crops the applicant's printed photo region out of the SAME buffer
++   * downloadPhoto already returned — never a second Telegram download, and
++   * never Tesseract/local OCR (Google Vision FACE_DETECTION only). Returns
++   * null (never throws past this call site) when no reliable photo region
++   * could be found — callers must then skip the portrait upload entirely,
++   * never upload the original full-passport buffer in its place.
++   */
++  extractPhotoCrop: typeof extractApplicantPhotoCrop;
++  /** Uploads the CROPPED portrait buffer as a SEPARATE artifact from uploadPhoto's original passport image (never overwrites it — see uploadApplicantPhoto.ts's uploadApplicantPortrait). Returns null (never throws past this call site) when photo storage isn't configured, or the upload itself failed. */
++  uploadPortrait: typeof uploadApplicantPortrait;
++  /** Generates the dedicated public-URL token — called ONLY when the corresponding upload actually succeeds (see below), never derived from telegramMessageId or any other identifier. Used independently for the original photo's token and the portrait's token. */
+   generateToken: typeof generateApplicantPhotoToken;
+   saveResult: typeof createPassportOcrResult;
+   enqueueSheetSync: typeof enqueueSheetSync;
+@@ -39,6 +51,8 @@
+   downloadPhoto: downloadTelegramPhoto,
+   extract: defaultProvider.extract,
+   uploadPhoto: uploadApplicantPhoto,
++  extractPhotoCrop: extractApplicantPhotoCrop,
++  uploadPortrait: uploadApplicantPortrait,
+   generateToken: generateApplicantPhotoToken,
+   saveResult: createPassportOcrResult,
+   enqueueSheetSync,
+@@ -166,10 +180,43 @@
+     );
+   }
+ 
++  // Crops the applicant's printed portrait region out of the SAME buffer
++  // downloaded above — never a second Telegram fetch, never Tesseract/
++  // local OCR (Google Vision FACE_DETECTION only, see
++  // extractApplicantPhotoCrop.ts). This is entirely independent of the
++  // original-photo upload above: a failure here can never affect
++  // personalPhotoObjectPath/Token, and a failure there (already handled
++  // above) can never block this portrait step from being attempted — both
++  // artifacts are always attempted from the one shared downloaded buffer.
++  // The original passport buffer is NEVER replaced by, or uploaded as, the
++  // cropped portrait, and vice versa.
++  let personalPortraitObjectPath: string | null = null;
++  let personalPortraitToken: string | null = null;
++  try {
++    const croppedPortrait = await deps.extractPhotoCrop(buffer, mimeType);
++    if (croppedPortrait) {
++      personalPortraitObjectPath = await deps.uploadPortrait({
++        telegramMessageId: context.telegramMessageId,
++        buffer: croppedPortrait,
++        mimeType,
++      });
++      if (personalPortraitObjectPath) {
++        personalPortraitToken = deps.generateToken();
++      }
++    }
++  } catch (error) {
++    console.error(
++      `[passport-ocr] failed to crop/upload applicant portrait for message ${context.telegramMessageId}; proceeding without a portrait URL`,
++      error,
++    );
++  }
++
+   const stored = await deps.saveResult({
+     telegramMessageId: context.telegramMessageId,
+     personalPhotoObjectPath,
+     personalPhotoToken,
++    personalPortraitObjectPath,
++    personalPortraitToken,
+     firstName: extraction.firstName,
+     middleName: extraction.middleName,
+     surname: extraction.surname,
+
+diff --git a/src/sheets/syncPassportRowToSheet.ts b/src/sheets/syncPassportRowToSheet.ts
+--- a/src/sheets/syncPassportRowToSheet.ts
++++ b/src/sheets/syncPassportRowToSheet.ts
+@@ -19,7 +19,7 @@
+ import { calculateBalance, formatMoneyForSheet, parsePackageAndDeposit } from '../telegram/parsePackageDeposit.js';
+ import { sendConfirmationMessage } from '../telegram/sendConfirmationMessage.js';
+ import { buildApplicantPhotoPublicUrl } from '../visa/applicantPhotoUrl.js';
+-import { VISA_PERSONAL_PHOTO_URL_COLUMN } from '../visa/visaSheetColumns.js';
++import { VISA_PERSONAL_PHOTO_URL_COLUMN, VISA_PERSONAL_PORTRAIT_URL_COLUMN } from '../visa/visaSheetColumns.js';
+ import { writePersonalPhotoUrlIfBlank } from '../visa/writePersonalPhotoUrlIfBlank.js';
+ import { buildGenderSummaryBlock } from './buildGenderSummaryBlock.js';
+ import { buildSheetRow } from './buildSheetRow.js';
+@@ -324,6 +324,30 @@
+       );
+     }
+ 
++    // Populates Sheet column V (personalPortraitUrl) with the durable
++    // /visa-photos/:token URL for the CROPPED portrait — a fully
++    // independent artifact/token/column from the original passport image's
++    // own T-column write above (see performPassportOcr.ts and
++    // uploadApplicantPhoto.ts's uploadApplicantPortrait). Deliberately NOT
++    // column U: U already holds an operator-entered "passport scan URL"
++    // for the unrelated VisitSaudi/KSA Visa draft-building flow (see
++    // visaSheetColumns.ts's own doc comment on
++    // VISA_PERSONAL_PORTRAIT_URL_COLUMN) — writing here must never touch
++    // that column. Same blank-only-write guarantee, same try/catch
++    // isolation as the T-column write above.
++    try {
++      if (ocrResult.personalPortraitToken && deps.photoPublicBaseUrl) {
++        const sheetTitleForPortrait =
++          group?.googleSheetGid != null ? await deps.resolveSheetTitle(spreadsheetId, group.googleSheetGid) : undefined;
++        const portraitUrl = buildApplicantPhotoPublicUrl(deps.photoPublicBaseUrl, ocrResult.personalPortraitToken);
++        await deps.writePhotoUrl(spreadsheetId, result.rowNumber, portraitUrl, VISA_PERSONAL_PORTRAIT_URL_COLUMN, sheetTitleForPortrait);
++      }
++    } catch (portraitUrlError) {
++      console.error(
++        `[sheets-sync] job ${claimed.id} synced successfully but writing the personal portrait URL failed: ${sanitizeErrorMessage(portraitUrlError)}`,
++      );
++    }
++
+     // Confirmation is sent strictly after the sheet write is durably marked
+     // synced above, and its own failures are caught here rather than by the
+     // outer catch: a job that already succeeded in the sheet must never be
+
+diff --git a/src/visa/visaSheetColumns.ts b/src/visa/visaSheetColumns.ts
+--- a/src/visa/visaSheetColumns.ts
++++ b/src/visa/visaSheetColumns.ts
+@@ -14,15 +14,26 @@
+ export const VISA_ARRIVAL_DATE_COLUMN = 'S';
+ export const VISA_PERSONAL_PHOTO_URL_COLUMN = 'T';
+ export const VISA_PASSPORT_SCAN_URL_COLUMN = 'U';
++/**
++ * The applicant's CROPPED portrait URL (the face-detected photo region
++ * only) — deliberately NOT column U: U is already an operator-entered
++ * field (VISA_PASSPORT_SCAN_URL_COLUMN / passportScanUrl, read by
++ * readVerifiedApplicantData.ts for the VisitSaudi/KSA Visa draft-building
++ * flow). Writing the auto-generated cropped-portrait URL there would
++ * silently corrupt that unrelated feature. V is the next free column after
++ * the existing Q:U visa block.
++ */
++export const VISA_PERSONAL_PORTRAIT_URL_COLUMN = 'V';
+ 
+ export const VISA_FIRST_COLUMN_LETTER = VISA_NATIONALITY_COLUMN;
+-export const VISA_LAST_COLUMN_LETTER = VISA_PASSPORT_SCAN_URL_COLUMN;
++export const VISA_LAST_COLUMN_LETTER = VISA_PERSONAL_PORTRAIT_URL_COLUMN;
+ 
+-/** 0-indexed position within a row array read from A:U (A=0, ..., M=12, N=13, O=14, P=15, Q=16, R=17, S=18, T=19, U=20). */
++/** 0-indexed position within a row array read from A:V (A=0, ..., M=12, N=13, O=14, P=15, Q=16, R=17, S=18, T=19, U=20, V=21). */
+ export const VISA_COLUMN_INDEX = {
+   nationality: 16,
+   email: 17,
+   arrivalDate: 18,
+   personalPhotoUrl: 19,
+   passportScanUrl: 20,
++  personalPortraitUrl: 21,
+ } as const;
+
+diff --git a/src/visa/uploadApplicantPhoto.ts b/src/visa/uploadApplicantPhoto.ts
+--- a/src/visa/uploadApplicantPhoto.ts
++++ b/src/visa/uploadApplicantPhoto.ts
+@@ -144,3 +144,37 @@
+   await file.save(input.buffer, { contentType: input.mimeType, resumable: false });
+   return objectPath;
+ }
++
++/**
++ * Keyed by telegram_message_id like buildApplicantPhotoObjectPath, with a
++ * distinct "-portrait" suffix so the cropped portrait's object never
++ * collides with (or overwrites) the original, full passport image's own
++ * object at buildApplicantPhotoObjectPath's path for the SAME message —
++ * both coexist as independent objects in the same bucket.
++ */
++export function buildApplicantPortraitObjectPath(telegramMessageId: string, mimeType: string): string {
++  return `visa-photos/${telegramMessageId}-portrait.${extensionForMimeType(mimeType)}`;
++}
++
++/**
++ * Uploads the CROPPED applicant portrait (see extractApplicantPhotoCrop.ts)
++ * as an artifact fully independent from uploadApplicantPhoto's own original,
++ * full passport image — same bucket, same storage config, same "null means
++ * not configured/failed, never an error" contract, but a distinct object
++ * path (buildApplicantPortraitObjectPath) so neither upload can ever
++ * overwrite the other. Callers must never pass the original, uncropped
++ * buffer here, and must never let a failure here affect the original
++ * photo's own upload.
++ */
++export async function uploadApplicantPortrait(
++  input: UploadApplicantPhotoInput,
++  deps: UploadApplicantPhotoDependencies = defaultDependencies,
++): Promise<string | null> {
++  if (!deps.config) {
++    return null;
++  }
++  const objectPath = buildApplicantPortraitObjectPath(input.telegramMessageId, input.mimeType);
++  const file = deps.getBucket(deps.config).file(objectPath);
++  await file.save(input.buffer, { contentType: input.mimeType, resumable: false });
++  return objectPath;
++}
+
+diff --git a/src/visa/applicantPhotoRoute.ts b/src/visa/applicantPhotoRoute.ts
+--- a/src/visa/applicantPhotoRoute.ts
++++ b/src/visa/applicantPhotoRoute.ts
+@@ -105,7 +105,17 @@
+     return;
+   }
+ 
+-  const objectPath = ocrResult?.personalPhotoObjectPath ?? null;
++  // findOcrResult matches EITHER personal_photo_token (original passport)
++  // OR personal_portrait_token (cropped portrait) — see its own doc comment
++  // in passportOcrResult.repo.ts. Which object to serve depends on which of
++  // the two token columns actually equals the REQUESTED token, never on
++  // which one happens to be non-null (a row can legitimately have both).
++  const objectPath =
++    ocrResult?.personalPhotoToken === token
++      ? ocrResult.personalPhotoObjectPath
++      : ocrResult?.personalPortraitToken === token
++        ? ocrResult.personalPortraitObjectPath
++        : null;
+   if (!objectPath) {
+     res.status(404).json({ error: 'photo not found' });
+     return;
+
+diff --git a/src/visa/writePersonalPhotoUrlIfBlank.ts b/src/visa/writePersonalPhotoUrlIfBlank.ts
+--- a/src/visa/writePersonalPhotoUrlIfBlank.ts
++++ b/src/visa/writePersonalPhotoUrlIfBlank.ts
+@@ -1,33 +1,32 @@
+ import { getConfiguredApiTimeoutMs, getSheetsClients } from '../sheets/sheetsAuth.js';
+ import { withSheetTitle } from '../sheets/sheetLayout.js';
+-import { VISA_PERSONAL_PHOTO_URL_COLUMN } from './visaSheetColumns.js';
+ 
+ export interface PhotoUrlCellClient {
+-  getCell(spreadsheetId: string, rowNumber: number, sheetTitle?: string): Promise<string>;
+-  setCell(spreadsheetId: string, rowNumber: number, value: string, sheetTitle?: string): Promise<void>;
++  getCell(spreadsheetId: string, column: string, rowNumber: number, sheetTitle?: string): Promise<string>;
++  setCell(spreadsheetId: string, column: string, rowNumber: number, value: string, sheetTitle?: string): Promise<void>;
+ }
+ 
+-function photoUrlRange(rowNumber: number, sheetTitle?: string): string {
+-  return withSheetTitle(`${VISA_PERSONAL_PHOTO_URL_COLUMN}${rowNumber}`, sheetTitle);
++function photoUrlRange(column: string, rowNumber: number, sheetTitle?: string): string {
++  return withSheetTitle(`${column}${rowNumber}`, sheetTitle);
+ }
+ 
+ export function buildRealPhotoUrlCellClient(getClients: typeof getSheetsClients = getSheetsClients): PhotoUrlCellClient {
+   return {
+-    async getCell(spreadsheetId, rowNumber, sheetTitle) {
++    async getCell(spreadsheetId, column, rowNumber, sheetTitle) {
+       const { sheets } = getClients();
+       const response = await sheets.spreadsheets.values.get(
+-        { spreadsheetId, range: photoUrlRange(rowNumber, sheetTitle) },
++        { spreadsheetId, range: photoUrlRange(column, rowNumber, sheetTitle) },
+         { timeout: getConfiguredApiTimeoutMs() },
+       );
+       const value = response.data.values?.[0]?.[0];
+       return typeof value === 'string' ? value : '';
+     },
+-    async setCell(spreadsheetId, rowNumber, value, sheetTitle) {
++    async setCell(spreadsheetId, column, rowNumber, value, sheetTitle) {
+       const { sheets } = getClients();
+       await sheets.spreadsheets.values.update(
+         {
+           spreadsheetId,
+-          range: photoUrlRange(rowNumber, sheetTitle),
++          range: photoUrlRange(column, rowNumber, sheetTitle),
+           valueInputOption: 'RAW',
+           requestBody: { values: [[value]] },
+         },
+@@ -40,11 +39,17 @@
+ const defaultClient: PhotoUrlCellClient = buildRealPhotoUrlCellClient();
+ 
+ /**
+- * Populates Sheet column T (personalPhotoUrl) ONLY when it is currently
+- * blank — an operator's own manually-typed value (the only way this column
+- * was ever filled before this feature existed, and still a valid override
+- * afterward) is NEVER overwritten. Reads the single cell first, then writes
+- * only on a blank read.
++ * Populates the given single-cell visa Sheet column (e.g. VISA_PERSONAL_
++ * PHOTO_URL_COLUMN = 'T' for the original passport image, or VISA_PERSONAL_
++ * PORTRAIT_URL_COLUMN = 'V' for the cropped portrait — see
++ * visaSheetColumns.ts) ONLY when it is currently blank — an operator's own
++ * manually-typed value (the only way either column was ever filled before
++ * these features existed, and still a valid override afterward) is NEVER
++ * overwritten. Reads the single cell first, then writes only on a blank
++ * read. `column` is a required, explicit argument (not defaulted) so every
++ * call site states unambiguously which column it targets — this function
++ * has no opinion of its own about which artifact (original photo vs.
++ * cropped portrait) a given call is for.
+  *
+  * Not atomic against a concurrent manual edit — Sheets has no such
+  * primitive spanning two API calls (same limitation upsertRowInSheet.ts's
+@@ -56,13 +61,14 @@
+   spreadsheetId: string,
+   rowNumber: number,
+   url: string,
++  column: string,
+   sheetTitle?: string,
+   client: PhotoUrlCellClient = defaultClient,
+ ): Promise<'written' | 'skipped-not-blank'> {
+-  const current = await client.getCell(spreadsheetId, rowNumber, sheetTitle);
++  const current = await client.getCell(spreadsheetId, column, rowNumber, sheetTitle);
+   if (current.trim() !== '') {
+     return 'skipped-not-blank';
+   }
+-  await client.setCell(spreadsheetId, rowNumber, url, sheetTitle);
++  await client.setCell(spreadsheetId, column, rowNumber, url, sheetTitle);
+   return 'written';
+ }
+
+diff --git a/src/visa/extractApplicantPhotoCrop.ts b/src/visa/extractApplicantPhotoCrop.ts
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/src/visa/extractApplicantPhotoCrop.ts
+@@ -0,0 +1,133 @@
++import { ImageAnnotatorClient, protos } from '@google-cloud/vision';
++import sharp from 'sharp';
++import { getImageDimensions } from '../ocr/mrz/getImageDimensions.js';
++import { computeApplicantPhotoCropRegion, type PixelCropRegion, type VisionFaceAnnotation } from './computeApplicantPhotoCropRegion.js';
++
++const MAX_ERROR_MESSAGE_LENGTH = 300;
++
++export interface DetectFacesResult {
++  faces: VisionFaceAnnotation[];
++}
++
++export type DetectFacesFn = (imageBuffer: Buffer) => Promise<DetectFacesResult>;
++
++export interface ExtractApplicantPhotoCropDependencies {
++  detectFaces: DetectFacesFn;
++}
++
++/** Bounded the same way googleVisionProvider.ts bounds its own Vision error messages -- defense in depth. */
++function sanitizeErrorReason(error: unknown): string {
++  const message = error instanceof Error ? error.message : 'unknown error';
++  return message.slice(0, MAX_ERROR_MESSAGE_LENGTH);
++}
++
++let realVisionClient: ImageAnnotatorClient | null = null;
++function getRealVisionClient(): ImageAnnotatorClient {
++  if (!realVisionClient) {
++    realVisionClient = new ImageAnnotatorClient();
++  }
++  return realVisionClient;
++}
++
++/**
++ * Dedicated FACE_DETECTION-only Vision call, deliberately independent of
++ * whichever text-extraction OCR_PROVIDER is configured (google-vision/
++ * anthropic/local/compare) -- the applicant-photo crop must work the same
++ * way regardless of that setting, since it answers a different question
++ * ("where is the face in this image") than any text-extraction provider
++ * does, and performPassportOcr.ts already calls uploadApplicantPhoto
++ * unconditionally today, independent of OCR_PROVIDER.
++ *
++ * This IS a second Vision API call on top of googleVisionProvider.ts's own
++ * DOCUMENT_TEXT_DETECTION call when OCR_PROVIDER=google-vision (Vision's
++ * client does support combining multiple feature types into one
++ * annotateImage()/batchAnnotateImages() request, which would avoid that --
++ * but doing so here would mean threading Vision-specific face geometry back
++ * out through the provider-agnostic OcrProvider interface, which every
++ * other provider (anthropic/local) has no equivalent for, or wiring this
++ * module's internals into googleVisionProvider.ts specifically and breaking
++ * its independence from the configured provider. A second, cheap,
++ * FACE_DETECTION-only call -- isolated so a failure here can never fail the
++ * OCR job itself (see performPassportOcr.ts's own try/catch around this) --
++ * is the smaller, safer change for the bounded message volumes this system
++ * handles.
++ */
++async function detectFacesReal(imageBuffer: Buffer): Promise<DetectFacesResult> {
++  const client = getRealVisionClient();
++  const [response]: [protos.google.cloud.vision.v1.IAnnotateImageResponse] = await client.faceDetection(imageBuffer);
++  if (response.error?.message) {
++    throw new Error(response.error.message);
++  }
++  return { faces: (response.faceAnnotations ?? []) as VisionFaceAnnotation[] };
++}
++
++const defaultDependencies: ExtractApplicantPhotoCropDependencies = {
++  detectFaces: detectFacesReal,
++};
++
++async function encodeCrop(imageBuffer: Buffer, region: PixelCropRegion, mimeType: string): Promise<Buffer> {
++  const pipeline = sharp(imageBuffer).extract(region);
++  if (mimeType === 'image/png') return pipeline.png().toBuffer();
++  if (mimeType === 'image/webp') return pipeline.webp({ quality: 92 }).toBuffer();
++  // Telegram photos are JPEG in the overwhelming common case; any other/
++  // unrecognized mime type also falls back to JPEG here, matching
++  // uploadApplicantPhoto.ts's own extensionForMimeType default.
++  return pipeline.jpeg({ quality: 92 }).toBuffer();
++}
++
++/**
++ * Crops the applicant's printed passport PHOTO (the full portrait
++ * rectangle, not just a tight face box -- see computeApplicantPhotoCropRegion)
++ * out of the original Telegram passport image. The ORIGINAL full-page
++ * buffer is used only as an in-memory input here and is never itself
++ * returned or uploaded -- only this function's cropped output is ever
++ * passed to uploadApplicantPhoto by its caller.
++ *
++ * The input buffer is first EXIF-auto-oriented (sharp's rotate() with no
++ * arguments physically applies the EXIF orientation tag and strips it) so
++ * that the pixel coordinates Vision's FACE_DETECTION returns and the pixel
++ * grid sharp's extract() crops from are always the exact same coordinate
++ * space, regardless of how the original photo's camera/Telegram client
++ * recorded orientation -- this is done unconditionally so there's no
++ * reliance on assumptions about whether Vision itself also auto-rotates by
++ * EXIF internally. This normalization is local to this crop path only; it
++ * does not change the buffer passed to the configured OcrProvider's own
++ * extract() call (see performPassportOcr.ts), so MRZ/text extraction is
++ * entirely unaffected.
++ *
++ * Returns null (never throws for this case) when no reliably-located photo
++ * region can be determined -- callers must treat that exactly like "photo
++ * storage not configured": skip uploading anything for this message, never
++ * fall back to uploading the original, uncropped passport image.
++ *
++ * DOES throw for a genuine Vision API infrastructure failure (network,
++ * quota, auth) -- same distinction googleVisionProvider.ts's own MRZ call
++ * makes -- so callers that want OCR to still succeed despite a photo
++ * problem (see performPassportOcr.ts) must wrap this call in their own
++ * try/catch, exactly as they already do around uploadApplicantPhoto.
++ */
++export async function extractApplicantPhotoCrop(
++  imageBuffer: Buffer,
++  mimeType: string,
++  deps: ExtractApplicantPhotoCropDependencies = defaultDependencies,
++): Promise<Buffer | null> {
++  const normalizedBuffer = await sharp(imageBuffer).rotate().toBuffer();
++
++  let faces: VisionFaceAnnotation[];
++  try {
++    ({ faces } = await deps.detectFaces(normalizedBuffer));
++  } catch (error) {
++    const reason = sanitizeErrorReason(error);
++    console.log(`[applicant-photo-crop] Vision face detection call failed: ${reason}`);
++    throw new Error(`Google Vision face detection call failed: ${reason}`);
++  }
++
++  const { width, height } = await getImageDimensions(normalizedBuffer);
++  const region = computeApplicantPhotoCropRegion(faces, width, height);
++  if (!region) {
++    console.log('[applicant-photo-crop] no reliable photo region found; skipping photo for this message');
++    return null;
++  }
++
++  return encodeCrop(normalizedBuffer, region, mimeType);
++}
+
+diff --git a/src/visa/computeApplicantPhotoCropRegion.ts b/src/visa/computeApplicantPhotoCropRegion.ts
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/src/visa/computeApplicantPhotoCropRegion.ts
+@@ -0,0 +1,140 @@
++import type { VisionBoundingPoly } from '../ocr/visual/extractIssueDateFromVisionStructure.js';
++
++/**
++ * Loose/local shape for Google Vision's FaceAnnotation -- same deliberate
++ * looseness as VisionWord/VisionPage in extractIssueDateFromVisionStructure.ts,
++ * trivially unit-testable with synthetic fixtures while remaining
++ * structurally compatible with the real
++ * protos.google.cloud.vision.v1.IFaceAnnotation shape. Only the two fields
++ * this module actually needs are modeled -- landmarks/angles are unused.
++ *
++ * `boundingPoly` (not the tighter `fdBoundingPoly`) is used deliberately:
++ * Vision's own proto docs describe it as "computed to frame the face in
++ * accordance with human expectations" (includes forehead/hair/chin), which
++ * is the right starting rectangle to expand outward into the full printed
++ * photo region -- fd_bounding_poly is tighter (skin only) and would need a
++ * larger, less certain expansion to reach the same target.
++ */
++export interface VisionFaceAnnotation {
++  boundingPoly?: VisionBoundingPoly | null;
++  detectionConfidence?: number | null;
++}
++
++export interface PixelCropRegion {
++  left: number;
++  top: number;
++  width: number;
++  height: number;
++}
++
++interface PixelBox {
++  x0: number;
++  y0: number;
++  x1: number;
++  y1: number;
++}
++
++const MIN_DETECTION_CONFIDENCE = 0.5;
++const MIN_CROP_DIMENSION_PIXELS = 80;
++
++// Expansion factors approximate a standard passport/ID photo crop around a
++// detected face: generous headroom above (hair/headwear), a smaller margin
++// below (chin/neck/shoulders), and symmetric side margins. This is a
++// starting heuristic, not a measured photographic standard -- it should be
++// retuned against real production photos (see extractApplicantPhotoCrop.ts).
++const TOP_MARGIN_FACTOR = 0.9;
++const BOTTOM_MARGIN_FACTOR = 0.7;
++const SIDE_MARGIN_FACTOR = 0.55;
++
++function faceBoundingBoxPixels(face: VisionFaceAnnotation): PixelBox | null {
++  const vertices = face.boundingPoly?.vertices;
++  if (!vertices || vertices.length === 0) return null;
++  const xs = vertices.map((v) => v.x ?? null).filter((x): x is number => x !== null);
++  const ys = vertices.map((v) => v.y ?? null).filter((y): y is number => y !== null);
++  if (xs.length === 0 || ys.length === 0) return null;
++  return { x0: Math.min(...xs), y0: Math.min(...ys), x1: Math.max(...xs), y1: Math.max(...ys) };
++}
++
++function boxArea(box: PixelBox): number {
++  return Math.max(0, box.x1 - box.x0) * Math.max(0, box.y1 - box.y0);
++}
++
++/**
++ * Picks the single most likely "this is the ID photo's face" candidate out
++ * of every face Vision found on the page. A real passport's printed
++ * security pattern/hologram/ghost-photo sometimes triggers a spurious,
++ * small, low-confidence face match too, so this never just takes the first
++ * result: it requires a minimum detection confidence, then prefers the
++ * LARGEST confident face -- the genuine photo's face is always
++ * substantially bigger in frame than a hologram/security-pattern artifact.
++ */
++function selectBestFace(faces: readonly VisionFaceAnnotation[]): VisionFaceAnnotation | null {
++  let best: { face: VisionFaceAnnotation; area: number } | null = null;
++  for (const face of faces) {
++    const confidence = face.detectionConfidence ?? 0;
++    if (confidence < MIN_DETECTION_CONFIDENCE) continue;
++    const box = faceBoundingBoxPixels(face);
++    if (!box) continue;
++    const area = boxArea(box);
++    if (area <= 0) continue;
++    if (best === null || area > best.area) best = { face, area };
++  }
++  return best?.face ?? null;
++}
++
++/**
++ * Computes the passport PHOTO rectangle (the full printed portrait, not
++ * just the face) from Google Vision's FACE_DETECTION result, by expanding
++ * the best-matching detected face's framing bounding box outward by fixed
++ * margins and clamping to the image bounds.
++ *
++ * Returns null -- never a guessed or undersized rectangle -- when: no face
++ * was found, every candidate's confidence is below the threshold, or the
++ * resulting crop would be smaller than a sane minimum (e.g. the face sat
++ * right at the image edge and clamping shrank it away). Callers must treat
++ * null as "skip creating a photo for this message", never as an error and
++ * never by falling back to uploading the original, uncropped image.
++ */
++export function computeApplicantPhotoCropRegion(
++  faces: readonly VisionFaceAnnotation[],
++  imageWidth: number,
++  imageHeight: number,
++): PixelCropRegion | null {
++  if (imageWidth <= 0 || imageHeight <= 0) return null;
++
++  const face = selectBestFace(faces);
++  if (!face) return null;
++
++  const box = faceBoundingBoxPixels(face);
++  if (!box) return null;
++
++  const faceWidth = box.x1 - box.x0;
++  const faceHeight = box.y1 - box.y0;
++  if (faceWidth <= 0 || faceHeight <= 0) return null;
++
++  const expandedX0 = box.x0 - faceWidth * SIDE_MARGIN_FACTOR;
++  const expandedX1 = box.x1 + faceWidth * SIDE_MARGIN_FACTOR;
++  const expandedY0 = box.y0 - faceHeight * TOP_MARGIN_FACTOR;
++  const expandedY1 = box.y1 + faceHeight * BOTTOM_MARGIN_FACTOR;
++
++  const clampedX0 = Math.max(0, expandedX0);
++  const clampedY0 = Math.max(0, expandedY0);
++  const clampedX1 = Math.min(imageWidth, expandedX1);
++  const clampedY1 = Math.min(imageHeight, expandedY1);
++
++  const width = Math.round(clampedX1 - clampedX0);
++  const height = Math.round(clampedY1 - clampedY0);
++  if (width < MIN_CROP_DIMENSION_PIXELS || height < MIN_CROP_DIMENSION_PIXELS) return null;
++
++  const left = Math.round(clampedX0);
++  const top = Math.round(clampedY0);
++  // Rounding left/top up and width/height down (via Math.round independently)
++  // can occasionally push left+width or top+height one pixel past the
++  // image bounds -- clamp the extent here too so sharp's extract() never
++  // receives an out-of-bounds region.
++  const safeWidth = Math.min(width, Math.floor(imageWidth) - left);
++  const safeHeight = Math.min(height, Math.floor(imageHeight) - top);
++  if (safeWidth < MIN_CROP_DIMENSION_PIXELS || safeHeight < MIN_CROP_DIMENSION_PIXELS) return null;
++
++  return { left, top, width: safeWidth, height: safeHeight };
++}
+
+diff --git a/migrations/0027_add_personal_portrait_fields.sql b/migrations/0027_add_personal_portrait_fields.sql
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/migrations/0027_add_personal_portrait_fields.sql
+@@ -0,0 +1,18 @@
++-- Stable GCS object path + dedicated public token for the applicant's
++-- CROPPED portrait (the face-detected photo region only), separate from
++-- personal_photo_object_path/personal_photo_token (migrations 0025/0026),
++-- which remain the ORIGINAL, full, uncropped passport image -- see
++-- src/visa/extractApplicantPhotoCrop.ts and performPassportOcr.ts for the
++-- crop step, and src/visa/uploadApplicantPhoto.ts's uploadApplicantPortrait
++-- for the upload. Mirrors personal_photo_object_path/personal_photo_token's
++-- own conventions exactly: NULL means no portrait crop/upload has happened
++-- yet (no reliable face region found, photo storage not configured, or the
++-- upload attempt failed) -- every reader must treat NULL as "nothing to do
++-- yet", never as an error, and must never fall back to the original
++-- passport image in its place.
++ALTER TABLE passport_ocr_results ADD COLUMN personal_portrait_object_path TEXT;
++ALTER TABLE passport_ocr_results ADD COLUMN personal_portrait_token TEXT;
++
++CREATE UNIQUE INDEX idx_passport_ocr_results_personal_portrait_token
++  ON passport_ocr_results (personal_portrait_token)
++  WHERE personal_portrait_token IS NOT NULL;
+
+diff --git a/tests/passportOcrResult.repo.test.ts b/tests/passportOcrResult.repo.test.ts
+--- a/tests/passportOcrResult.repo.test.ts
++++ b/tests/passportOcrResult.repo.test.ts
+@@ -299,6 +299,133 @@
+   }
+ });
+ 
++// --- personal portrait (cropped) fields — fully independent from personal_photo_*, see migration 0027 ---
++
++test('createPassportOcrResult persists a non-null personal_portrait_object_path and it round-trips exactly, independent of personal_photo_object_path', async () => {
++  const fixture = await createLinkedTelegramMessage();
++  try {
++    const created = await createPassportOcrResult({
++      ...sampleInput(fixture.telegramMessageId),
++      personalPhotoObjectPath: `visa-photos/${fixture.telegramMessageId}.jpg`,
++      personalPortraitObjectPath: `visa-photos/${fixture.telegramMessageId}-portrait.jpg`,
++    });
++    assert.ok(created);
++    assert.equal(created.personalPhotoObjectPath, `visa-photos/${fixture.telegramMessageId}.jpg`);
++    assert.equal(created.personalPortraitObjectPath, `visa-photos/${fixture.telegramMessageId}-portrait.jpg`);
++    assert.notEqual(created.personalPortraitObjectPath, created.personalPhotoObjectPath);
++
++    const fetched = await findPassportOcrResultByTelegramMessageId(fixture.telegramMessageId);
++    assert.equal(fetched?.personalPortraitObjectPath, `visa-photos/${fixture.telegramMessageId}-portrait.jpg`);
++    assert.equal(fetched?.personalPhotoObjectPath, `visa-photos/${fixture.telegramMessageId}.jpg`);
++  } finally {
++    await cleanup(fixture);
++  }
++});
++
++test('createPassportOcrResult persists a null personal_portrait_object_path when omitted, even when personal_photo_object_path is set', async () => {
++  const fixture = await createLinkedTelegramMessage();
++  try {
++    const created = await createPassportOcrResult({
++      ...sampleInput(fixture.telegramMessageId),
++      personalPhotoObjectPath: `visa-photos/${fixture.telegramMessageId}.jpg`,
++    });
++    assert.ok(created);
++    assert.equal(created.personalPortraitObjectPath, null);
++    assert.equal(created.personalPhotoObjectPath, `visa-photos/${fixture.telegramMessageId}.jpg`);
++  } finally {
++    await cleanup(fixture);
++  }
++});
++
++test('createPassportOcrResult persists personal_portrait_token together with personal_portrait_object_path, and findPassportOcrResultByPersonalPhotoToken matches it too', async () => {
++  const fixture = await createLinkedTelegramMessage();
++  const photoToken = `photo-token-${fixture.telegramMessageId}`;
++  const portraitToken = `portrait-token-${fixture.telegramMessageId}`;
++  try {
++    const created = await createPassportOcrResult({
++      ...sampleInput(fixture.telegramMessageId),
++      personalPhotoObjectPath: `visa-photos/${fixture.telegramMessageId}.jpg`,
++      personalPhotoToken: photoToken,
++      personalPortraitObjectPath: `visa-photos/${fixture.telegramMessageId}-portrait.jpg`,
++      personalPortraitToken: portraitToken,
++    });
++    assert.ok(created);
++    assert.equal(created.personalPortraitToken, portraitToken);
++    assert.notEqual(created.personalPortraitToken, created.personalPhotoToken);
++
++    // The SAME lookup function used by the public /visa-photos/:token route
++    // must find this row via EITHER token — see applicantPhotoRoute.ts,
++    // which then picks the matching object path itself.
++    const fetchedByPhotoToken = await findPassportOcrResultByPersonalPhotoToken(photoToken);
++    assert.ok(fetchedByPhotoToken);
++    assert.equal(fetchedByPhotoToken.id, created.id);
++
++    const fetchedByPortraitToken = await findPassportOcrResultByPersonalPhotoToken(portraitToken);
++    assert.ok(fetchedByPortraitToken);
++    assert.equal(fetchedByPortraitToken.id, created.id);
++  } finally {
++    await cleanup(fixture);
++  }
++});
++
++test('createPassportOcrResult persists a null personal_portrait_token when omitted', async () => {
++  const fixture = await createLinkedTelegramMessage();
++  try {
++    const created = await createPassportOcrResult(sampleInput(fixture.telegramMessageId));
++    assert.ok(created);
++    assert.equal(created.personalPortraitToken, null);
++  } finally {
++    await cleanup(fixture);
++  }
++});
++
++test('the database enforces uniqueness of personal_portrait_token across rows, independent from the personal_photo_token uniqueness constraint', async () => {
++  const fixtureA = await createLinkedTelegramMessage();
++  const fixtureB = await createLinkedTelegramMessage();
++  const sharedPortraitToken = `duplicate-portrait-token-${Date.now()}`;
++  try {
++    const first = await createPassportOcrResult({
++      ...sampleInput(fixtureA.telegramMessageId),
++      personalPortraitToken: sharedPortraitToken,
++    });
++    assert.ok(first);
++
++    await assert.rejects(
++      () =>
++        createPassportOcrResult({
++          ...sampleInput(fixtureB.telegramMessageId),
++          personalPortraitToken: sharedPortraitToken,
++        }),
++      /duplicate key value violates unique constraint/,
++    );
++  } finally {
++    await cleanup(fixtureA);
++    await cleanup(fixtureB);
++  }
++});
++
++test('a personal_photo_token and a personal_portrait_token may safely share the same string value on DIFFERENT rows (independent unique indexes, no cross-column constraint)', async () => {
++  const fixtureA = await createLinkedTelegramMessage();
++  const fixtureB = await createLinkedTelegramMessage();
++  const sharedValue = `cross-column-value-${Date.now()}`;
++  try {
++    const first = await createPassportOcrResult({
++      ...sampleInput(fixtureA.telegramMessageId),
++      personalPhotoToken: sharedValue,
++    });
++    assert.ok(first);
++
++    const second = await createPassportOcrResult({
++      ...sampleInput(fixtureB.telegramMessageId),
++      personalPortraitToken: sharedValue,
++    });
++    assert.ok(second, 'the two unique indexes are on different columns, so this must succeed');
++  } finally {
++    await cleanup(fixtureA);
++    await cleanup(fixtureB);
++  }
++});
++
+ after(async () => {
+   await pool.end();
+ });
+
+diff --git a/tests/performPassportOcr.test.ts b/tests/performPassportOcr.test.ts
+--- a/tests/performPassportOcr.test.ts
++++ b/tests/performPassportOcr.test.ts
+@@ -45,6 +45,8 @@
+     download: number;
+     extract: number;
+     upload: number;
++    extractPhotoCrop: number;
++    uploadPortrait: number;
+     generateToken: number;
+     save: number;
+     enqueueSheetSync: number;
+@@ -57,6 +59,8 @@
+     download: 0,
+     extract: 0,
+     upload: 0,
++    extractPhotoCrop: 0,
++    uploadPortrait: 0,
+     generateToken: 0,
+     save: 0,
+     enqueueSheetSync: 0,
+@@ -90,6 +94,18 @@
+       calls.upload += 1;
+       return 'visa-photos/11111111-1111-1111-1111-111111111111.jpg';
+     },
++    extractPhotoCrop: async () => {
++      calls.extractPhotoCrop += 1;
++      return Buffer.from('fake-cropped-portrait-bytes');
++    },
++    uploadPortrait: async () => {
++      calls.uploadPortrait += 1;
++      return 'visa-photos/11111111-1111-1111-1111-111111111111-portrait.jpg';
++    },
++    // Called independently for the original photo's token and the
++    // portrait's token — a shared fake counter lets tests distinguish
++    // "called once" from "called twice" without the two calls colliding
++    // on the exact same returned string.
+     generateToken: () => {
+       calls.generateToken += 1;
+       tokenCounter += 1;
+@@ -421,3 +437,173 @@
+   assert.equal(savedInputs[0]?.personalPhotoToken, 'totally-unrelated-opaque-value');
+   assert.notEqual(savedInputs[0]?.personalPhotoToken, CONTEXT.telegramMessageId);
+ });
++
++// --- CROPPED applicant portrait crop + upload (src/visa/extractApplicantPhotoCrop.ts, src/visa/uploadApplicantPhoto.ts's uploadApplicantPortrait) ---
++// Fully independent from the original-photo upload above: its own buffer
++// source (the same downloaded buffer, cropped), its own object path, its
++// own token, its own DB fields. Never replaces, and is never replaced by,
++// the original passport image.
++
++test('performPassportOcr crops the portrait from the SAME downloaded buffer — never downloads a second time', async () => {
++  const receivedBuffers: Buffer[] = [];
++  const { deps, calls } = buildDeps({
++    extractPhotoCrop: async (buffer) => {
++      calls.extractPhotoCrop += 1;
++      receivedBuffers.push(buffer);
++      return Buffer.from('fake-cropped-portrait-bytes');
++    },
++  });
++
++  await performPassportOcr(CONTEXT, deps);
++
++  assert.equal(calls.download, 1, 'must download the photo exactly once');
++  assert.equal(calls.extractPhotoCrop, 1);
++  assert.equal(receivedBuffers.length, 1);
++  assert.equal(receivedBuffers[0]?.toString(), 'fake-image-bytes', 'extractPhotoCrop must receive the exact buffer downloadPhoto returned');
++});
++
++test('performPassportOcr uploads the CROPPED portrait buffer via uploadPortrait, never via uploadPhoto', async () => {
++  const uploadedBuffers: Buffer[] = [];
++  const { deps, calls } = buildDeps({
++    extractPhotoCrop: async () => {
++      calls.extractPhotoCrop += 1;
++      return Buffer.from('fake-cropped-portrait-bytes');
++    },
++    uploadPortrait: async (input) => {
++      calls.uploadPortrait += 1;
++      uploadedBuffers.push(input.buffer);
++      return 'visa-photos/11111111-1111-1111-1111-111111111111-portrait.jpg';
++    },
++  });
++
++  await performPassportOcr(CONTEXT, deps);
++
++  assert.equal(calls.uploadPortrait, 1);
++  assert.equal(calls.upload, 1, 'the original-photo upload still happens independently');
++  assert.equal(uploadedBuffers.length, 1);
++  assert.equal(uploadedBuffers[0]?.toString(), 'fake-cropped-portrait-bytes', 'uploadPortrait must receive the CROPPED buffer');
++});
++
++test('performPassportOcr never calls uploadPortrait when extractPhotoCrop finds no reliable portrait region (returns null), but still uploads the original photo', async () => {
++  const { deps, calls, savedInputs } = buildDeps({
++    extractPhotoCrop: async () => {
++      calls.extractPhotoCrop += 1;
++      return null;
++    },
++  });
++
++  await performPassportOcr(CONTEXT, deps);
++
++  assert.equal(calls.extractPhotoCrop, 1);
++  assert.equal(calls.uploadPortrait, 0, 'must never upload a portrait when no reliable crop was found');
++  assert.equal(calls.upload, 1, 'the original photo upload is unaffected');
++  assert.equal(savedInputs[0]?.personalPortraitObjectPath, null);
++  assert.equal(savedInputs[0]?.personalPortraitToken, null);
++  assert.ok(savedInputs[0]?.personalPhotoObjectPath, 'the original photo path must still be saved');
++});
++
++test('a portrait crop failure (extractPhotoCrop throws, e.g. a Vision API infra error) never fails performPassportOcr, and never affects the original-photo upload', async () => {
++  const { deps, calls, savedInputs } = buildDeps({
++    extractPhotoCrop: async () => {
++      calls.extractPhotoCrop += 1;
++      throw new Error('Google Vision face detection call failed: 7 PERMISSION_DENIED');
++    },
++  });
++
++  await assert.doesNotReject(() => performPassportOcr(CONTEXT, deps));
++  assert.equal(calls.extractPhotoCrop, 1);
++  assert.equal(calls.uploadPortrait, 0, 'must never fall back to uploading the original buffer as a portrait when cropping fails');
++  assert.equal(calls.upload, 1, 'the original photo upload still happens independently');
++  assert.equal(calls.save, 1, 'OCR must still succeed even though the portrait crop failed');
++  assert.equal(savedInputs[0]?.personalPortraitObjectPath, null);
++  assert.ok(savedInputs[0]?.personalPhotoObjectPath, 'the original photo path is unaffected by the portrait failure');
++});
++
++test('a portrait UPLOAD failure never fails performPassportOcr, and never affects the original-photo upload', async () => {
++  const { deps, calls, savedInputs } = buildDeps({
++    uploadPortrait: async () => {
++      calls.uploadPortrait += 1;
++      throw new Error('GCS upload failed: service unavailable');
++    },
++  });
++
++  await assert.doesNotReject(() => performPassportOcr(CONTEXT, deps));
++  assert.equal(calls.uploadPortrait, 1);
++  assert.equal(calls.upload, 1, 'the original photo upload still happens independently');
++  assert.equal(calls.save, 1);
++  assert.equal(savedInputs[0]?.personalPortraitObjectPath, null);
++  assert.ok(savedInputs[0]?.personalPhotoObjectPath, 'the original photo path is unaffected by the portrait failure');
++});
++
++test('performPassportOcr never attempts a portrait crop/upload on the idempotent (already-exists) path', async () => {
++  const { deps, calls } = buildDeps({
++    findExistingResult: async () => {
++      calls.findExisting += 1;
++      return { id: 'existing', telegramMessageId: CONTEXT.telegramMessageId } as unknown as PassportOcrResultRecord;
++    },
++  });
++
++  await performPassportOcr(CONTEXT, deps);
++
++  assert.equal(calls.extractPhotoCrop, 0, 'must not re-crop/re-upload a portrait for a message whose OCR result already exists');
++  assert.equal(calls.uploadPortrait, 0);
++});
++
++test('performPassportOcr persists the uploaded portrait object path on the saved OCR result, independent from the photo object path', async () => {
++  const { deps, savedInputs } = buildDeps();
++
++  await performPassportOcr(CONTEXT, deps);
++
++  assert.equal(savedInputs[0]?.personalPortraitObjectPath, 'visa-photos/11111111-1111-1111-1111-111111111111-portrait.jpg');
++  assert.equal(savedInputs[0]?.personalPhotoObjectPath, 'visa-photos/11111111-1111-1111-1111-111111111111.jpg');
++  assert.notEqual(
++    savedInputs[0]?.personalPortraitObjectPath,
++    savedInputs[0]?.personalPhotoObjectPath,
++    'the portrait and the original photo must be two distinct objects',
++  );
++});
++
++test('performPassportOcr generates a portrait token ONLY when the portrait upload actually succeeds, independent from the photo token', async () => {
++  const { deps, savedInputs } = buildDeps();
++
++  await performPassportOcr(CONTEXT, deps);
++
++  assert.ok(savedInputs[0]?.personalPortraitToken, 'a portrait token must have been generated');
++  assert.ok(savedInputs[0]?.personalPhotoToken, 'a photo token must also have been generated, independently');
++  assert.notEqual(
++    savedInputs[0]?.personalPortraitToken,
++    savedInputs[0]?.personalPhotoToken,
++    'the portrait token and the photo token must be two distinct, independently generated values',
++  );
++});
++
++test('performPassportOcr never generates a portrait token when the portrait upload fails', async () => {
++  const { deps, savedInputs } = buildDeps({
++    uploadPortrait: async () => {
++      throw new Error('GCS upload failed: service unavailable');
++    },
++  });
++
++  await assert.doesNotReject(() => performPassportOcr(CONTEXT, deps));
++  assert.equal(savedInputs[0]?.personalPortraitToken, null);
++});
++
++test('performPassportOcr never generates a portrait token when no reliable portrait region was found', async () => {
++  const { deps, savedInputs } = buildDeps({
++    extractPhotoCrop: async () => null,
++  });
++
++  await performPassportOcr(CONTEXT, deps);
++
++  assert.equal(savedInputs[0]?.personalPortraitToken, null);
++});
++
++test('performPassportOcr never derives the portrait token from telegramMessageId or any other identifier', async () => {
++  const { deps, savedInputs } = buildDeps({
++    generateToken: () => 'totally-unrelated-portrait-value',
++  });
++
++  await performPassportOcr(CONTEXT, deps);
++
++  assert.notEqual(savedInputs[0]?.personalPortraitToken, CONTEXT.telegramMessageId);
++});
+
+diff --git a/tests/sheets.syncPassportRowToSheet.test.ts b/tests/sheets.syncPassportRowToSheet.test.ts
+--- a/tests/sheets.syncPassportRowToSheet.test.ts
++++ b/tests/sheets.syncPassportRowToSheet.test.ts
+@@ -51,6 +51,8 @@
+   telegramMessageId: 'msg-1',
+   personalPhotoObjectPath: null,
+   personalPhotoToken: null,
++  personalPortraitObjectPath: null,
++  personalPortraitToken: null,
+   firstName: ocrField('ANNA'),
+   middleName: ocrField(null),
+   surname: ocrField('ERIKSSON'),
+@@ -946,3 +948,115 @@
+   assert.equal(calls.writePhotoUrl, 0, 'must never attempt a column write for a row that never synced');
+ });
+ 
++// --- personal portrait URL (column V, see writePersonalPhotoUrlIfBlank.ts) ---
++// Deliberately NOT column U: U already holds an operator-entered "passport
++// scan URL" for the unrelated VisitSaudi/KSA Visa draft-building flow (see
++// visaSheetColumns.ts's own doc comment on VISA_PERSONAL_PORTRAIT_URL_COLUMN).
++
++test('syncPassportRowToSheet writes the durable portrait URL, built from the dedicated portrait token, to column V, independent of the photo/column-T write', async () => {
++  const { deps, calls, writePhotoUrlArgs } = buildDeps({
++    ocrResult: {
++      ...OCR_RESULT,
++      personalPhotoObjectPath: 'visa-photos/msg-1.jpg',
++      personalPhotoToken: 'photo-token-value',
++      personalPortraitObjectPath: 'visa-photos/msg-1-portrait.jpg',
++      personalPortraitToken: 'portrait-token-value',
++    },
++  });
++
++  await syncPassportRowToSheet('job-1', deps);
++
++  assert.equal(calls.writePhotoUrl, 2, 'both the T write and the V write happen');
++  const photoCall = writePhotoUrlArgs.find((a) => (a as { column: string }).column === 'T');
++  const portraitCall = writePhotoUrlArgs.find((a) => (a as { column: string }).column === 'V');
++  assert.deepEqual(photoCall, {
++    spreadsheetId: 'sheet-abc',
++    rowNumber: 5,
++    url: 'https://visa.mahbubtour.uz/visa-photos/photo-token-value',
++    column: 'T',
++    sheetTitle: undefined,
++  });
++  assert.deepEqual(portraitCall, {
++    spreadsheetId: 'sheet-abc',
++    rowNumber: 5,
++    url: 'https://visa.mahbubtour.uz/visa-photos/portrait-token-value',
++    column: 'V',
++    sheetTitle: undefined,
++  });
++});
++
++test('syncPassportRowToSheet never attempts a portrait URL write when no portrait was uploaded yet (personalPortraitToken null)', async () => {
++  const { deps, calls, writePhotoUrlArgs } = buildDeps({
++    ocrResult: {
++      ...OCR_RESULT,
++      personalPhotoObjectPath: 'visa-photos/msg-1.jpg',
++      personalPhotoToken: 'photo-token-value',
++      personalPortraitObjectPath: null,
++      personalPortraitToken: null,
++    },
++  });
++
++  await syncPassportRowToSheet('job-1', deps);
++
++  assert.equal(calls.writePhotoUrl, 1, 'only the T write happens');
++  assert.equal((writePhotoUrlArgs[0] as { column: string }).column, 'T');
++});
++
++test('syncPassportRowToSheet never attempts a portrait URL write when VISA_PHOTOS_PUBLIC_BASE_URL is not configured', async () => {
++  const { deps, calls } = buildDeps({
++    ocrResult: {
++      ...OCR_RESULT,
++      personalPortraitObjectPath: 'visa-photos/msg-1-portrait.jpg',
++      personalPortraitToken: 'portrait-token-value',
++    },
++    photoPublicBaseUrl: null,
++  });
++
++  await syncPassportRowToSheet('job-1', deps);
++
++  assert.equal(calls.writePhotoUrl, 0);
++});
++
++test('a portrait URL write failure never flips an already-synced job back to failed, and never affects the photo (column T) write', async () => {
++  const attemptedColumns: string[] = [];
++  const { deps, calls } = buildDeps({
++    ocrResult: {
++      ...OCR_RESULT,
++      personalPhotoObjectPath: 'visa-photos/msg-1.jpg',
++      personalPhotoToken: 'photo-token-value',
++      personalPortraitObjectPath: 'visa-photos/msg-1-portrait.jpg',
++      personalPortraitToken: 'portrait-token-value',
++    },
++    writePhotoUrlImpl: async (spreadsheetId, rowNumber, url, column) => {
++      attemptedColumns.push(column);
++      if (column === 'V') {
++        throw new Error('Google Sheets API error: quota exceeded');
++      }
++      return 'written';
++    },
++  });
++
++  await syncPassportRowToSheet('job-1', deps);
++
++  assert.equal(calls.markSynced, 1, 'a portrait-URL write failure must never look like a sheet sync failure');
++  assert.equal(calls.markFailed, 0);
++  assert.deepEqual(attemptedColumns, ['T', 'V'], 'the T write completes successfully before the throwing V write is attempted');
++});
++
++test('syncPassportRowToSheet never attempts a portrait URL write when the sheet write itself fails', async () => {
++  const { deps, calls } = buildDeps({
++    ocrResult: {
++      ...OCR_RESULT,
++      personalPortraitObjectPath: 'visa-photos/msg-1-portrait.jpg',
++      personalPortraitToken: 'portrait-token-value',
++    },
++    upsertRowImpl: async () => {
++      throw new Error('Google Sheets API error: quota exceeded');
++    },
++  });
++
++  await syncPassportRowToSheet('job-1', deps);
++
++  assert.equal(calls.markSynced, 0);
++  assert.equal(calls.writePhotoUrl, 0, 'must never attempt a column write for a row that never synced');
++});
+
+diff --git a/tests/sheets.reconcileSheetRow.test.ts b/tests/sheets.reconcileSheetRow.test.ts
+--- a/tests/sheets.reconcileSheetRow.test.ts
++++ b/tests/sheets.reconcileSheetRow.test.ts
+@@ -116,6 +116,8 @@
+       telegramMessageId: 'irrelevant',
+       personalPhotoObjectPath: null,
+       personalPhotoToken: null,
++      personalPortraitObjectPath: null,
++      personalPortraitToken: null,
+       firstName: { value: 'JOHN', confidence: 'high' },
+       middleName: { value: null, confidence: null },
+       surname: { value: 'DOE', confidence: 'high' },
+
+diff --git a/tests/sheets.runSheetSyncLoop.test.ts b/tests/sheets.runSheetSyncLoop.test.ts
+--- a/tests/sheets.runSheetSyncLoop.test.ts
++++ b/tests/sheets.runSheetSyncLoop.test.ts
+@@ -439,6 +439,8 @@
+         telegramMessageId: fixture.telegramMessageId,
+         personalPhotoObjectPath: null,
+         personalPhotoToken: null,
++        personalPortraitObjectPath: null,
++        personalPortraitToken: null,
+         firstName: { value: 'ANNA', confidence: 'high' },
+         middleName: { value: null, confidence: null },
+         surname: { value: 'ERIKSSON', confidence: 'high' },
+
+diff --git a/tests/visa.applicantPhotoRoute.test.ts b/tests/visa.applicantPhotoRoute.test.ts
+--- a/tests/visa.applicantPhotoRoute.test.ts
++++ b/tests/visa.applicantPhotoRoute.test.ts
+@@ -12,6 +12,8 @@
+ 
+ /** A realistic generateApplicantPhotoToken.ts-shaped value — 43-char base64url, NOT a UUID. */
+ const REAL_TOKEN = 'xR7k2mQpL9vN4zT8wF1yB6hJ3cD0aE5sG2uK7iM9oPw';
++/** A second, independent realistic token for the cropped portrait artifact — distinct from REAL_TOKEN, never derived from it. */
++const REAL_PORTRAIT_TOKEN = 'qW3eR8tY5uI2oP9aS6dF1gH4jK7lZ0xC3vB6nM9kLq';
+ const TELEGRAM_MESSAGE_ID = '11111111-1111-1111-1111-111111111111';
+ 
+ const CONFIG: ApplicantPhotoStorageConfig = {
+@@ -29,6 +31,8 @@
+     telegramMessageId: TELEGRAM_MESSAGE_ID,
+     personalPhotoObjectPath: 'visa-photos/11111111-1111-1111-1111-111111111111.jpg',
+     personalPhotoToken: REAL_TOKEN,
++    personalPortraitObjectPath: null,
++    personalPortraitToken: null,
+     firstName: ocrField(),
+     middleName: ocrField(),
+     surname: ocrField(),
+@@ -158,6 +162,79 @@
+   );
+ 
+   assert.equal(res.statusCode, 404);
++});
++
++test('handleApplicantPhotoRequest serves the CROPPED PORTRAIT object when the requested token matches personal_portrait_token, not personal_photo_token', async () => {
++  const res = new FakeResponse();
++  const row = sampleOcrResult({
++    personalPhotoObjectPath: 'visa-photos/11111111-1111-1111-1111-111111111111.jpg',
++    personalPhotoToken: REAL_TOKEN,
++    personalPortraitObjectPath: 'visa-photos/11111111-1111-1111-1111-111111111111-portrait.jpg',
++    personalPortraitToken: REAL_PORTRAIT_TOKEN,
++  });
++  let requestedObjectPath: string | undefined;
++  await handleApplicantPhotoRequest(
++    req(REAL_PORTRAIT_TOKEN),
++    res,
++    buildDeps({
++      findOcrResult: async (token) => (token === REAL_PORTRAIT_TOKEN || token === REAL_TOKEN ? row : null),
++      getBucket: () =>
++        ({
++          file: (objectPath: string) => {
++            requestedObjectPath = objectPath;
++            return { createReadStream: () => Readable.from([Buffer.from('fake-portrait-bytes')]) };
++          },
++        }) as PhotoBucketLike,
++    }),
++  );
++  await waitForStreamEnd(res);
++
++  assert.equal(requestedObjectPath, 'visa-photos/11111111-1111-1111-1111-111111111111-portrait.jpg');
++  assert.equal(Buffer.concat(res.receivedBytes).toString(), 'fake-portrait-bytes');
++});
++
++test('handleApplicantPhotoRequest still serves the ORIGINAL passport object for the same row when requested by its own personal_photo_token', async () => {
++  const res = new FakeResponse();
++  const row = sampleOcrResult({
++    personalPhotoObjectPath: 'visa-photos/11111111-1111-1111-1111-111111111111.jpg',
++    personalPhotoToken: REAL_TOKEN,
++    personalPortraitObjectPath: 'visa-photos/11111111-1111-1111-1111-111111111111-portrait.jpg',
++    personalPortraitToken: REAL_PORTRAIT_TOKEN,
++  });
++  let requestedObjectPath: string | undefined;
++  await handleApplicantPhotoRequest(
++    req(REAL_TOKEN),
++    res,
++    buildDeps({
++      findOcrResult: async (token) => (token === REAL_PORTRAIT_TOKEN || token === REAL_TOKEN ? row : null),
++      getBucket: () =>
++        ({
++          file: (objectPath: string) => {
++            requestedObjectPath = objectPath;
++            return { createReadStream: () => Readable.from([Buffer.from('fake-photo-bytes')]) };
++          },
++        }) as PhotoBucketLike,
++    }),
++  );
++  await waitForStreamEnd(res);
++
++  assert.equal(requestedObjectPath, 'visa-photos/11111111-1111-1111-1111-111111111111.jpg');
++});
++
++test('handleApplicantPhotoRequest returns 404 when the portrait token matches but personal_portrait_object_path is somehow null', async () => {
++  const res = new FakeResponse();
++  await handleApplicantPhotoRequest(
++    req(REAL_PORTRAIT_TOKEN),
++    res,
++    buildDeps({
++      findOcrResult: async (token) =>
++        token === REAL_PORTRAIT_TOKEN
++          ? sampleOcrResult({ personalPortraitToken: REAL_PORTRAIT_TOKEN, personalPortraitObjectPath: null })
++          : null,
++    }),
++  );
++
++  assert.equal(res.statusCode, 404);
+ });
+ 
+ test('handleApplicantPhotoRequest returns 500 (not the raw error) when the DB lookup itself fails', async () => {
+
+diff --git a/tests/visa.writePersonalPhotoUrlIfBlank.test.ts b/tests/visa.writePersonalPhotoUrlIfBlank.test.ts
+--- a/tests/visa.writePersonalPhotoUrlIfBlank.test.ts
++++ b/tests/visa.writePersonalPhotoUrlIfBlank.test.ts
+@@ -1,5 +1,6 @@
+ import assert from 'node:assert/strict';
+ import { test } from 'node:test';
++import { VISA_PERSONAL_PHOTO_URL_COLUMN, VISA_PERSONAL_PORTRAIT_URL_COLUMN } from '../src/visa/visaSheetColumns.js';
+ import { writePersonalPhotoUrlIfBlank, type PhotoUrlCellClient } from '../src/visa/writePersonalPhotoUrlIfBlank.js';
+ 
+ function buildFakeClient(currentValue: string): {
+@@ -14,9 +15,9 @@
+       calls.get += 1;
+       return currentValue;
+     },
+-    async setCell(spreadsheetId, rowNumber, value, sheetTitle) {
++    async setCell(spreadsheetId, column, rowNumber, value, sheetTitle) {
+       calls.set += 1;
+-      setArgs.push({ spreadsheetId, rowNumber, value, sheetTitle });
++      setArgs.push({ spreadsheetId, column, rowNumber, value, sheetTitle });
+     },
+   };
+   return { client, calls, setArgs };
+@@ -29,6 +30,7 @@
+     'sheet-1',
+     5,
+     'https://visa.mahbubtour.uz/visa-photos/msg-1',
++    VISA_PERSONAL_PHOTO_URL_COLUMN,
+     undefined,
+     client,
+   );
+@@ -38,6 +40,7 @@
+   assert.equal(calls.set, 1);
+   assert.deepEqual(setArgs[0], {
+     spreadsheetId: 'sheet-1',
++    column: 'T',
+     rowNumber: 5,
+     value: 'https://visa.mahbubtour.uz/visa-photos/msg-1',
+     sheetTitle: undefined,
+@@ -51,6 +54,7 @@
+     'sheet-1',
+     5,
+     'https://visa.mahbubtour.uz/visa-photos/msg-1',
++    VISA_PERSONAL_PHOTO_URL_COLUMN,
+     undefined,
+     client,
+   );
+@@ -66,6 +70,7 @@
+     'sheet-1',
+     5,
+     'https://visa.mahbubtour.uz/visa-photos/msg-1',
++    VISA_PERSONAL_PHOTO_URL_COLUMN,
+     undefined,
+     client,
+   );
+@@ -82,6 +87,7 @@
+     'sheet-1',
+     5,
+     'https://visa.mahbubtour.uz/visa-photos/msg-1',
++    VISA_PERSONAL_PHOTO_URL_COLUMN,
+     'Live Tab Title',
+     client,
+   );
+@@ -103,9 +109,25 @@
+         'sheet-1',
+         5,
+         'https://visa.mahbubtour.uz/visa-photos/msg-1',
++        VISA_PERSONAL_PHOTO_URL_COLUMN,
+         undefined,
+         client,
+       ),
+     /quota exceeded/,
+   );
+ });
++
++test('writePersonalPhotoUrlIfBlank writes to the given column — the portrait column, independent from the photo column', async () => {
++  const { client, setArgs } = buildFakeClient('');
++
++  await writePersonalPhotoUrlIfBlank(
++    'sheet-1',
++    5,
++    'https://visa.mahbubtour.uz/visa-photos/portrait-token',
++    VISA_PERSONAL_PORTRAIT_URL_COLUMN,
++    undefined,
++    client,
++  );
++
++  assert.equal((setArgs[0] as { column: string }).column, 'V');
++});
+
+diff --git a/tests/visa.extractApplicantPhotoCrop.test.ts b/tests/visa.extractApplicantPhotoCrop.test.ts
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/tests/visa.extractApplicantPhotoCrop.test.ts
+@@ -0,0 +1,166 @@
++import assert from 'node:assert/strict';
++import { test } from 'node:test';
++import sharp from 'sharp';
++import { extractApplicantPhotoCrop, type ExtractApplicantPhotoCropDependencies } from '../src/visa/extractApplicantPhotoCrop.js';
++import type { VisionFaceAnnotation } from '../src/visa/computeApplicantPhotoCropRegion.js';
++
++const IMAGE_WIDTH = 800;
++const IMAGE_HEIGHT = 1000;
++
++async function makeSyntheticPassportImage(): Promise<Buffer> {
++  return sharp({
++    create: { width: IMAGE_WIDTH, height: IMAGE_HEIGHT, channels: 3, background: { r: 230, g: 230, b: 230 } },
++  })
++    .jpeg()
++    .toBuffer();
++}
++
++function box(x0: number, y0: number, x1: number, y1: number) {
++  return {
++    vertices: [
++      { x: x0, y: y0 },
++      { x: x1, y: y0 },
++      { x: x1, y: y1 },
++      { x: x0, y: y1 },
++    ],
++  };
++}
++
++function buildDeps(faces: VisionFaceAnnotation[], calls?: { count: number }): ExtractApplicantPhotoCropDependencies {
++  return {
++    detectFaces: async () => {
++      if (calls) calls.count += 1;
++      return { faces };
++    },
++  };
++}
++
++test('extractApplicantPhotoCrop returns a cropped buffer smaller than the original when a confident face is found', async () => {
++  const original = await makeSyntheticPassportImage();
++  const faces = [{ boundingPoly: box(100, 100, 220, 220), detectionConfidence: 0.95 }];
++  const deps = buildDeps(faces);
++
++  const cropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps);
++
++  assert.ok(cropped, 'expected a non-null cropped buffer');
++  assert.notEqual(cropped!.toString('base64'), original.toString('base64'), 'the cropped output must differ from the original full-passport image');
++
++  const croppedMeta = await sharp(cropped!).metadata();
++  assert.ok(croppedMeta.width! < IMAGE_WIDTH, 'the crop must be narrower than the original full-passport image');
++  assert.ok(croppedMeta.height! < IMAGE_HEIGHT, 'the crop must be shorter than the original full-passport image');
++});
++
++test('extractApplicantPhotoCrop returns null when Vision finds no faces at all — never falls back to the original image', async () => {
++  const original = await makeSyntheticPassportImage();
++  const deps = buildDeps([]);
++
++  const cropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps);
++
++  assert.equal(cropped, null);
++});
++
++test('extractApplicantPhotoCrop returns null when every detected face is below the confidence threshold', async () => {
++  const original = await makeSyntheticPassportImage();
++  const faces = [{ boundingPoly: box(100, 100, 220, 220), detectionConfidence: 0.1 }];
++  const deps = buildDeps(faces);
++
++  const cropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps);
++
++  assert.equal(cropped, null);
++});
++
++test('extractApplicantPhotoCrop rethrows (never returns null silently) when the Vision face-detection call itself fails', async () => {
++  const original = await makeSyntheticPassportImage();
++  const deps: ExtractApplicantPhotoCropDependencies = {
++    detectFaces: async () => {
++      throw new Error('7 PERMISSION_DENIED: Cloud Vision API has not been used in project ocrumra before or it is disabled');
++    },
++  };
++
++  await assert.rejects(() => extractApplicantPhotoCrop(original, 'image/jpeg', deps));
++});
++
++test('extractApplicantPhotoCrop calls detectFaces exactly once per invocation (one Vision call, never more)', async () => {
++  const original = await makeSyntheticPassportImage();
++  const faces = [{ boundingPoly: box(100, 100, 220, 220), detectionConfidence: 0.95 }];
++  const calls = { count: 0 };
++  const deps = buildDeps(faces, calls);
++
++  await extractApplicantPhotoCrop(original, 'image/jpeg', deps);
++
++  assert.equal(calls.count, 1);
++});
++
++test('extractApplicantPhotoCrop outputs a PNG buffer when mimeType is image/png', async () => {
++  const original = await sharp({
++    create: { width: IMAGE_WIDTH, height: IMAGE_HEIGHT, channels: 3, background: { r: 200, g: 200, b: 200 } },
++  })
++    .png()
++    .toBuffer();
++  const faces = [{ boundingPoly: box(100, 100, 220, 220), detectionConfidence: 0.95 }];
++  const deps = buildDeps(faces);
++
++  const cropped = await extractApplicantPhotoCrop(original, 'image/png', deps);
++
++  assert.ok(cropped);
++  const meta = await sharp(cropped!).metadata();
++  assert.equal(meta.format, 'png');
++});
++
++test('extractApplicantPhotoCrop outputs a WebP buffer when mimeType is image/webp', async () => {
++  const original = await sharp({
++    create: { width: IMAGE_WIDTH, height: IMAGE_HEIGHT, channels: 3, background: { r: 200, g: 200, b: 200 } },
++  })
++    .webp()
++    .toBuffer();
++  const faces = [{ boundingPoly: box(100, 100, 220, 220), detectionConfidence: 0.95 }];
++  const deps = buildDeps(faces);
++
++  const cropped = await extractApplicantPhotoCrop(original, 'image/webp', deps);
++
++  assert.ok(cropped);
++  const meta = await sharp(cropped!).metadata();
++  assert.equal(meta.format, 'webp');
++});
++
++test('extractApplicantPhotoCrop defaults to JPEG output for an unrecognized mimeType', async () => {
++  const original = await makeSyntheticPassportImage();
++  const faces = [{ boundingPoly: box(100, 100, 220, 220), detectionConfidence: 0.95 }];
++  const deps = buildDeps(faces);
++
++  const cropped = await extractApplicantPhotoCrop(original, 'application/octet-stream', deps);
++
++  assert.ok(cropped);
++  const meta = await sharp(cropped!).metadata();
++  assert.equal(meta.format, 'jpeg');
++});
++
++test('extractApplicantPhotoCrop produces a crop whose pixel region stays within the (EXIF-normalized) image bounds for a rotated input', async () => {
++  // Build a wide (landscape, 1000x800) image and tag it with EXIF
++  // orientation 6 (rotate 90deg CW on display) — sharp's rotate() with no
++  // arguments physically applies that tag, so the EFFECTIVE image this
++  // function operates on becomes a tall 800x1000 portrait, matching how a
++  // phone camera's sideways-held JPEG is normally displayed.
++  const landscape = await sharp({
++    create: { width: 1000, height: 800, channels: 3, background: { r: 210, g: 210, b: 210 } },
++  })
++    .withMetadata({ orientation: 6 })
++    .jpeg()
++    .toBuffer();
++
++  // After a 90deg CW rotation, pixel (x,y) in the original landscape maps
++  // near (height-1-y, x) in the rotated/display frame. A face placed at
++  // roughly the center of the ROTATED (800x1000) frame is used so this
++  // assertion doesn't depend on exactly reproducing that transform by hand.
++  const faces = [{ boundingPoly: box(350, 450, 450, 550), detectionConfidence: 0.95 }];
++  const deps = buildDeps(faces);
++
++  const cropped = await extractApplicantPhotoCrop(landscape, 'image/jpeg', deps);
++
++  assert.ok(cropped, 'expected a crop to be produced for an EXIF-rotated input');
++  const meta = await sharp(cropped!).metadata();
++  // The rotated/display frame is 800 wide x 1000 tall — the crop must fit
++  // inside that normalized frame, not the original un-rotated 1000x800 buffer.
++  assert.ok(meta.width! <= 800, 'crop width must fit within the EXIF-normalized (post-rotation) frame width');
++  assert.ok(meta.height! <= 1000, 'crop height must fit within the EXIF-normalized (post-rotation) frame height');
++});
+
+diff --git a/tests/visa.computeApplicantPhotoCropRegion.test.ts b/tests/visa.computeApplicantPhotoCropRegion.test.ts
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/tests/visa.computeApplicantPhotoCropRegion.test.ts
+@@ -0,0 +1,116 @@
++import assert from 'node:assert/strict';
++import { test } from 'node:test';
++import { computeApplicantPhotoCropRegion, type VisionFaceAnnotation } from '../src/visa/computeApplicantPhotoCropRegion.js';
++
++function box(x0: number, y0: number, x1: number, y1: number) {
++  return {
++    vertices: [
++      { x: x0, y: y0 },
++      { x: x1, y: y0 },
++      { x: x1, y: y1 },
++      { x: x0, y: y1 },
++    ],
++  };
++}
++
++function face(
++  boundingBox: ReturnType<typeof box> | null,
++  detectionConfidence: number | null = 0.9,
++): VisionFaceAnnotation {
++  return { boundingPoly: boundingBox, detectionConfidence };
++}
++
++test('computeApplicantPhotoCropRegion returns null when there are no faces at all', () => {
++  const region = computeApplicantPhotoCropRegion([], 1000, 1000);
++  assert.equal(region, null);
++});
++
++test('computeApplicantPhotoCropRegion expands a centrally-placed, high-confidence face into a larger rectangle', () => {
++  // A 100x100 face centered in a large 1000x1000 image, well away from any edge.
++  const faces = [face(box(450, 450, 550, 550), 0.95)];
++  const region = computeApplicantPhotoCropRegion(faces, 1000, 1000);
++
++  assert.ok(region, 'expected a non-null crop region');
++  assert.ok(region!.width > 100, 'the photo rectangle must be larger than the bare face width');
++  assert.ok(region!.height > 100, 'the photo rectangle must be larger than the bare face height');
++  // Expanded rectangle must still fully contain the original face box.
++  assert.ok(region!.left <= 450);
++  assert.ok(region!.top <= 450);
++  assert.ok(region!.left + region!.width >= 550);
++  assert.ok(region!.top + region!.height >= 550);
++});
++
++test('computeApplicantPhotoCropRegion clamps the expanded rectangle to the image bounds when the face sits near an edge', () => {
++  // Face in the top-left corner — expansion above/left of (0,0) must clamp, not go negative.
++  const faces = [face(box(0, 0, 80, 80), 0.9)];
++  const region = computeApplicantPhotoCropRegion(faces, 1000, 1000);
++
++  assert.ok(region, 'expected a non-null crop region even near an edge');
++  assert.ok(region!.left >= 0);
++  assert.ok(region!.top >= 0);
++  assert.ok(region!.left + region!.width <= 1000);
++  assert.ok(region!.top + region!.height <= 1000);
++});
++
++test('computeApplicantPhotoCropRegion ignores a face below the minimum detection confidence threshold', () => {
++  const faces = [face(box(400, 400, 600, 600), 0.2)];
++  const region = computeApplicantPhotoCropRegion(faces, 1000, 1000);
++  assert.equal(region, null, 'a low-confidence candidate must never produce a crop');
++});
++
++test('computeApplicantPhotoCropRegion treats a missing detectionConfidence as zero (never crops on an unscored candidate)', () => {
++  const faces = [face(box(400, 400, 600, 600), null)];
++  const region = computeApplicantPhotoCropRegion(faces, 1000, 1000);
++  assert.equal(region, null);
++});
++
++test('computeApplicantPhotoCropRegion picks the LARGEST confident face when multiple faces are present (e.g. a small hologram/ghost-photo artifact alongside the real photo)', () => {
++  const realFace = box(400, 400, 600, 600); // 200x200, large — the genuine printed photo's face
++  const ghostArtifact = box(50, 50, 80, 80); // 30x30, tiny — a spurious security-pattern match
++  const faces = [face(ghostArtifact, 0.8), face(realFace, 0.85)];
++  const region = computeApplicantPhotoCropRegion(faces, 1000, 1000);
++
++  assert.ok(region);
++  // The crop must be built around the large real face, not the tiny ghost artifact.
++  assert.ok(region!.left < 400 && region!.left > 100, 'crop should be anchored near the real face, not the ghost artifact');
++  assert.ok(region!.left + region!.width > 600);
++});
++
++test('computeApplicantPhotoCropRegion returns null when the resulting crop would be smaller than the minimum dimension (face is a sliver right at the image edge)', () => {
++  // A tiny, high-confidence face box crammed into the extreme corner such
++  // that most of its expansion clamps away, leaving a crop below the
++  // minimum size floor.
++  const faces = [face(box(0, 0, 10, 10), 0.99)];
++  const region = computeApplicantPhotoCropRegion(faces, 1000, 1000);
++  assert.equal(region, null, 'an undersized crop must never be returned — callers should skip the photo entirely instead');
++});
++
++test('computeApplicantPhotoCropRegion returns null for a face annotation with no boundingPoly at all', () => {
++  const faces: VisionFaceAnnotation[] = [{ boundingPoly: null, detectionConfidence: 0.95 }];
++  const region = computeApplicantPhotoCropRegion(faces, 1000, 1000);
++  assert.equal(region, null);
++});
++
++test('computeApplicantPhotoCropRegion returns null for a face annotation with an empty vertices array', () => {
++  const faces: VisionFaceAnnotation[] = [{ boundingPoly: { vertices: [] }, detectionConfidence: 0.95 }];
++  const region = computeApplicantPhotoCropRegion(faces, 1000, 1000);
++  assert.equal(region, null);
++});
++
++test('computeApplicantPhotoCropRegion returns null when the image has zero or negative dimensions', () => {
++  const faces = [face(box(10, 10, 100, 100), 0.95)];
++  assert.equal(computeApplicantPhotoCropRegion(faces, 0, 1000), null);
++  assert.equal(computeApplicantPhotoCropRegion(faces, 1000, 0), null);
++  assert.equal(computeApplicantPhotoCropRegion(faces, -5, 1000), null);
++});
++
++test('computeApplicantPhotoCropRegion never returns a region that exceeds the image bounds', () => {
++  // A very large face relative to a small image, to stress the clamp logic.
++  const faces = [face(box(5, 5, 95, 95), 0.9)];
++  const region = computeApplicantPhotoCropRegion(faces, 100, 100);
++  if (region) {
++    assert.ok(region.left >= 0 && region.top >= 0);
++    assert.ok(region.left + region.width <= 100);
++    assert.ok(region.top + region.height <= 100);
++  }
++});

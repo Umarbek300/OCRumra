@@ -3,6 +3,7 @@ import { after, test } from 'node:test';
 import { pool } from '../src/db/pool.js';
 import {
   createPassportOcrResult,
+  findPassportOcrResultByPersonalPhotoToken,
   findPassportOcrResultByTelegramMessageId,
   type CreatePassportOcrResultInput,
 } from '../src/db/repositories/passportOcrResult.repo.js';
@@ -192,6 +193,236 @@ test('createPassportOcrResult persists null values for every field when nothing 
     assert.equal(created.overallConfidence, 'low');
   } finally {
     await cleanup(fixture);
+  }
+});
+
+test('createPassportOcrResult persists a non-null personal_photo_object_path and it round-trips exactly', async () => {
+  const fixture = await createLinkedTelegramMessage();
+  try {
+    const created = await createPassportOcrResult({
+      ...sampleInput(fixture.telegramMessageId),
+      personalPhotoObjectPath: `visa-photos/${fixture.telegramMessageId}.jpg`,
+    });
+    assert.ok(created);
+    assert.equal(created.personalPhotoObjectPath, `visa-photos/${fixture.telegramMessageId}.jpg`);
+
+    const fetched = await findPassportOcrResultByTelegramMessageId(fixture.telegramMessageId);
+    assert.equal(fetched?.personalPhotoObjectPath, `visa-photos/${fixture.telegramMessageId}.jpg`);
+  } finally {
+    await cleanup(fixture);
+  }
+});
+
+test('createPassportOcrResult persists a null personal_photo_object_path when omitted (photo storage not configured, or upload failed)', async () => {
+  const fixture = await createLinkedTelegramMessage();
+  try {
+    const created = await createPassportOcrResult(sampleInput(fixture.telegramMessageId));
+    assert.ok(created);
+    assert.equal(created.personalPhotoObjectPath, null);
+  } finally {
+    await cleanup(fixture);
+  }
+});
+
+test('createPassportOcrResult persists personal_photo_token together with personal_photo_object_path and both round-trip exactly', async () => {
+  const fixture = await createLinkedTelegramMessage();
+  const token = `token-${fixture.telegramMessageId}`;
+  try {
+    const created = await createPassportOcrResult({
+      ...sampleInput(fixture.telegramMessageId),
+      personalPhotoObjectPath: `visa-photos/${fixture.telegramMessageId}.jpg`,
+      personalPhotoToken: token,
+    });
+    assert.ok(created);
+    assert.equal(created.personalPhotoToken, token);
+    assert.equal(created.personalPhotoObjectPath, `visa-photos/${fixture.telegramMessageId}.jpg`);
+
+    const fetchedByMessageId = await findPassportOcrResultByTelegramMessageId(fixture.telegramMessageId);
+    assert.equal(fetchedByMessageId?.personalPhotoToken, token);
+
+    const fetchedByToken = await findPassportOcrResultByPersonalPhotoToken(token);
+    assert.ok(fetchedByToken);
+    assert.equal(fetchedByToken.id, created.id);
+  } finally {
+    await cleanup(fixture);
+  }
+});
+
+test('createPassportOcrResult persists a null personal_photo_token when omitted', async () => {
+  const fixture = await createLinkedTelegramMessage();
+  try {
+    const created = await createPassportOcrResult(sampleInput(fixture.telegramMessageId));
+    assert.ok(created);
+    assert.equal(created.personalPhotoToken, null);
+  } finally {
+    await cleanup(fixture);
+  }
+});
+
+test('findPassportOcrResultByPersonalPhotoToken returns null for a value that matches no row (e.g. a telegram_message_id passed by mistake)', async () => {
+  const fixture = await createLinkedTelegramMessage();
+  try {
+    await createPassportOcrResult({
+      ...sampleInput(fixture.telegramMessageId),
+      personalPhotoToken: `token-${fixture.telegramMessageId}`,
+    });
+
+    const result = await findPassportOcrResultByPersonalPhotoToken(fixture.telegramMessageId);
+    assert.equal(result, null, 'a telegram_message_id must never resolve via the token lookup, even though a row with that message id exists');
+  } finally {
+    await cleanup(fixture);
+  }
+});
+
+test('the database enforces uniqueness of personal_photo_token across rows', async () => {
+  const fixtureA = await createLinkedTelegramMessage();
+  const fixtureB = await createLinkedTelegramMessage();
+  const sharedToken = `duplicate-token-${Date.now()}`;
+  try {
+    const first = await createPassportOcrResult({
+      ...sampleInput(fixtureA.telegramMessageId),
+      personalPhotoToken: sharedToken,
+    });
+    assert.ok(first);
+
+    await assert.rejects(
+      () =>
+        createPassportOcrResult({
+          ...sampleInput(fixtureB.telegramMessageId),
+          personalPhotoToken: sharedToken,
+        }),
+      /duplicate key value violates unique constraint/,
+    );
+  } finally {
+    await cleanup(fixtureA);
+    await cleanup(fixtureB);
+  }
+});
+
+// --- personal portrait (cropped) fields — fully independent from personal_photo_*, see migration 0027 ---
+
+test('createPassportOcrResult persists a non-null personal_portrait_object_path and it round-trips exactly, independent of personal_photo_object_path', async () => {
+  const fixture = await createLinkedTelegramMessage();
+  try {
+    const created = await createPassportOcrResult({
+      ...sampleInput(fixture.telegramMessageId),
+      personalPhotoObjectPath: `visa-photos/${fixture.telegramMessageId}.jpg`,
+      personalPortraitObjectPath: `visa-photos/${fixture.telegramMessageId}-portrait.jpg`,
+    });
+    assert.ok(created);
+    assert.equal(created.personalPhotoObjectPath, `visa-photos/${fixture.telegramMessageId}.jpg`);
+    assert.equal(created.personalPortraitObjectPath, `visa-photos/${fixture.telegramMessageId}-portrait.jpg`);
+    assert.notEqual(created.personalPortraitObjectPath, created.personalPhotoObjectPath);
+
+    const fetched = await findPassportOcrResultByTelegramMessageId(fixture.telegramMessageId);
+    assert.equal(fetched?.personalPortraitObjectPath, `visa-photos/${fixture.telegramMessageId}-portrait.jpg`);
+    assert.equal(fetched?.personalPhotoObjectPath, `visa-photos/${fixture.telegramMessageId}.jpg`);
+  } finally {
+    await cleanup(fixture);
+  }
+});
+
+test('createPassportOcrResult persists a null personal_portrait_object_path when omitted, even when personal_photo_object_path is set', async () => {
+  const fixture = await createLinkedTelegramMessage();
+  try {
+    const created = await createPassportOcrResult({
+      ...sampleInput(fixture.telegramMessageId),
+      personalPhotoObjectPath: `visa-photos/${fixture.telegramMessageId}.jpg`,
+    });
+    assert.ok(created);
+    assert.equal(created.personalPortraitObjectPath, null);
+    assert.equal(created.personalPhotoObjectPath, `visa-photos/${fixture.telegramMessageId}.jpg`);
+  } finally {
+    await cleanup(fixture);
+  }
+});
+
+test('createPassportOcrResult persists personal_portrait_token together with personal_portrait_object_path, and findPassportOcrResultByPersonalPhotoToken matches it too', async () => {
+  const fixture = await createLinkedTelegramMessage();
+  const photoToken = `photo-token-${fixture.telegramMessageId}`;
+  const portraitToken = `portrait-token-${fixture.telegramMessageId}`;
+  try {
+    const created = await createPassportOcrResult({
+      ...sampleInput(fixture.telegramMessageId),
+      personalPhotoObjectPath: `visa-photos/${fixture.telegramMessageId}.jpg`,
+      personalPhotoToken: photoToken,
+      personalPortraitObjectPath: `visa-photos/${fixture.telegramMessageId}-portrait.jpg`,
+      personalPortraitToken: portraitToken,
+    });
+    assert.ok(created);
+    assert.equal(created.personalPortraitToken, portraitToken);
+    assert.notEqual(created.personalPortraitToken, created.personalPhotoToken);
+
+    // The SAME lookup function used by the public /visa-photos/:token route
+    // must find this row via EITHER token — see applicantPhotoRoute.ts,
+    // which then picks the matching object path itself.
+    const fetchedByPhotoToken = await findPassportOcrResultByPersonalPhotoToken(photoToken);
+    assert.ok(fetchedByPhotoToken);
+    assert.equal(fetchedByPhotoToken.id, created.id);
+
+    const fetchedByPortraitToken = await findPassportOcrResultByPersonalPhotoToken(portraitToken);
+    assert.ok(fetchedByPortraitToken);
+    assert.equal(fetchedByPortraitToken.id, created.id);
+  } finally {
+    await cleanup(fixture);
+  }
+});
+
+test('createPassportOcrResult persists a null personal_portrait_token when omitted', async () => {
+  const fixture = await createLinkedTelegramMessage();
+  try {
+    const created = await createPassportOcrResult(sampleInput(fixture.telegramMessageId));
+    assert.ok(created);
+    assert.equal(created.personalPortraitToken, null);
+  } finally {
+    await cleanup(fixture);
+  }
+});
+
+test('the database enforces uniqueness of personal_portrait_token across rows, independent from the personal_photo_token uniqueness constraint', async () => {
+  const fixtureA = await createLinkedTelegramMessage();
+  const fixtureB = await createLinkedTelegramMessage();
+  const sharedPortraitToken = `duplicate-portrait-token-${Date.now()}`;
+  try {
+    const first = await createPassportOcrResult({
+      ...sampleInput(fixtureA.telegramMessageId),
+      personalPortraitToken: sharedPortraitToken,
+    });
+    assert.ok(first);
+
+    await assert.rejects(
+      () =>
+        createPassportOcrResult({
+          ...sampleInput(fixtureB.telegramMessageId),
+          personalPortraitToken: sharedPortraitToken,
+        }),
+      /duplicate key value violates unique constraint/,
+    );
+  } finally {
+    await cleanup(fixtureA);
+    await cleanup(fixtureB);
+  }
+});
+
+test('a personal_photo_token and a personal_portrait_token may safely share the same string value on DIFFERENT rows (independent unique indexes, no cross-column constraint)', async () => {
+  const fixtureA = await createLinkedTelegramMessage();
+  const fixtureB = await createLinkedTelegramMessage();
+  const sharedValue = `cross-column-value-${Date.now()}`;
+  try {
+    const first = await createPassportOcrResult({
+      ...sampleInput(fixtureA.telegramMessageId),
+      personalPhotoToken: sharedValue,
+    });
+    assert.ok(first);
+
+    const second = await createPassportOcrResult({
+      ...sampleInput(fixtureB.telegramMessageId),
+      personalPortraitToken: sharedValue,
+    });
+    assert.ok(second, 'the two unique indexes are on different columns, so this must succeed');
+  } finally {
+    await cleanup(fixtureA);
+    await cleanup(fixtureB);
   }
 });
 

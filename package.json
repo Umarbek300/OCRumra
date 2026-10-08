@@ -19,6 +19,8 @@
     "admin:register-group": "tsx src/admin/registerGroup.ts",
     "admin:register-agent": "tsx src/admin/registerAgent.ts",
     "admin:operator-command": "tsx src/admin/operatorCommand.ts",
+    "admin:split-link": "tsx src/admin/splitLink.ts",
+    "admin:merge-identities": "tsx src/admin/mergeIdentities.ts",
     "operator-command:worker": "tsx src/duplicates/start.ts",
     "queue:worker": "tsx src/worker/start.ts",
     "sheets:worker": "tsx src/sheets/start.ts",
@@ -27,6 +29,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.127.0",
+    "@google-cloud/storage": "^8.2.0",
     "@google-cloud/vision": "^6.1.0",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",

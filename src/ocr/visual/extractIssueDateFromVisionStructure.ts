@@ -51,6 +51,16 @@ export interface VisionWord {
 }
 export interface VisionParagraph {
   words?: VisionWord[] | null;
+  /**
+   * Optional: not read anywhere in this module (issue-date extraction works
+   * at word granularity — see flattenWords below), but the real Vision
+   * IParagraph proto always carries this, and the layout-aware applicant
+   * photo crop (src/visa/transformVisionCoordinates.ts) needs paragraph-
+   * level geometry. Added here, additively, so that module can accept the
+   * SAME VisionPage[] googleVisionProvider.ts already produces, instead of
+   * duplicating this whole loose type tree.
+   */
+  boundingBox?: VisionBoundingPoly | null;
 }
 export interface VisionBlock {
   paragraphs?: VisionParagraph[] | null;

@@ -202,6 +202,57 @@ export async function findActiveDuplicateCandidates(
   }));
 }
 
+export interface ApplicantPhotoAssetCandidate {
+  telegramMessageId: string;
+  /** ISO timestamp — the source message's own timestamp, used to pick the most recent asset on a tie. */
+  messageTimestamp: string;
+  personalPhotoToken: string | null;
+  personalPortraitToken: string | null;
+}
+
+/**
+ * Every ACTIVE link (canonical or duplicate — unlike findActiveDuplicateCandidates,
+ * which is duplicate-only) for a (identity, group) pair, joined against its
+ * own OCR result's photo/portrait tokens and the source message's timestamp
+ * — exactly the shape selectApplicantPhotoAssets.ts needs to fall back from
+ * a canonical message with no photo/portrait of its own to the most
+ * recently sent duplicate that does have one. A link whose telegram_message
+ * has no OCR result (should not normally happen, since a link is only ever
+ * created after OCR completes) is excluded rather than crashing the
+ * selection.
+ */
+export async function findApplicantPhotoAssetCandidates(
+  passportIdentityId: string,
+  groupId: string,
+): Promise<ApplicantPhotoAssetCandidate[]> {
+  const { rows } = await pool.query<{
+    telegram_message_id: string;
+    message_timestamp: string;
+    personal_photo_token: string | null;
+    personal_portrait_token: string | null;
+  }>(
+    `SELECT
+       pml.telegram_message_id,
+       tm.message_timestamp,
+       por.personal_photo_token,
+       por.personal_portrait_token
+     FROM passport_message_links pml
+     JOIN passport_ocr_results por ON por.telegram_message_id = pml.telegram_message_id
+     JOIN telegram_messages tm ON tm.id = pml.telegram_message_id
+     WHERE pml.passport_identity_id = $1
+       AND pml.group_id = $2
+       AND pml.role IN ('canonical', 'duplicate')
+       AND pml.link_status = 'active'`,
+    [passportIdentityId, groupId],
+  );
+  return rows.map((row) => ({
+    telegramMessageId: row.telegram_message_id,
+    messageTimestamp: row.message_timestamp,
+    personalPhotoToken: row.personal_photo_token,
+    personalPortraitToken: row.personal_portrait_token,
+  }));
+}
+
 /** Flips a link's role (canonical <-> duplicate). Used by canonical reassignment — see applyIdentityStateChange.ts for the transactional wrapper that changes two links together. */
 export async function setPassportMessageLinkRole(id: string, role: PassportLinkRole): Promise<PassportMessageLinkRecord | null> {
   const { rows } = await pool.query<PassportMessageLinkRow>(

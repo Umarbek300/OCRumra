@@ -10,6 +10,14 @@ export interface OcrField<T extends string = string> {
 
 export interface CreatePassportOcrResultInput {
   telegramMessageId: string;
+  /** Stable GCS object path for the applicant's personal photo (see src/visa/uploadApplicantPhoto.ts) — null when photo storage isn't configured, or the upload attempt failed. Never a public URL, never a bucket-qualified URI. */
+  personalPhotoObjectPath?: string | null;
+  /** Dedicated, cryptographically random public URL token (see generateApplicantPhotoToken.ts) — generated ONLY alongside a successful upload, never derived from telegram_message_id or any other existing identifier. Null whenever personalPhotoObjectPath is null. */
+  personalPhotoToken?: string | null;
+  /** Stable GCS object path for the applicant's CROPPED portrait — a SEPARATE artifact from personalPhotoObjectPath (the original, full, uncropped passport image). See src/visa/uploadApplicantPhoto.ts's uploadApplicantPortrait and extractApplicantPhotoCrop.ts. Null when no reliable face region was found, photo storage isn't configured, or the upload failed. */
+  personalPortraitObjectPath?: string | null;
+  /** Dedicated, cryptographically random public URL token for the cropped portrait — independent from personalPhotoToken, generated ONLY alongside a successful portrait upload. Null whenever personalPortraitObjectPath is null. */
+  personalPortraitToken?: string | null;
   firstName: OcrField;
   middleName: OcrField;
   surname: OcrField;
@@ -30,6 +38,14 @@ export interface CreatePassportOcrResultInput {
 
 export interface PassportOcrResultRecord extends CreatePassportOcrResultInput {
   id: string;
+  /** Always present (never undefined) on a record read back from the DB — null simply means no photo has been uploaded yet. */
+  personalPhotoObjectPath: string | null;
+  /** Always present (never undefined) on a record read back from the DB. */
+  personalPhotoToken: string | null;
+  /** Always present (never undefined) on a record read back from the DB — null simply means no portrait crop has been uploaded yet. */
+  personalPortraitObjectPath: string | null;
+  /** Always present (never undefined) on a record read back from the DB. */
+  personalPortraitToken: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -37,6 +53,10 @@ export interface PassportOcrResultRecord extends CreatePassportOcrResultInput {
 interface PassportOcrResultRow {
   id: string;
   telegram_message_id: string;
+  personal_photo_object_path: string | null;
+  personal_photo_token: string | null;
+  personal_portrait_object_path: string | null;
+  personal_portrait_token: string | null;
   first_name: string | null;
   first_name_confidence: OcrConfidenceLevel | null;
   middle_name: string | null;
@@ -73,6 +93,10 @@ function mapRow(row: PassportOcrResultRow): PassportOcrResultRecord {
   return {
     id: row.id,
     telegramMessageId: row.telegram_message_id,
+    personalPhotoObjectPath: row.personal_photo_object_path,
+    personalPhotoToken: row.personal_photo_token,
+    personalPortraitObjectPath: row.personal_portrait_object_path,
+    personalPortraitToken: row.personal_portrait_token,
     firstName: { value: row.first_name, confidence: row.first_name_confidence },
     middleName: { value: row.middle_name, confidence: row.middle_name_confidence },
     surname: { value: row.surname, confidence: row.surname_confidence },
@@ -95,7 +119,8 @@ function mapRow(row: PassportOcrResultRow): PassportOcrResultRecord {
 }
 
 const SELECT_COLUMNS = `
-  id, telegram_message_id,
+  id, telegram_message_id, personal_photo_object_path, personal_photo_token,
+  personal_portrait_object_path, personal_portrait_token,
   first_name, first_name_confidence, middle_name, middle_name_confidence,
   surname, surname_confidence, passport_number, passport_number_confidence,
   date_of_birth, date_of_birth_confidence,
@@ -117,7 +142,8 @@ export async function createPassportOcrResult(
 ): Promise<PassportOcrResultRecord | null> {
   const { rows } = await pool.query<PassportOcrResultRow>(
     `INSERT INTO passport_ocr_results (
-       telegram_message_id,
+       telegram_message_id, personal_photo_object_path, personal_photo_token,
+       personal_portrait_object_path, personal_portrait_token,
        first_name, first_name_confidence, middle_name, middle_name_confidence,
        surname, surname_confidence, passport_number, passport_number_confidence,
        date_of_birth, date_of_birth_confidence,
@@ -128,21 +154,26 @@ export async function createPassportOcrResult(
        issuing_authority, issuing_authority_confidence, mrz, mrz_confidence,
        overall_confidence, raw_response, provider, model
      ) VALUES (
-       $1,
-       $2,$3,$4,$5,
+       $1,$2,$3,
+       $4,$5,
        $6,$7,$8,$9,
-       $10,$11,
-       $12,$13,
+       $10,$11,$12,$13,
        $14,$15,
-       $16,$17,$18,$19,
-       $20,$21,
-       $22,$23,$24,$25,
-       $26,$27,$28,$29
+       $16,$17,
+       $18,$19,
+       $20,$21,$22,$23,
+       $24,$25,
+       $26,$27,$28,$29,
+       $30,$31,$32,$33
      )
      ON CONFLICT (telegram_message_id) DO NOTHING
      RETURNING ${SELECT_COLUMNS}`,
     [
       input.telegramMessageId,
+      input.personalPhotoObjectPath ?? null,
+      input.personalPhotoToken ?? null,
+      input.personalPortraitObjectPath ?? null,
+      input.personalPortraitToken ?? null,
       input.firstName.value,
       input.firstName.confidence,
       input.middleName.value,
@@ -183,6 +214,34 @@ export async function findPassportOcrResultByTelegramMessageId(
   const { rows } = await pool.query<PassportOcrResultRow>(
     `SELECT ${SELECT_COLUMNS} FROM passport_ocr_results WHERE telegram_message_id = $1`,
     [telegramMessageId],
+  );
+  const row = rows[0];
+  return row ? mapRow(row) : null;
+}
+
+/**
+ * The ONLY lookup the public /visa-photos/:token route is allowed to use
+ * (see applicantPhotoRoute.ts) — deliberately a separate function from
+ * findPassportOcrResultByTelegramMessageId above, so that route can never
+ * be refactored into accidentally accepting a telegram_message_id (or any
+ * other existing identifier) as the public token. Matches against
+ * personal_photo_token OR personal_portrait_token — the same opaque-token
+ * public route serves both the original passport image and the cropped
+ * portrait, since a token's value alone can never collide between the two
+ * (each is independently generated, see generateApplicantPhotoToken.ts) and
+ * the partial unique index on each column already guarantees no collision
+ * within a column. The caller (applicantPhotoRoute.ts) is responsible for
+ * checking which of the two token fields on the returned row actually
+ * equals the requested token, to pick the matching object path. A
+ * telegram_message_id, passport number, or any other value passed here
+ * simply won't match any row.
+ */
+export async function findPassportOcrResultByPersonalPhotoToken(
+  token: string,
+): Promise<PassportOcrResultRecord | null> {
+  const { rows } = await pool.query<PassportOcrResultRow>(
+    `SELECT ${SELECT_COLUMNS} FROM passport_ocr_results WHERE personal_photo_token = $1 OR personal_portrait_token = $1`,
+    [token],
   );
   const row = rows[0];
   return row ? mapRow(row) : null;

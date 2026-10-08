@@ -117,7 +117,13 @@ export function createGoogleVisionProvider(deps: GoogleVisionProviderDependencie
       const { validWinner } = selectMrzCandidateWinner(windows);
 
       if (!validWinner) {
-        return buildUnreadableMrzResult([], GOOGLE_VISION_PROVIDER_MODEL);
+        // pages is still attached even on this "unreadable MRZ" path --
+        // the DOCUMENT_TEXT_DETECTION call already succeeded and its
+        // structured geometry remains useful for the applicant portrait
+        // crop's layout-aware constraints (see extractApplicantPhotoCrop.ts)
+        // regardless of whether the flat-text checksum validator found a
+        // valid MRZ in this same response.
+        return { ...buildUnreadableMrzResult([], GOOGLE_VISION_PROVIDER_MODEL), visionPages: pages };
       }
 
       // Already-known MRZ-derived dates (DOB, expiry) — passed to
@@ -155,12 +161,10 @@ export function createGoogleVisionProvider(deps: GoogleVisionProviderDependencie
         `[google-vision] visualIssueDateFound=${visualIssueDate !== null} flatTextIssueDateFound=${flatTextIssueDate !== null}`,
       );
 
-      return mapMrzToExtractionResult(
-        validWinner.parsed,
-        validWinner.lines,
-        GOOGLE_VISION_PROVIDER_MODEL,
-        issueDate,
-      );
+      return {
+        ...mapMrzToExtractionResult(validWinner.parsed, validWinner.lines, GOOGLE_VISION_PROVIDER_MODEL, issueDate),
+        visionPages: pages,
+      };
     },
   };
 }

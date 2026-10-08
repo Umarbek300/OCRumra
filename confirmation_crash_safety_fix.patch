@@ -1,0 +1,290 @@
+diff --git a/src/sheets/syncPassportRowToSheet.ts b/src/sheets/syncPassportRowToSheet.ts
+index 9e3affb..8cc43b8 100644
+--- a/src/sheets/syncPassportRowToSheet.ts
++++ b/src/sheets/syncPassportRowToSheet.ts
+@@ -7,7 +7,6 @@ import {
+ } from '../db/repositories/passportMessageLinks.repo.js';
+ import { findPassportOcrResultByTelegramMessageId } from '../db/repositories/passportOcrResult.repo.js';
+ import {
+-  clearSheetSyncConfirmationSent,
+   MAX_SHEET_SYNC_ATTEMPTS,
+   markSheetSyncConfirmationSent,
+   markSheetSyncFailed,
+@@ -41,6 +40,14 @@ export function computeSheetSyncBackoff(attempts: number, now: () => Date = () =
+ 
+ interface SendPassportConfirmationInput {
+   sheetSyncQueueId: string;
++  /**
++   * Whether this job's confirmation was already recorded as sent, as of the
++   * SAME atomic claim markSheetSyncStarted returned for this run (see
++   * syncPassportRowToSheet's own `claimed.confirmationSentAt`). This is the
++   * sole duplicate-send guard — see this function's own doc comment for why
++   * it is sufficient.
++   */
++  alreadySent: boolean;
+   telegramChatId: string;
+   ocrResult: Parameters<typeof buildConfirmationMessage>[0]['ocrResult'];
+   agent: Parameters<typeof buildConfirmationMessage>[0]['agent'];
+@@ -50,9 +57,40 @@ interface SendPassportConfirmationInput {
+   sheetRowNumber: number;
+ }
+ 
++/**
++ * Sends the post-sync Telegram confirmation, then records confirmation_sent_at
++ * — in that order, never the reverse. The previous implementation called
++ * markSheetSyncConfirmationSent BEFORE sending, rolling it back only if
++ * sendConfirmation threw; that left a real crash window (the worker process
++ * being killed/OOM'd/restarted between the successful DB write and the
++ * Telegram API call actually completing) where confirmation_sent_at would be
++ * permanently non-null even though no Telegram message was ever delivered —
++ * exactly the production symptom observed on telegram_message 320
++ * (synced_at and confirmation_sent_at both set, no corresponding Telegram
++ * send ever logged). Marking AFTER a successful send closes that window: the
++ * column can now only ever read "sent" when Telegram actually accepted the
++ * message.
++ *
++ * Duplicate-send safety: `alreadySent` is read once, from the SAME atomic
++ * claim markSheetSyncStarted already won for this run (status 'syncing' is
++ * held exclusively for this job's id for the whole duration of
++ * syncPassportRowToSheet, including this call) — so no second, concurrent
++ * execution of this function can ever be in flight for the same job at the
++ * same time. The only way this function runs again for an already-attempted
++ * job is a LATER, SEQUENTIAL retry (e.g. a crashed worker's stale 'syncing'
++ * row recovered back to 'pending' and reprocessed), which is exactly what
++ * `alreadySent` guards against re-sending for.
++ *
++ * This still cannot make send+mark perfectly atomic across a process crash:
++ * if the process is killed in the narrow window after Telegram has already
++ * accepted the message but before markSheetSyncConfirmationSent commits, a
++ * later retry will see alreadySent=false and send one duplicate
++ * confirmation. That is a deliberate, accepted tradeoff — an occasional
++ * duplicate "qabul qilindi" message is far less harmful than silently and
++ * permanently recording a confirmation as sent when it never was.
++ */
+ async function sendPassportConfirmation(input: SendPassportConfirmationInput, deps: SyncPassportRowToSheetDependencies): Promise<void> {
+-  const claimed = await deps.markConfirmationSent(input.sheetSyncQueueId);
+-  if (!claimed) {
++  if (input.alreadySent) {
+     return;
+   }
+ 
+@@ -65,12 +103,10 @@ async function sendPassportConfirmation(input: SendPassportConfirmationInput, de
+     sheetRowNumber: input.sheetRowNumber,
+   });
+ 
+-  try {
+-    await deps.sendConfirmation(input.telegramChatId, text);
+-  } catch (error) {
+-    await deps.clearConfirmationSent(input.sheetSyncQueueId);
+-    throw error;
+-  }
++  await deps.sendConfirmation(input.telegramChatId, text);
++
++  // Reached only once Telegram has actually accepted the message above.
++  await deps.markConfirmationSent(input.sheetSyncQueueId);
+ }
+ 
+ export interface SyncPassportRowToSheetDependencies {
+@@ -78,7 +114,6 @@ export interface SyncPassportRowToSheetDependencies {
+   markSynced: typeof markSheetSyncSynced;
+   markFailed: typeof markSheetSyncFailed;
+   markConfirmationSent: typeof markSheetSyncConfirmationSent;
+-  clearConfirmationSent: typeof clearSheetSyncConfirmationSent;
+   sendConfirmation: typeof sendConfirmationMessage;
+   findTelegramMessage: typeof findTelegramMessageById;
+   findOcrResult: typeof findPassportOcrResultByTelegramMessageId;
+@@ -98,7 +133,6 @@ const defaultDependencies: SyncPassportRowToSheetDependencies = {
+   markSynced: markSheetSyncSynced,
+   markFailed: markSheetSyncFailed,
+   markConfirmationSent: markSheetSyncConfirmationSent,
+-  clearConfirmationSent: clearSheetSyncConfirmationSent,
+   sendConfirmation: sendConfirmationMessage,
+   findTelegramMessage: findTelegramMessageById,
+   findOcrResult: findPassportOcrResultByTelegramMessageId,
+@@ -206,6 +240,7 @@ export async function syncPassportRowToSheet(
+       await sendPassportConfirmation(
+         {
+           sheetSyncQueueId: claimed.id,
++          alreadySent: claimed.confirmationSentAt !== null,
+           telegramChatId: telegramMessage.telegramChatId,
+           ocrResult,
+           agent,
+diff --git a/src/db/repositories/sheetSyncQueue.repo.ts b/src/db/repositories/sheetSyncQueue.repo.ts
+index 836455e..b37e1b8 100644
+--- a/src/db/repositories/sheetSyncQueue.repo.ts
++++ b/src/db/repositories/sheetSyncQueue.repo.ts
+@@ -246,16 +246,18 @@ export async function recoverStaleSyncingJobs(
+ }
+ 
+ /**
+- * Atomically claims the right to send this job's post-sync Telegram
+- * confirmation: sets confirmation_sent_at = now() only if it is still NULL,
+- * same "claim guard" shape as markSheetSyncStarted. Returns null if a
+- * confirmation was already sent (or being sent) for this job, so the caller
+- * knows to skip sending — the sole guard against a duplicate confirmation
+- * message, including for a job an operator manually resets and re-syncs.
++ * Records that this job's post-sync Telegram confirmation was ACTUALLY sent:
++ * sets confirmation_sent_at = now(), guarded by "only if it is still NULL" as
++ * defense in depth. The caller (see syncPassportRowToSheet.ts) is expected to
++ * call this ONLY AFTER the Telegram sendMessage call has already succeeded —
++ * never before — so this column can never read "sent" for a confirmation
++ * that was never actually delivered (e.g. the process crashing mid-send).
+  *
+- * The caller is expected to send the message only after winning this claim.
+- * If the send then fails, call clearSheetSyncConfirmationSent to allow a
+- * future attempt to try again — see syncPassportRowToSheet.ts.
++ * The primary duplicate-send guard is the caller's own check of
++ * confirmation_sent_at (read from the SAME atomic claim markSheetSyncStarted
++ * already returned for this run) before ever attempting a send at all — see
++ * syncPassportRowToSheet.ts's sendPassportConfirmation. The IS NULL guard
++ * here is a second, redundant layer, not the primary mechanism.
+  */
+ export async function markSheetSyncConfirmationSent(id: string): Promise<SheetSyncQueueRecord | null> {
+   const { rows } = await pool.query<SheetSyncQueueRow>(
+@@ -270,11 +272,13 @@ export async function markSheetSyncConfirmationSent(id: string): Promise<SheetSy
+ }
+ 
+ /**
+- * Rolls back a confirmation claim after the actual Telegram send failed, so
+- * confirmation_sent_at keeps meaning "successfully sent" rather than
+- * "attempted". Unconditional by id (no WHERE ... IS NULL guard) — only ever
+- * called by the same code path that just won the claim via
+- * markSheetSyncConfirmationSent, so there is no concurrent claim to disturb.
++ * Clears a confirmation_sent_at that was set in error, so a later attempt can
++ * still send. Not currently called by syncPassportRowToSheet.ts (which now
++ * calls markSheetSyncConfirmationSent only after a successful send, so there
++ * is nothing to roll back on a send failure — see that module's own doc
++ * comment) — kept as a standalone, independently-tested repository primitive
++ * for any future caller (e.g. an operator tool) that needs to reset a
++ * wrongly-marked row.
+  */
+ export async function clearSheetSyncConfirmationSent(id: string): Promise<void> {
+   await pool.query(`UPDATE sheet_sync_queue SET confirmation_sent_at = NULL WHERE id = $1`, [id]);
+diff --git a/tests/sheets.syncPassportRowToSheet.test.ts b/tests/sheets.syncPassportRowToSheet.test.ts
+index 0c1d878..67e9868 100644
+--- a/tests/sheets.syncPassportRowToSheet.test.ts
++++ b/tests/sheets.syncPassportRowToSheet.test.ts
+@@ -104,7 +104,6 @@ interface Calls {
+   computeGenderStats: number;
+   writeGenderSummary: number;
+   markConfirmationSent: number;
+-  clearConfirmationSent: number;
+   sendConfirmation: number;
+ }
+ 
+@@ -117,8 +116,14 @@ interface BuildDepsOptions {
+   claimResult?: SheetSyncQueueRecord | null;
+   upsertRowImpl?: SyncPassportRowToSheetDependencies['upsertRow'];
+   writeGenderSummaryImpl?: SyncPassportRowToSheetDependencies['writeGenderSummary'];
+-  /** null simulates "a confirmation was already sent for this job" (the atomic claim losing/no-op). */
+-  confirmationClaimResult?: SheetSyncQueueRecord | null;
++  /**
++   * true simulates re-processing a job whose confirmation was ALREADY
++   * recorded as sent on a prior attempt (e.g. a crash-recovered retry) —
++   * sets the claimed job's own confirmationSentAt, which is what
++   * syncPassportRowToSheet now reads to decide whether to (re)send at all.
++   * Ignored if `claimResult` is also given (that takes full control instead).
++   */
++  confirmationAlreadySent?: boolean;
+   sendConfirmationImpl?: SyncPassportRowToSheetDependencies['sendConfirmation'];
+   messageLink?: Awaited<ReturnType<SyncPassportRowToSheetDependencies['findMessageLink']>>;
+   activeCanonicalLink?: Awaited<ReturnType<SyncPassportRowToSheetDependencies['findActiveCanonicalLink']>>;
+@@ -149,7 +154,6 @@ function buildDeps(options: BuildDepsOptions = {}): {
+     computeGenderStats: 0,
+     writeGenderSummary: 0,
+     markConfirmationSent: 0,
+-    clearConfirmationSent: 0,
+     sendConfirmation: 0,
+   };
+   const syncedArgs: unknown[] = [];
+@@ -160,7 +164,10 @@ function buildDeps(options: BuildDepsOptions = {}): {
+   const deps: SyncPassportRowToSheetDependencies = {
+     markStarted: async () => {
+       calls.markStarted += 1;
+-      return options.claimResult !== undefined ? options.claimResult : CLAIMED_JOB;
++      if (options.claimResult !== undefined) return options.claimResult;
++      return options.confirmationAlreadySent
++        ? { ...CLAIMED_JOB, confirmationSentAt: '2025-12-31T00:00:00.000Z' }
++        : CLAIMED_JOB;
+     },
+     markSynced: async (id, sheetRowNumber) => {
+       calls.markSynced += 1;
+@@ -214,12 +221,8 @@ function buildDeps(options: BuildDepsOptions = {}): {
+       }),
+     markConfirmationSent: async (id) => {
+       calls.markConfirmationSent += 1;
+-      if (options.confirmationClaimResult !== undefined) return options.confirmationClaimResult;
+       return { ...CLAIMED_JOB, status: 'synced', confirmationSentAt: '2026-01-01T00:00:00.000Z' };
+     },
+-    clearConfirmationSent: async () => {
+-      calls.clearConfirmationSent += 1;
+-    },
+     sendConfirmation:
+       options.sendConfirmationImpl ??
+       (async (telegramChatId, text) => {
+@@ -539,17 +542,39 @@ test('syncPassportRowToSheet never sends a confirmation when the Sheets write it
+   assert.equal(calls.sendConfirmation, 0);
+ });
+ 
+-test('syncPassportRowToSheet skips sending when the confirmation claim reports it was already sent (duplicate-prevention)', async () => {
+-  const { deps, calls } = buildDeps({ confirmationClaimResult: null });
++test('syncPassportRowToSheet skips sending entirely when this job\'s own claim already shows a confirmation was sent (crash-recovery retry safety)', async () => {
++  const { deps, calls } = buildDeps({ confirmationAlreadySent: true });
+ 
+   await syncPassportRowToSheet('job-1', deps);
+ 
+   assert.equal(calls.markSynced, 1, 'the sheet sync itself still succeeds and is recorded');
+-  assert.equal(calls.markConfirmationSent, 1, 'still attempts the atomic claim...');
+-  assert.equal(calls.sendConfirmation, 0, '...but sends nothing once the claim reports it lost/already-sent');
++  assert.equal(calls.sendConfirmation, 0, 'must never resend a confirmation already recorded as delivered');
++  assert.equal(calls.markConfirmationSent, 0, 'must not even re-attempt marking an already-sent confirmation');
++});
++
++test('syncPassportRowToSheet marks confirmation_sent_at ONLY AFTER the Telegram send has actually succeeded — never before (crash-safety regression guard)', async () => {
++  const order: string[] = [];
++  const { deps } = buildDeps({
++    sendConfirmationImpl: async () => {
++      order.push('send');
++    },
++  });
++  const realMarkConfirmationSent = deps.markConfirmationSent;
++  deps.markConfirmationSent = async (id) => {
++    order.push('mark');
++    return realMarkConfirmationSent(id);
++  };
++
++  await syncPassportRowToSheet('job-1', deps);
++
++  assert.deepEqual(
++    order,
++    ['send', 'mark'],
++    'marking confirmation_sent_at before the send completes would let a worker crash in between record a confirmation that was never actually delivered to Telegram',
++  );
+ });
+ 
+-test('syncPassportRowToSheet rolls back the confirmation claim and does not affect job status when the Telegram send itself throws', async () => {
++test('syncPassportRowToSheet never marks confirmation_sent_at when the Telegram send itself throws, so a later attempt can still try again', async () => {
+   const { deps, calls } = buildDeps({
+     sendConfirmationImpl: async () => {
+       throw new Error('Telegram API error: bot was blocked by the user');
+@@ -560,7 +585,7 @@ test('syncPassportRowToSheet rolls back the confirmation claim and does not affe
+ 
+   assert.equal(calls.markSynced, 1, 'the job is still recorded as synced — a notification failure must never look like a Sheets failure');
+   assert.equal(calls.markFailed, 0, 'must never flip an already-synced job back to failed just because the confirmation send failed');
+-  assert.equal(calls.clearConfirmationSent, 1, 'rolls back the claim so a later attempt could still try again');
++  assert.equal(calls.markConfirmationSent, 0, 'confirmation_sent_at must stay null when the send never actually succeeded, so a future retry still attempts it');
+ });
+ 
+ test('syncPassportRowToSheet never logs raw OCR/passport field values when the confirmation send fails', async () => {
+diff --git a/tests/sheets.runSheetSyncLoop.test.ts b/tests/sheets.runSheetSyncLoop.test.ts
+index 9d54cba..32266d0 100644
+--- a/tests/sheets.runSheetSyncLoop.test.ts
++++ b/tests/sheets.runSheetSyncLoop.test.ts
+@@ -468,7 +468,6 @@ test('two concurrent syncPassportRowToSheet calls for the same real queue row ca
+       computeGenderStats: async () => ({ male: 0, female: 0, unspecified: 0, total: 0 }),
+       writeGenderSummary: async () => {},
+       markConfirmationSent: sheetSyncQueueRepo.markSheetSyncConfirmationSent,
+-      clearConfirmationSent: sheetSyncQueueRepo.clearSheetSyncConfirmationSent,
+       sendConfirmation: async () => {},
+       // Duplicate-passport canonical resolution (src/duplicates/) — no link
+       // for this fixture, so it resolves to the job's own message, exactly

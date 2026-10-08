@@ -1,13 +1,14 @@
+import { env } from '../config/env.js';
 import { findAgentById } from '../db/repositories/agents.repo.js';
 import { computeGroupGenderStats } from '../db/repositories/groupGenderStats.repo.js';
 import { findGroupById } from '../db/repositories/groups.repo.js';
 import {
   findActiveCanonicalLink,
+  findApplicantPhotoAssetCandidates,
   findPassportMessageLinkByTelegramMessageId,
 } from '../db/repositories/passportMessageLinks.repo.js';
 import { findPassportOcrResultByTelegramMessageId } from '../db/repositories/passportOcrResult.repo.js';
 import {
-  clearSheetSyncConfirmationSent,
   MAX_SHEET_SYNC_ATTEMPTS,
   markSheetSyncConfirmationSent,
   markSheetSyncFailed,
@@ -18,10 +19,14 @@ import { findTelegramMessageById } from '../db/repositories/telegramMessages.rep
 import { buildConfirmationMessage } from '../telegram/buildConfirmationMessage.js';
 import { calculateBalance, formatMoneyForSheet, parsePackageAndDeposit } from '../telegram/parsePackageDeposit.js';
 import { sendConfirmationMessage } from '../telegram/sendConfirmationMessage.js';
+import { buildApplicantPhotoPublicUrl, buildApplicantPortraitPublicUrl } from '../visa/applicantPhotoUrl.js';
+import { VISA_PERSONAL_PHOTO_URL_COLUMN } from '../visa/visaSheetColumns.js';
+import { writePersonalPhotoUrlIfBlank, writePersonalPortraitUrlIfBlank } from '../visa/writePersonalPhotoUrlIfBlank.js';
 import { buildGenderSummaryBlock } from './buildGenderSummaryBlock.js';
 import { buildSheetRow } from './buildSheetRow.js';
 import { ensureGroupSheet } from './ensureGroupSheet.js';
-import { upsertRowInSheet } from './upsertRowInSheet.js';
+import { selectApplicantPhotoAssets, type SelectedApplicantPhotoAssets } from './selectApplicantPhotoAssets.js';
+import { buildRealSheetTitleResolver, upsertRowInSheet, type ResolveSheetTitleByGid } from './upsertRowInSheet.js';
 import { writeGroupGenderSummary } from './writeGroupGenderSummary.js';
 
 const MAX_ERROR_MESSAGE_LENGTH = 300;
@@ -43,6 +48,14 @@ export function computeSheetSyncBackoff(attempts: number, now: () => Date = () =
 
 interface SendPassportConfirmationInput {
   sheetSyncQueueId: string;
+  /**
+   * Whether this job's confirmation was already recorded as sent, as of the
+   * SAME atomic claim markSheetSyncStarted returned for this run (see
+   * syncPassportRowToSheet's own `claimed.confirmationSentAt`). This is the
+   * sole duplicate-send guard — see this function's own doc comment for why
+   * it is sufficient.
+   */
+  alreadySent: boolean;
   telegramChatId: string;
   ocrResult: Parameters<typeof buildConfirmationMessage>[0]['ocrResult'];
   agent: Parameters<typeof buildConfirmationMessage>[0]['agent'];
@@ -53,15 +66,39 @@ interface SendPassportConfirmationInput {
 }
 
 /**
- * Claims the confirmation-send right (at-most-once, see
- * markSheetSyncConfirmationSent), sends the message, and rolls the claim
- * back if the send itself throws so a later attempt can still try. A null
- * claim result (someone already sent it) is a normal, silent no-op — not an
- * error.
+ * Sends the post-sync Telegram confirmation, then records confirmation_sent_at
+ * — in that order, never the reverse. The previous implementation called
+ * markSheetSyncConfirmationSent BEFORE sending, rolling it back only if
+ * sendConfirmation threw; that left a real crash window (the worker process
+ * being killed/OOM'd/restarted between the successful DB write and the
+ * Telegram API call actually completing) where confirmation_sent_at would be
+ * permanently non-null even though no Telegram message was ever delivered —
+ * exactly the production symptom observed on telegram_message 320
+ * (synced_at and confirmation_sent_at both set, no corresponding Telegram
+ * send ever logged). Marking AFTER a successful send closes that window: the
+ * column can now only ever read "sent" when Telegram actually accepted the
+ * message.
+ *
+ * Duplicate-send safety: `alreadySent` is read once, from the SAME atomic
+ * claim markSheetSyncStarted already won for this run (status 'syncing' is
+ * held exclusively for this job's id for the whole duration of
+ * syncPassportRowToSheet, including this call) — so no second, concurrent
+ * execution of this function can ever be in flight for the same job at the
+ * same time. The only way this function runs again for an already-attempted
+ * job is a LATER, SEQUENTIAL retry (e.g. a crashed worker's stale 'syncing'
+ * row recovered back to 'pending' and reprocessed), which is exactly what
+ * `alreadySent` guards against re-sending for.
+ *
+ * This still cannot make send+mark perfectly atomic across a process crash:
+ * if the process is killed in the narrow window after Telegram has already
+ * accepted the message but before markSheetSyncConfirmationSent commits, a
+ * later retry will see alreadySent=false and send one duplicate
+ * confirmation. That is a deliberate, accepted tradeoff — an occasional
+ * duplicate "qabul qilindi" message is far less harmful than silently and
+ * permanently recording a confirmation as sent when it never was.
  */
 async function sendPassportConfirmation(input: SendPassportConfirmationInput, deps: SyncPassportRowToSheetDependencies): Promise<void> {
-  const claimed = await deps.markConfirmationSent(input.sheetSyncQueueId);
-  if (!claimed) {
+  if (input.alreadySent) {
     return;
   }
 
@@ -74,12 +111,10 @@ async function sendPassportConfirmation(input: SendPassportConfirmationInput, de
     sheetRowNumber: input.sheetRowNumber,
   });
 
-  try {
-    await deps.sendConfirmation(input.telegramChatId, text);
-  } catch (error) {
-    await deps.clearConfirmationSent(input.sheetSyncQueueId);
-    throw error;
-  }
+  await deps.sendConfirmation(input.telegramChatId, text);
+
+  // Reached only once Telegram has actually accepted the message above.
+  await deps.markConfirmationSent(input.sheetSyncQueueId);
 }
 
 export interface SyncPassportRowToSheetDependencies {
@@ -87,7 +122,6 @@ export interface SyncPassportRowToSheetDependencies {
   markSynced: typeof markSheetSyncSynced;
   markFailed: typeof markSheetSyncFailed;
   markConfirmationSent: typeof markSheetSyncConfirmationSent;
-  clearConfirmationSent: typeof clearSheetSyncConfirmationSent;
   sendConfirmation: typeof sendConfirmationMessage;
   findTelegramMessage: typeof findTelegramMessageById;
   findOcrResult: typeof findPassportOcrResultByTelegramMessageId;
@@ -100,6 +134,14 @@ export interface SyncPassportRowToSheetDependencies {
   /** Duplicate-passport canonical resolution (see src/duplicates/). A message with no link (predates the feature, or OCR found no identity data) resolves to itself — pre-feature behavior is exactly preserved. */
   findMessageLink: typeof findPassportMessageLinkByTelegramMessageId;
   findActiveCanonicalLink: typeof findActiveCanonicalLink;
+  /** Fallback photo/portrait token source when the canonical message itself has neither — see selectApplicantPhotoAssets.ts. */
+  findPhotoAssetCandidates: typeof findApplicantPhotoAssetCandidates;
+  /** Re-resolves a master/tab group's CURRENT tab title live, for the single-cell photo-URL write below — upsertRow's own resolution isn't exposed back to this caller, so this mirrors readVerifiedApplicantData.ts's own "never cache a tab title" approach. */
+  resolveSheetTitle: ResolveSheetTitleByGid;
+  writePhotoUrl: typeof writePersonalPhotoUrlIfBlank;
+  writePortraitUrl: typeof writePersonalPortraitUrlIfBlank;
+  /** This server's own public base URL (VISA_PHOTOS_PUBLIC_BASE_URL) — null when unset, meaning "don't write a photo URL yet" (not an error). */
+  photoPublicBaseUrl: string | null;
   now: () => Date;
 }
 
@@ -108,7 +150,6 @@ const defaultDependencies: SyncPassportRowToSheetDependencies = {
   markSynced: markSheetSyncSynced,
   markFailed: markSheetSyncFailed,
   markConfirmationSent: markSheetSyncConfirmationSent,
-  clearConfirmationSent: clearSheetSyncConfirmationSent,
   sendConfirmation: sendConfirmationMessage,
   findTelegramMessage: findTelegramMessageById,
   findOcrResult: findPassportOcrResultByTelegramMessageId,
@@ -120,8 +161,19 @@ const defaultDependencies: SyncPassportRowToSheetDependencies = {
   writeGenderSummary: writeGroupGenderSummary,
   findMessageLink: findPassportMessageLinkByTelegramMessageId,
   findActiveCanonicalLink,
+  findPhotoAssetCandidates: findApplicantPhotoAssetCandidates,
+  resolveSheetTitle: buildRealSheetTitleResolver(),
+  writePhotoUrl: writePersonalPhotoUrlIfBlank,
+  writePortraitUrl: writePersonalPortraitUrlIfBlank,
+  photoPublicBaseUrl: env.VISA_PHOTOS_PUBLIC_BASE_URL ?? null,
   now: () => new Date(),
 };
+
+interface CanonicalMessageResolution {
+  telegramMessageId: string;
+  /** Null only when this message has no passport_message_links row at all (predates the duplicate-resolution feature, or OCR found no usable identity data) — in which case there is no (identity, group) pair to fall back across for photo/portrait assets either. */
+  passportIdentityId: string | null;
+}
 
 /**
  * Resolves which telegram_message's data should actually drive this
@@ -129,16 +181,19 @@ const defaultDependencies: SyncPassportRowToSheetDependencies = {
  * must update the EXISTING canonical row, never append its own. A message
  * with no passport_message_links row at all (predates this feature, or OCR
  * found no usable passport number/DOB) resolves to itself, leaving every
- * pre-existing sync exactly as it always was.
+ * pre-existing sync exactly as it always was. Also returns the link's own
+ * passportIdentityId (when a link exists at all) so the caller can look up
+ * photo/portrait fallback candidates across every active link for the same
+ * (identity, group) — see selectApplicantPhotoAssets.ts.
  */
 async function resolveCanonicalTelegramMessageId(
   telegramMessageId: string,
   groupId: string,
   deps: Pick<SyncPassportRowToSheetDependencies, 'findMessageLink' | 'findActiveCanonicalLink'>,
-): Promise<string> {
+): Promise<CanonicalMessageResolution> {
   const link = await deps.findMessageLink(telegramMessageId);
   if (!link) {
-    return telegramMessageId;
+    return { telegramMessageId, passportIdentityId: null };
   }
   const canonical = await deps.findActiveCanonicalLink(link.passportIdentityId, groupId);
   if (!canonical) {
@@ -147,9 +202,9 @@ async function resolveCanonicalTelegramMessageId(
     // hasn't landed yet. Either way, syncing this message directly is safe:
     // upsertRowInSheet's own column-M lookup makes this an ordinary write,
     // never a destructive one.
-    return telegramMessageId;
+    return { telegramMessageId, passportIdentityId: link.passportIdentityId };
   }
-  return canonical.telegramMessageId;
+  return { telegramMessageId: canonical.telegramMessageId, passportIdentityId: link.passportIdentityId };
 }
 
 /**
@@ -186,11 +241,12 @@ export async function syncPassportRowToSheet(
     // create its own — see resolveCanonicalTelegramMessageId's doc comment.
     // A message with no link at all (pre-feature, or no usable identity
     // data) resolves to itself, so every pre-existing sync is unaffected.
-    const canonicalTelegramMessageId = await resolveCanonicalTelegramMessageId(
+    const canonicalResolution = await resolveCanonicalTelegramMessageId(
       claimed.telegramMessageId,
       telegramMessage.groupId,
       deps,
     );
+    const canonicalTelegramMessageId = canonicalResolution.telegramMessageId;
     const canonicalTelegramMessage =
       canonicalTelegramMessageId === claimed.telegramMessageId
         ? telegramMessage
@@ -261,6 +317,101 @@ export async function syncPassportRowToSheet(
       );
     }
 
+    // Resolves which photo/portrait token the T/V-column writes below
+    // should actually use (see selectApplicantPhotoAssets.ts): the
+    // canonical message's own token when it has one — the ENTIRE
+    // pre-existing behavior, completely unaffected — or, only when the
+    // canonical itself has neither, the most recently sent active
+    // duplicate message's token for the same (identity, group). Skipped
+    // entirely (no DB call at all) whenever the canonical already has both
+    // of its own tokens, or has no passport_message_links row to begin
+    // with, so the overwhelmingly common case pays zero extra cost.
+    // Isolated in its own try/catch and defaults to exactly the
+    // pre-existing "use the canonical's own token" values on any error, so
+    // this optional enhancement can never make T/V worse than before it
+    // existed, and never risks the already-successful sync.
+    let photoAssets: SelectedApplicantPhotoAssets = {
+      photoToken: ocrResult.personalPhotoToken,
+      portraitToken: ocrResult.personalPortraitToken,
+    };
+    try {
+      if (
+        canonicalResolution.passportIdentityId &&
+        (ocrResult.personalPhotoToken === null || ocrResult.personalPortraitToken === null)
+      ) {
+        const candidates = await deps.findPhotoAssetCandidates(canonicalResolution.passportIdentityId, telegramMessage.groupId);
+        photoAssets = selectApplicantPhotoAssets(
+          {
+            telegramMessageId: canonicalTelegramMessageId,
+            personalPhotoToken: ocrResult.personalPhotoToken,
+            personalPortraitToken: ocrResult.personalPortraitToken,
+          },
+          candidates,
+        );
+      }
+    } catch (photoAssetError) {
+      console.error(
+        `[sheets-sync] job ${claimed.id} synced successfully but resolving fallback photo/portrait assets failed: ${sanitizeErrorMessage(photoAssetError)}`,
+      );
+    }
+
+    // Populates Sheet column T (personalPhotoUrl) with the durable
+    // /visa-photos/:token URL, ONLY when a photo token is available
+    // (photoAssets.photoToken — the canonical message's own token, or a
+    // fallback from an active duplicate, see above) and this server has a
+    // configured public base URL. The URL is built from the dedicated
+    // random token, NEVER from canonicalTelegramMessageId or any other
+    // existing identifier (see applicantPhotoUrl.ts). writePhotoUrl itself
+    // guarantees an operator's own manually-typed value is never
+    // overwritten. Isolated in its own try/catch for the same reason as
+    // the gender summary above — never flips an already-synced job back
+    // to failed.
+    try {
+      if (photoAssets.photoToken && deps.photoPublicBaseUrl) {
+        const sheetTitleForPhoto =
+          group?.googleSheetGid != null ? await deps.resolveSheetTitle(spreadsheetId, group.googleSheetGid) : undefined;
+        const photoUrl = buildApplicantPhotoPublicUrl(deps.photoPublicBaseUrl, photoAssets.photoToken);
+        await deps.writePhotoUrl(spreadsheetId, result.rowNumber, photoUrl, VISA_PERSONAL_PHOTO_URL_COLUMN, sheetTitleForPhoto);
+      }
+    } catch (photoUrlError) {
+      console.error(
+        `[sheets-sync] job ${claimed.id} synced successfully but writing the personal photo URL failed: ${sanitizeErrorMessage(photoUrlError)}`,
+      );
+    }
+
+    // Populates Sheet column V (personalPortraitUrl) with the durable
+    // /visa-portraits/:token URL for the CROPPED portrait — a fully
+    // independent artifact/token/column from the original passport image's
+    // own T-column write above (see performPassportOcr.ts and
+    // uploadApplicantPhoto.ts's uploadApplicantPortrait). Deliberately NOT
+    // column U: U already holds an operator-entered "passport scan URL"
+    // for the unrelated VisitSaudi/KSA Visa draft-building flow (see
+    // visaSheetColumns.ts's own doc comment on
+    // VISA_PERSONAL_PORTRAIT_URL_COLUMN) — writing here must never touch
+    // that column. buildApplicantPortraitPublicUrl (not
+    // buildApplicantPhotoPublicUrl) is used deliberately, since the portrait
+    // is served by its own route (applicantPortraitRoute.ts) under
+    // /visa-portraits/, backed by a portrait-only token lookup — reusing the
+    // T-column URL builder here would always 404. The URL is built solely
+    // from photoAssets.portraitToken (the canonical message's own token, or
+    // a fallback from an active duplicate — see above); no object path is
+    // ever embedded. Same blank-only-write guarantee, same try/catch
+    // isolation as the T-column write above — a failure here never fails
+    // the sync job or affects the T-column write or the confirmation send
+    // that follows.
+    try {
+      if (photoAssets.portraitToken && deps.photoPublicBaseUrl) {
+        const sheetTitleForPortrait =
+          group?.googleSheetGid != null ? await deps.resolveSheetTitle(spreadsheetId, group.googleSheetGid) : undefined;
+        const portraitUrl = buildApplicantPortraitPublicUrl(deps.photoPublicBaseUrl, photoAssets.portraitToken);
+        await deps.writePortraitUrl(spreadsheetId, result.rowNumber, portraitUrl, sheetTitleForPortrait);
+      }
+    } catch (portraitUrlError) {
+      console.error(
+        `[sheets-sync] job ${claimed.id} synced successfully but writing the personal portrait URL failed: ${sanitizeErrorMessage(portraitUrlError)}`,
+      );
+    }
+
     // Confirmation is sent strictly after the sheet write is durably marked
     // synced above, and its own failures are caught here rather than by the
     // outer catch: a job that already succeeded in the sheet must never be
@@ -270,6 +421,7 @@ export async function syncPassportRowToSheet(
       await sendPassportConfirmation(
         {
           sheetSyncQueueId: claimed.id,
+          alreadySent: claimed.confirmationSentAt !== null,
           telegramChatId: telegramMessage.telegramChatId,
           ocrResult,
           agent,

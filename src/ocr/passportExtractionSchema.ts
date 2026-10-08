@@ -4,6 +4,7 @@
 // ships both from the same package, so no extra dependency is needed —
 // just this one import path, isolated to the Claude-facing schema.
 import { z } from 'zod/v4';
+import type { VisionPage } from './visual/extractIssueDateFromVisionStructure.js';
 
 export const CONFIDENCE_LEVELS = ['high', 'medium', 'low'] as const;
 export const ConfidenceLevelSchema = z.enum(CONFIDENCE_LEVELS);
@@ -57,6 +58,18 @@ export type ClaudePassportResponse = z.infer<typeof ClaudePassportResponseSchema
 export interface PassportExtractionResult extends ClaudePassportResponse {
   overallConfidence: ConfidenceLevel;
   model: string;
+  /**
+   * Optional: only the google-vision provider ever populates this, with the
+   * SAME DOCUMENT_TEXT_DETECTION `pages` structure it already computed for
+   * MRZ/issue-date extraction (zero extra Vision API cost) -- reused by
+   * performPassportOcr.ts to additionally constrain the applicant portrait
+   * crop against the passport's own printed text layout (see
+   * extractApplicantPhotoCrop.ts, detectPersonalDataColumn.ts,
+   * locateMrzParagraphGeometry.ts). Every other provider (anthropic/local)
+   * never sets this, and its absence must always be treated as "no layout
+   * data available", never an error.
+   */
+  visionPages?: VisionPage[];
 }
 
 export const CRITICAL_FIELDS = [

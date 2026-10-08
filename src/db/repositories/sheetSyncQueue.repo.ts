@@ -246,16 +246,18 @@ export async function recoverStaleSyncingJobs(
 }
 
 /**
- * Atomically claims the right to send this job's post-sync Telegram
- * confirmation: sets confirmation_sent_at = now() only if it is still NULL,
- * same "claim guard" shape as markSheetSyncStarted. Returns null if a
- * confirmation was already sent (or being sent) for this job, so the caller
- * knows to skip sending — the sole guard against a duplicate confirmation
- * message, including for a job an operator manually resets and re-syncs.
+ * Records that this job's post-sync Telegram confirmation was ACTUALLY sent:
+ * sets confirmation_sent_at = now(), guarded by "only if it is still NULL" as
+ * defense in depth. The caller (see syncPassportRowToSheet.ts) is expected to
+ * call this ONLY AFTER the Telegram sendMessage call has already succeeded —
+ * never before — so this column can never read "sent" for a confirmation
+ * that was never actually delivered (e.g. the process crashing mid-send).
  *
- * The caller is expected to send the message only after winning this claim.
- * If the send then fails, call clearSheetSyncConfirmationSent to allow a
- * future attempt to try again — see syncPassportRowToSheet.ts.
+ * The primary duplicate-send guard is the caller's own check of
+ * confirmation_sent_at (read from the SAME atomic claim markSheetSyncStarted
+ * already returned for this run) before ever attempting a send at all — see
+ * syncPassportRowToSheet.ts's sendPassportConfirmation. The IS NULL guard
+ * here is a second, redundant layer, not the primary mechanism.
  */
 export async function markSheetSyncConfirmationSent(id: string): Promise<SheetSyncQueueRecord | null> {
   const { rows } = await pool.query<SheetSyncQueueRow>(
@@ -270,11 +272,13 @@ export async function markSheetSyncConfirmationSent(id: string): Promise<SheetSy
 }
 
 /**
- * Rolls back a confirmation claim after the actual Telegram send failed, so
- * confirmation_sent_at keeps meaning "successfully sent" rather than
- * "attempted". Unconditional by id (no WHERE ... IS NULL guard) — only ever
- * called by the same code path that just won the claim via
- * markSheetSyncConfirmationSent, so there is no concurrent claim to disturb.
+ * Clears a confirmation_sent_at that was set in error, so a later attempt can
+ * still send. Not currently called by syncPassportRowToSheet.ts (which now
+ * calls markSheetSyncConfirmationSent only after a successful send, so there
+ * is nothing to roll back on a send failure — see that module's own doc
+ * comment) — kept as a standalone, independently-tested repository primitive
+ * for any future caller (e.g. an operator tool) that needs to reset a
+ * wrongly-marked row.
  */
 export async function clearSheetSyncConfirmationSent(id: string): Promise<void> {
   await pool.query(`UPDATE sheet_sync_queue SET confirmation_sent_at = NULL WHERE id = $1`, [id]);
