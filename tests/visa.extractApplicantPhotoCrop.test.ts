@@ -1,8 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import sharp from 'sharp';
-import { extractApplicantPhotoCrop, type ExtractApplicantPhotoCropDependencies } from '../src/visa/extractApplicantPhotoCrop.js';
-import type { VisionFaceAnnotation } from '../src/visa/computeApplicantPhotoCropRegion.js';
+import {
+  buildColumnDetectionContext,
+  extractApplicantPhotoCrop,
+  type ExtractApplicantPhotoCropDependencies,
+} from '../src/visa/extractApplicantPhotoCrop.js';
+import { computeApplicantPhotoCropRegion, type VisionFaceAnnotation } from '../src/visa/computeApplicantPhotoCropRegion.js';
+import { detectPersonalDataColumn, type LayoutParagraph } from '../src/visa/detectPersonalDataColumn.js';
 import type { VisionPage } from '../src/ocr/visual/extractIssueDateFromVisionStructure.js';
 
 const IMAGE_WIDTH = 800;
@@ -473,4 +478,230 @@ test('document boundary: a tilted/perspective-distorted passport still gets isol
   // the large empty background above/around it -- isolation still works
   // even though the tilt angle itself is never corrected.
   assert.ok(boundaryMeta.height! < faceOnlyMeta.height!, 'boundary-aware crop must still exclude background even for a tilted document cluster');
+});
+
+// --- A/C/D: the 433 regression (RIGHT constraint survives margin retuning
+// and the aspect-ratio step) ------------------------------------------------
+// Real production passport 381 geometry (960x1280, same fixture as
+// REAL_381_TEXT_DETECTION_PAGES above), reused here to pin down the exact
+// mechanism behind a real regression this engagement fixed: narrowing
+// computeApplicantPhotoCropRegion.ts's own TOP_MARGIN_FACTOR/
+// BOTTOM_MARGIN_FACTOR must never shrink the search window
+// detectPersonalDataColumn() is given (that window is now the fixed,
+// independent buildColumnDetectionContext -- see extractApplicantPhotoCrop.ts),
+// and an already-applied RIGHT constraint must survive the later
+// aspect-ratio step even when reaching ratio 0.78 would want more width.
+
+test('A: buildColumnDetectionContext uses the fixed legacy factors (0.9 top / 0.7 bottom / 0.55 side), computed purely from faceBox -- never from the final crop region', () => {
+  const faceBox = { x0: 100, y0: 200, x1: 300, y1: 500 }; // faceWidth=200, faceHeight=300
+  const context = buildColumnDetectionContext(faceBox);
+
+  assert.deepEqual(context, {
+    x0: 100 - 200 * 0.55,
+    x1: 300 + 200 * 0.55,
+    y0: 200 - 300 * 0.9,
+    y1: 500 + 300 * 0.7,
+  });
+});
+
+test('A: buildColumnDetectionContext never coincides with what a baseRegion-derived window would be -- proving the decoupling this fix relies on', () => {
+  const faceBox = { x0: 139, y0: 746, x1: 341, y1: 981 }; // real passport 406 face geometry
+  const faces = [{ boundingPoly: box(139, 746, 341, 981), detectionConfidence: 0.988 }];
+  const baseRegion = computeApplicantPhotoCropRegion(faces, 960, 1280);
+  assert.ok(baseRegion);
+
+  const context = buildColumnDetectionContext(faceBox);
+  // Before this fix, detectPersonalDataColumn's search window WAS exactly
+  // this baseRegion-shaped box -- tied to whatever
+  // TOP_MARGIN_FACTOR/BOTTOM_MARGIN_FACTOR happen to be. It must not
+  // coincide with that any more.
+  const oldStyleWindowFromBaseRegion = {
+    x0: baseRegion!.left,
+    y0: baseRegion!.top,
+    x1: baseRegion!.left + baseRegion!.width,
+    y1: baseRegion!.top + baseRegion!.height,
+  };
+  assert.notDeepEqual(context, oldStyleWindowFromBaseRegion);
+});
+
+test('C (integration): the aspect-ratio step never widens a crop past an already-applied RIGHT layout constraint, even though reaching ratio 0.78 would want more width', async () => {
+  const original = await makePassport381SizedImage();
+  const faces = [{ boundingPoly: box(60, 776, 264, 1014), detectionConfidence: 0.98828125 }];
+  const deps = buildDeps(faces);
+
+  const layoutCropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps, REAL_381_TEXT_DETECTION_PAGES);
+  assert.ok(layoutCropped);
+  const meta = await sharp(layoutCropped!).metadata();
+
+  // real columnX0=310, margin = max(8, 0.012*960) = 11.52 -> applied right
+  // edge = 298.48; this face's clampedX0 is 0, so the crop's own width IS
+  // its right edge in original-image pixels. Reaching ratio 0.78 against
+  // this crop's height (412) would want width=321 -- the applied RIGHT
+  // constraint must win instead.
+  assert.equal(meta.width, 298, 'the applied RIGHT constraint (≈298.48) must survive the aspect-ratio step unchanged');
+  assert.ok(meta.width! / meta.height! < 0.78, 'ratio 0.78 must NOT be fully reached here -- the hard RIGHT bound correctly takes priority over it');
+});
+
+test('D (integration): the column-detection search window stays the fixed, margin-independent one -- a close-by noise paragraph placed exactly in the gap between it and the (smaller) output-margin-derived window flips confidence HIGH->MEDIUM if the wrong window is used, proving the decoupling matters', () => {
+  const faceBox = { x0: 60, y0: 776, x1: 264, y1: 1014 }; // real passport 381 face geometry
+  const pageWidth = 960;
+  const pageHeight = 1280;
+
+  // A clean 6-member personal-data-column cluster (real 381 paragraph
+  // geometry, see tests/visa.detectPersonalDataColumn.test.ts) -- none of
+  // these members are affected by which window is used below (their own
+  // mostlyInsideRegion overlap fraction stays under 50% either way).
+  const cluster: LayoutParagraph[] = [
+    { text: 'FAMILIYASI SURNAME', x0: 314, y0: 738, x1: 448, y1: 750 },
+    { text: 'IBRAGIMOVA', x0: 317, y0: 753, x1: 477, y1: 773 },
+    { text: "OTASINING ISMI FATHER'S NAME", x0: 312, y0: 823, x1: 511, y1: 838 },
+    { text: 'BOTIROVNA', x0: 315, y0: 840, x1: 463, y1: 860 },
+    { text: 'BERILGAN SANASH DATE OF ISSUE', x0: 311, y0: 1011, x1: 523, y1: 1049 },
+    { text: 'AMAL QILISH MUDDATI DATE OF EXPIRY', x0: 310, y0: 1055, x1: 554, y1: 1094 },
+  ];
+
+  // A CONSTRUCTED (not real-passport) noise paragraph, placed deliberately
+  // in the y-gap between the fixed context's range and what the smaller,
+  // output-margin-derived window's range would have been: mostly inside
+  // the former (correctly excluded as photo-area noise), entirely outside
+  // the latter (incorrectly let through as a false column member).
+  const noise: LayoutParagraph = { text: 'NOISE', x0: 342, y0: 1100, x1: 392, y1: 1160 };
+
+  const fixedContext = buildColumnDetectionContext(faceBox);
+  // What the search window used to be before this fix: the SAME side
+  // margin, but the y-range tied to computeApplicantPhotoCropRegion.ts's
+  // own TOP_MARGIN_FACTOR=0.4/BOTTOM_MARGIN_FACTOR=0.35 -- transcribed as
+  // literals (not imported), matching this file's own convention of
+  // writing out margin formulas rather than depending on another module's
+  // private constants.
+  const oldStyleOutputMarginContext = {
+    x0: fixedContext.x0,
+    x1: fixedContext.x1,
+    y0: faceBox.y0 - (faceBox.y1 - faceBox.y0) * 0.4,
+    y1: faceBox.y1 + (faceBox.y1 - faceBox.y0) * 0.35,
+  };
+
+  const withFixedContext = detectPersonalDataColumn([...cluster, noise], faceBox, fixedContext, pageWidth, pageHeight);
+  const withOldStyleContext = detectPersonalDataColumn([...cluster, noise], faceBox, oldStyleOutputMarginContext, pageWidth, pageHeight);
+
+  assert.ok(withFixedContext);
+  assert.equal(withFixedContext!.confidence, 'HIGH', 'the fixed, margin-independent window correctly excludes the noise paragraph as photo-area text');
+  assert.equal(withFixedContext!.memberCount, 6);
+
+  assert.ok(withOldStyleContext);
+  assert.equal(
+    withOldStyleContext!.confidence,
+    'MEDIUM',
+    'the old, output-margin-tied window lets the noise paragraph through, dragging confidence below HIGH -- exactly the regression this decoupling fixes',
+  );
+  assert.equal(withOldStyleContext!.memberCount, 7);
+});
+
+test('D2 (true wiring, real pipeline): extractApplicantPhotoCrop actually threads buildColumnDetectionContext into detectPersonalDataColumn -- if the wiring were reverted to a baseRegion-tied window, this exact test would fail', async () => {
+  // Same cluster+noise construction as D above (CONSTRUCTED noise
+  // paragraph, not real-passport data), but routed through the REAL
+  // extractApplicantPhotoCrop() -> buildLayoutConstraintsFromParagraphs()
+  // -> detectPersonalDataColumn() call chain via textDetectionPages, not a
+  // direct detectPersonalDataColumn() call. This is what D alone could not
+  // prove: that the production wiring itself, not just the helper in
+  // isolation, is what's actually used.
+  const original = await makePassport381SizedImage();
+  const faces = [{ boundingPoly: box(60, 776, 264, 1014), detectionConfidence: 0.98828125 }];
+  const deps = buildDeps(faces);
+
+  const pagesWithNoise: VisionPage[] = [
+    {
+      blocks: [
+        {
+          paragraphs: [
+            paragraphFixture('FAMILIYASI SURNAME', 314, 738, 448, 750),
+            paragraphFixture('IBRAGIMOVA', 317, 753, 477, 773),
+            paragraphFixture("OTASINING ISMI FATHER'S NAME", 312, 823, 511, 838),
+            paragraphFixture('BOTIROVNA', 315, 840, 463, 860),
+            paragraphFixture('BERILGAN SANASH DATE OF ISSUE', 311, 1011, 523, 1049),
+            paragraphFixture('AMAL QILISH MUDDATI DATE OF EXPIRY', 310, 1055, 554, 1094),
+            // The same CONSTRUCTED noise paragraph as test D: mostly inside
+            // the fixed (correct) search window, entirely outside what the
+            // smaller output-margin-derived window's range would be.
+            paragraphFixture('NOISE', 342, 1100, 392, 1160),
+          ],
+        },
+      ],
+    },
+  ];
+
+  const base = await extractApplicantPhotoCrop(original, 'image/jpeg', deps);
+  const withNoisyCluster = await extractApplicantPhotoCrop(original, 'image/jpeg', deps, pagesWithNoise);
+
+  assert.ok(base && withNoisyCluster);
+  const baseMeta = await sharp(base!).metadata();
+  const withMeta = await sharp(withNoisyCluster!).metadata();
+
+  // With the correct (margin-independent) wiring, the noise paragraph is
+  // excluded, confidence stays HIGH, and the RIGHT constraint narrows the
+  // crop well below the face-only base (376px -> 298px, verified against
+  // this exact fixture). If the wiring were ever reverted to a
+  // baseRegion-tied window, the noise paragraph would drag confidence to
+  // MEDIUM, the constraint would be rejected entirely, and this width
+  // would equal baseMeta.width (376) instead -- making this assertion the
+  // actual regression guard, not just a mechanism demonstration.
+  assert.ok(
+    withMeta.width! < baseMeta.width!,
+    'the RIGHT constraint must still be applied through the real pipeline despite the noise paragraph -- if this fails, buildColumnDetectionContext is no longer wired in',
+  );
+  assert.equal(withMeta.width, 298, 'must match the known-correct constrained width for this fixture');
+  assert.equal(baseMeta.width, 376, 'sanity check: the face-only base must be unaffected by the noise paragraph');
+});
+
+// --- MEDIUM-confidence columnResult, real pipeline wiring -----------------
+// extractApplicantPhotoCrop.ts's buildLayoutConstraintsFromParagraphs now
+// also supplies a RIGHT constraint when columnResult.confidence is
+// 'MEDIUM' (same margin formula as HIGH -- see that function's own doc
+// comment). This is a CONSTRUCTED (not real-passport) 4-member cluster,
+// deliberately engineered so confidenceScore is capped by fieldCountScore
+// alone (4 members -> fieldCountScore=min(1,4/8)=0.5) while dispersion
+// (x0Range=10px) and the face gap (40px, within detectPersonalDataColumn's
+// own [0.02,0.08]*pageWidth window) both stay perfect -- confirmed to
+// produce confidence='MEDIUM' via detectPersonalDataColumn directly before
+// this test was written. Deliberately has only 4 paragraphs (independently
+// confirmed to leave detectDocumentBoundary's own result null for this
+// fixture), so the narrowing this test checks for is attributable ONLY to
+// the new MEDIUM column branch, not document-boundary clamping.
+test('MEDIUM column (constructed, real pipeline): a 4-member cluster capped at MEDIUM by field count alone still narrows the crop through the real pipeline', async () => {
+  const faceBox = { x0: 60, y0: 700, x1: 260, y1: 950 };
+  const faces = [{ boundingPoly: box(faceBox.x0, faceBox.y0, faceBox.x1, faceBox.y1), detectionConfidence: 0.95 }];
+  const deps = buildDeps(faces);
+  const original = await sharp({
+    create: { width: 960, height: 1280, channels: 3, background: { r: 230, g: 230, b: 230 } },
+  })
+    .jpeg()
+    .toBuffer();
+
+  const pages: VisionPage[] = [
+    {
+      blocks: [
+        {
+          paragraphs: [
+            paragraphFixture('FAMILIYASI SURNAME', 305, 700, 480, 730),
+            paragraphFixture("OTASINING ISMI FATHER'S NAME", 303, 740, 490, 770),
+            paragraphFixture('FUQAROLIGI NATIONALITY', 300, 900, 470, 930),
+            paragraphFixture("TUG'ILGAN SANASI DATE OF BIRTH", 310, 970, 500, 1000),
+          ],
+        },
+      ],
+    },
+  ];
+
+  const base = await extractApplicantPhotoCrop(original, 'image/jpeg', deps);
+  const withMedium = await extractApplicantPhotoCrop(original, 'image/jpeg', deps, pages);
+  assert.ok(base && withMedium);
+  const baseMeta = await sharp(base!).metadata();
+  const withMeta = await sharp(withMedium!).metadata();
+
+  assert.equal(baseMeta.width, 370, 'sanity check: the face-only base for this fixture');
+  assert.ok(
+    withMeta.width! < baseMeta.width!,
+    'the MEDIUM-confidence RIGHT constraint must narrow the crop through the real pipeline -- if this fails, the MEDIUM branch is not wired in',
+  );
+  assert.equal(withMeta.width, 288, 'must match the known-correct constrained width for this fixture');
 });

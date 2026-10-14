@@ -3,6 +3,7 @@ import { getImageDimensions } from '../ocr/mrz/getImageDimensions.js';
 import { locateMrzParagraphGeometry } from '../ocr/mrz/locateMrzParagraphGeometry.js';
 import type { VisionPage } from '../ocr/visual/extractIssueDateFromVisionStructure.js';
 import {
+  applyTargetAspectRatio,
   computeApplicantPhotoCropRegion,
   selectBestFaceBox,
   type LayoutConstraints,
@@ -17,6 +18,7 @@ import {
   detectDocumentBoundary,
   filterFacesToBoundary,
   filterParagraphsToBoundary,
+  type DocumentBoundaryResult,
 } from './detectDocumentBoundary.js';
 import { flattenParagraphsToNormalizedSpace, type NormalizedParagraph, type RawImageGeometry } from './transformVisionCoordinates.js';
 
@@ -52,30 +54,79 @@ const RIGHT_MARGIN_FRACTION = 0.012;
 const BOTTOM_MARGIN_FRACTION = 0.012;
 const MIN_MARGIN_PIXELS = 8;
 
+// The applicant-photo crop's own output margins (TOP_MARGIN_FACTOR /
+// BOTTOM_MARGIN_FACTOR in computeApplicantPhotoCropRegion.ts) are tuned
+// independently of, and can change independently of, the search window
+// personal-data-column detection uses -- these fixed, legacy-style factors
+// (matching that module's pre-retune values) give detectPersonalDataColumn
+// a stable context region that never shifts just because the final crop's
+// own margins were retuned. This decoupling fixes a real regression: a
+// smaller TOP/BOTTOM margin was shrinking the Y-extent fed into
+// detectPersonalDataColumn, which could knock its confidence below HIGH
+// and silently drop the RIGHT constraint it would otherwise have supplied.
+const COLUMN_DETECTION_CONTEXT_TOP_FACTOR = 0.9;
+const COLUMN_DETECTION_CONTEXT_BOTTOM_FACTOR = 0.7;
+const COLUMN_DETECTION_CONTEXT_SIDE_FACTOR = 0.55;
+
+/**
+ * The fixed search-window region fed to detectPersonalDataColumn --
+ * deliberately NOT derived from the final crop region (see the module-level
+ * comment on COLUMN_DETECTION_CONTEXT_* above), so it stays byte-identical
+ * regardless of how computeApplicantPhotoCropRegion.ts's own output margins
+ * are tuned.
+ */
+export function buildColumnDetectionContext(faceBox: PixelBox): PixelBox {
+  const faceWidth = faceBox.x1 - faceBox.x0;
+  const faceHeight = faceBox.y1 - faceBox.y0;
+  return {
+    x0: faceBox.x0 - faceWidth * COLUMN_DETECTION_CONTEXT_SIDE_FACTOR,
+    x1: faceBox.x1 + faceWidth * COLUMN_DETECTION_CONTEXT_SIDE_FACTOR,
+    y0: faceBox.y0 - faceHeight * COLUMN_DETECTION_CONTEXT_TOP_FACTOR,
+    y1: faceBox.y1 + faceHeight * COLUMN_DETECTION_CONTEXT_BOTTOM_FACTOR,
+  };
+}
+
 /**
  * Builds the optional layout-aware crop constraints (personal-data column
  * -> right boundary, MRZ -> bottom boundary) from already-flattened,
  * EXIF-normalized paragraph geometry (see flattenParagraphsToNormalizedSpace
  * / detectDocumentBoundary.ts's own optional pre-filtering of that same
  * list) -- no Vision API call of its own, pure and synchronous. Returns
- * undefined when neither signal reaches HIGH confidence, which is exactly
- * "fall back to the pure face-only crop", never a guess.
+ * undefined when the column signal is below MEDIUM confidence AND the MRZ
+ * signal is below HIGH confidence, which is exactly "fall back to the pure
+ * face-only crop", never a guess.
+ *
+ * The column/RIGHT side also acts on MEDIUM confidence, using the EXACT
+ * SAME margin formula as HIGH (no extra buffer) -- real passports 408/409/
+ * 410 were MEDIUM before detectPersonalDataColumn.ts's own
+ * DISPERSION_BAD_FRACTION recalibration (see that module's doc comment),
+ * yet were genuine columns, not noise, so MEDIUM is worth acting on. No
+ * new margin was introduced here: computeApplicantPhotoCropRegion.ts's own
+ * acceptance check (`right >= box.x1 + minFaceRightPadding`) is the ONLY
+ * thing that decides whether a given `right` value is safe, and it takes
+ * no confidence parameter at all -- it is exactly as strict for a
+ * MEDIUM-sourced value as for a HIGH-sourced one. Real passport 414 (the
+ * only real MEDIUM example on record, gap=19px, tighter than every other
+ * real sample at 30-56px) is REJECTED by that exact check even with this
+ * identical margin (274.25 < 266+8.9), falling back to the face-only
+ * region -- proving the check's protection does not weaken for MEDIUM.
+ * The MRZ/BOTTOM side deliberately never acts on MEDIUM or LOW:
+ * locateMrzParagraphGeometry.ts's MEDIUM tier has a confirmed
+ * false-positive mode (see tests/mrz.locateMrzParagraphGeometry.test.ts --
+ * an ordinary printed sentence can reach MEDIUM from shape heuristics
+ * alone, with neither a "P<" prefix nor a long MRZ-alphabet run), so
+ * acting on it would mean clamping the crop's bottom edge to an
+ * essentially arbitrary position found by a known-unreliable detector.
  */
 function buildLayoutConstraintsFromParagraphs(
   paragraphs: readonly NormalizedParagraph[],
   faceBox: PixelBox,
-  baseRegion: PixelCropRegion,
   normalizedWidth: number,
   normalizedHeight: number,
 ): LayoutConstraints | undefined {
   if (paragraphs.length === 0) return undefined;
 
-  const expandedFaceRegion = {
-    x0: baseRegion.left,
-    y0: baseRegion.top,
-    x1: baseRegion.left + baseRegion.width,
-    y1: baseRegion.top + baseRegion.height,
-  };
+  const expandedFaceRegion = buildColumnDetectionContext(faceBox);
 
   const mrzResult = locateMrzParagraphGeometry(paragraphs, normalizedWidth, normalizedHeight);
   const mrzParagraphs = mrzResult ? [mrzResult.paragraph] : [];
@@ -90,10 +141,12 @@ function buildLayoutConstraintsFromParagraphs(
   );
 
   const constraints: LayoutConstraints = {};
-  if (columnResult && columnResult.confidence === 'HIGH') {
+  if (columnResult && (columnResult.confidence === 'HIGH' || columnResult.confidence === 'MEDIUM')) {
     const margin = Math.max(MIN_MARGIN_PIXELS, RIGHT_MARGIN_FRACTION * normalizedWidth);
     constraints.right = columnResult.columnX0 - margin;
   }
+  // mrzResult: HIGH only -- MEDIUM/LOW MRZ confidence is deliberately never
+  // used (see this function's own doc comment above for why).
   if (mrzResult && mrzResult.confidence === 'HIGH') {
     const margin = Math.max(MIN_MARGIN_PIXELS, BOTTOM_MARGIN_FRACTION * normalizedHeight);
     constraints.bottom = mrzResult.top - margin;
@@ -232,13 +285,7 @@ export async function extractApplicantPhotoCrop(
         const paragraphsForLayout = documentBoundary
           ? filterParagraphsToBoundary(normalizedParagraphs, documentBoundary)
           : normalizedParagraphs;
-        const layoutConstraints = buildLayoutConstraintsFromParagraphs(
-          paragraphsForLayout,
-          faceBox,
-          baseRegion,
-          width,
-          height,
-        );
+        const layoutConstraints = buildLayoutConstraintsFromParagraphs(paragraphsForLayout, faceBox, width, height);
         if (layoutConstraints) {
           const constrainedRegion = computeApplicantPhotoCropRegion(effectiveFaces, width, height, layoutConstraints);
           if (constrainedRegion) region = constrainedRegion;
@@ -259,7 +306,13 @@ export async function extractApplicantPhotoCrop(
     try {
       const faceBox = selectBestFaceBox(effectiveFaces);
       if (faceBox) {
-        region = clampRegionToBoundary(region, documentBoundary, faceBox);
+        // clampRegionToBoundary (detectDocumentBoundary.ts) returns a fresh
+        // {left,top,width,height} object with no knowledge of
+        // appliedRightConstraint/appliedBottomConstraint -- that module is
+        // deliberately left untouched (see its own doc comment), so those
+        // fields are preserved across the clamp here instead.
+        const { appliedRightConstraint, appliedBottomConstraint } = region;
+        region = { ...clampRegionToBoundary(region, documentBoundary, faceBox), appliedRightConstraint, appliedBottomConstraint };
       }
     } catch (error) {
       console.log(
@@ -268,5 +321,74 @@ export async function extractApplicantPhotoCrop(
     }
   }
 
+  try {
+    const faceBox = selectBestFaceBox(effectiveFaces);
+    if (faceBox) {
+      const hardBounds = computeHardBounds(region, width, height, documentBoundary);
+      region = applyTargetAspectRatio(
+        region,
+        TARGET_ASPECT_RATIO,
+        faceBox,
+        hardBounds.hardLeft,
+        hardBounds.hardTop,
+        hardBounds.hardRight,
+        hardBounds.hardBottom,
+      );
+    }
+  } catch (error) {
+    console.log(
+      `[applicant-photo-crop] target aspect-ratio step failed, using region as computed so far: ${sanitizeErrorReason(error)}`,
+    );
+  }
+
   return encodeCrop(normalizedBuffer, region, mimeType);
+}
+
+/**
+ * The target pixel width/height ratio applyTargetAspectRatio nudges the
+ * final crop toward -- a pure pixel ratio contract only (see that
+ * function's own doc comment), NOT a physical print-size (e.g. 35x45mm)
+ * guarantee.
+ */
+const TARGET_ASPECT_RATIO = 0.78;
+
+/**
+ * The maximal rectangle applyTargetAspectRatio is allowed to grow `region`
+ * into: the image bounds intersected with the document boundary (if
+ * present) and whichever layout constraint(s) were ACTUALLY applied to
+ * `region` -- each only included if `region` already respects it. A
+ * constraint `region` does NOT currently respect (e.g. clampRegionToBoundary
+ * above declined to clamp, to protect face containment) was not actually
+ * applied, so imposing it here would wrongly force safeBaseW/safeBaseH in
+ * applyTargetAspectRatio to shrink `region`, violating that function's own
+ * "never shrink in the normal case" contract -- excluding it instead just
+ * falls back to the image bounds for that edge, exactly as if detection
+ * had found nothing there.
+ */
+function computeHardBounds(
+  region: PixelCropRegion,
+  imageWidth: number,
+  imageHeight: number,
+  documentBoundary: DocumentBoundaryResult | null,
+): { hardLeft: number; hardTop: number; hardRight: number; hardBottom: number } {
+  let hardLeft = 0;
+  let hardTop = 0;
+  let hardRight = imageWidth;
+  let hardBottom = imageHeight;
+
+  if (documentBoundary) {
+    if (region.left >= documentBoundary.x0) hardLeft = Math.max(hardLeft, documentBoundary.x0);
+    if (region.top >= documentBoundary.y0) hardTop = Math.max(hardTop, documentBoundary.y0);
+    if (region.left + region.width <= documentBoundary.x1) hardRight = Math.min(hardRight, documentBoundary.x1);
+    if (region.top + region.height <= documentBoundary.y1) hardBottom = Math.min(hardBottom, documentBoundary.y1);
+  }
+
+  if (region.appliedRightConstraint !== undefined && region.left + region.width <= region.appliedRightConstraint) {
+    hardRight = Math.min(hardRight, region.appliedRightConstraint);
+  }
+  if (region.appliedBottomConstraint !== undefined && region.top + region.height <= region.appliedBottomConstraint) {
+    hardBottom = Math.min(hardBottom, region.appliedBottomConstraint);
+  }
+
+  return { hardLeft, hardTop, hardRight, hardBottom };
 }
