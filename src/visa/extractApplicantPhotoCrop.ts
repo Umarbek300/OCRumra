@@ -324,7 +324,7 @@ export async function extractApplicantPhotoCrop(
   try {
     const faceBox = selectBestFaceBox(effectiveFaces);
     if (faceBox) {
-      const hardBounds = computeHardBounds(region, width, height, documentBoundary);
+      const hardBounds = computeHardBounds(region, baseRegion, width, height, documentBoundary, normalizedParagraphs);
       region = applyTargetAspectRatio(
         region,
         TARGET_ASPECT_RATIO,
@@ -353,6 +353,15 @@ export async function extractApplicantPhotoCrop(
 const TARGET_ASPECT_RATIO = 0.78;
 
 /**
+ * Minimal left/top/width/height shape of the pre-narrowing, pre-clamp
+ * face-only region (computeApplicantPhotoCropRegion's own output BEFORE any
+ * right/bottom layout narrowing or document-boundary clamp) -- the
+ * "already deemed safe by construction" reference rectangle the four
+ * occupancy checks below cap growth back to.
+ */
+type BaseRegionEdges = Pick<PixelCropRegion, 'left' | 'top' | 'width' | 'height'>;
+
+/**
  * The maximal rectangle applyTargetAspectRatio is allowed to grow `region`
  * into: the image bounds intersected with the document boundary (if
  * present) and whichever layout constraint(s) were ACTUALLY applied to
@@ -364,12 +373,76 @@ const TARGET_ASPECT_RATIO = 0.78;
  * "never shrink in the normal case" contract -- excluding it instead just
  * falls back to the image bounds for that edge, exactly as if detection
  * had found nothing there.
+ *
+ * PER-AXIS EXPANSION SAFETY CHECK: each of `hardTop`/`hardRight`/
+ * `hardBottom`/`hardLeft` as computed above can sit well beyond
+ * `baseRegion`'s own corresponding edge (the face-only crop's edges, BEFORE
+ * any right/bottom layout narrowing or document-boundary clamp), since
+ * documentBoundary is the whole PAGE's own boundary, not specifically aware
+ * of text sitting just outside the printed photo -- and when no
+ * documentBoundary exists at all (or no layout constraint was applied),
+ * each hard bound defaults to the image's own edge, an even looser bound.
+ * If ANY detected paragraph (from `paragraphs`, in the SAME normalized
+ * coordinate space as `region` -- regardless of its text content, length,
+ * or shape) falls inside the gap between a hard bound and `baseRegion`'s
+ * corresponding edge, AND overlaps `region`'s own CURRENT span on the
+ * PERPENDICULAR axis (region.left/width for TOP/BOTTOM, region.top/height
+ * for RIGHT/LEFT -- at this point in the pipeline unaffected by
+ * narrowing/clamp in the normal case, so effectively the same span
+ * `baseRegion` itself had), that gap is no longer assumed safe to expand
+ * into: the hard bound is pulled in to `baseRegion`'s own edge, so
+ * applyTargetAspectRatio's own expandDimension (which already never
+ * crosses whatever hard bound it is given) simply cannot grow past the
+ * face-only region's existing edge on that axis for this crop. This is a
+ * pure geometric presence check on all four axes -- no text length, vowel
+ * ratio, or word count is evaluated anywhere here, so it cannot be gamed by
+ * OCR noise shaped like real text, and a false "paragraph detected" only
+ * ever makes the crop MORE conservative, never less. Strict `<`/`>`
+ * comparisons (never `<=`/`>=`) mean a paragraph that merely TOUCHES a
+ * zone's edge, with zero actual overlap, never triggers the cap. When
+ * `paragraphs` is empty (no text data at all) or a given gap is already
+ * empty/nonexistent, the corresponding check is a complete no-op.
+ *
+ * LEFT is included even though no layout constraint ever narrows the LEFT
+ * edge directly (LayoutConstraints has no `left` field): applyTargetAspectRatio's
+ * own expandDimension splits width growth between the LEFT and RIGHT sides
+ * of the SAME call, and when one side's share can't be absorbed without
+ * crossing its hard limit, the unused portion shifts to the OTHER side
+ * ("shift, not shrink" -- computeApplicantPhotoCropRegion.ts's own
+ * expandDimension doc comment). Tightening hardRight alone would therefore
+ * redirect MORE width growth toward the LEFT edge, which, with no LEFT
+ * check of its own, could still run all the way out to a loose hardLeft --
+ * potentially crossing into real text on the LEFT side this fix would
+ * otherwise never have considered. The LEFT occupancy check closes this
+ * regardless of why growth is approaching hardLeft (its own share or
+ * redirected share from RIGHT). The same reasoning applies symmetrically to
+ * TOP/BOTTOM (one shared height-axis expandDimension call).
+ *
+ * TWO LIMITS OF THIS CHECK, both load-bearing for callers to understand:
+ * 1. Face containment is NOT established here -- it depends entirely on
+ *    `region` (the input) already fully containing the detected face
+ *    BEFORE this function runs, which is the caller's own responsibility
+ *    (computeApplicantPhotoCropRegion's margin expansion, plus
+ *    clampRegionToBoundary's explicit face-containment guard, both upstream
+ *    of this function). This function and applyTargetAspectRatio only ever
+ *    cap or redirect GROWTH beyond `region`; they never shrink `region`
+ *    itself, so a face already cut before this point stays cut.
+ * 2. A paragraph that falls INSIDE `baseRegion`'s own footprint (not in the
+ *    gap beyond it) is never inspected by any of the four checks below --
+ *    that is a different problem (the face-only margin heuristic in
+ *    computeApplicantPhotoCropRegion.ts already including unwanted text in
+ *    its minimum output), out of scope for this purely growth-limiting
+ *    check, and not something it is safe to "fix" here by shrinking below
+ *    baseRegion (doing so would risk cutting the face that baseRegion's own
+ *    margins were sized to protect).
  */
-function computeHardBounds(
+export function computeHardBounds(
   region: PixelCropRegion,
+  baseRegion: BaseRegionEdges,
   imageWidth: number,
   imageHeight: number,
   documentBoundary: DocumentBoundaryResult | null,
+  paragraphs: readonly NormalizedParagraph[],
 ): { hardLeft: number; hardTop: number; hardRight: number; hardBottom: number } {
   let hardLeft = 0;
   let hardTop = 0;
@@ -388,6 +461,46 @@ function computeHardBounds(
   }
   if (region.appliedBottomConstraint !== undefined && region.top + region.height <= region.appliedBottomConstraint) {
     hardBottom = Math.min(hardBottom, region.appliedBottomConstraint);
+  }
+
+  const baseRegionLeft = baseRegion.left;
+  const baseRegionTop = baseRegion.top;
+  const baseRegionRight = baseRegion.left + baseRegion.width;
+  const baseRegionBottom = baseRegion.top + baseRegion.height;
+
+  // region's own current span on each perpendicular axis -- same
+  // "effectively baseRegion's own span" reasoning explained above.
+  const regionXStart = region.left;
+  const regionXEnd = region.left + region.width;
+  const regionYStart = region.top;
+  const regionYEnd = region.top + region.height;
+
+  if (hardTop < baseRegionTop) {
+    const zoneHasParagraph = paragraphs.some(
+      (p) => p.y1 > hardTop && p.y0 < baseRegionTop && p.x1 > regionXStart && p.x0 < regionXEnd,
+    );
+    if (zoneHasParagraph) hardTop = baseRegionTop;
+  }
+
+  if (hardBottom > baseRegionBottom) {
+    const zoneHasParagraph = paragraphs.some(
+      (p) => p.y0 < hardBottom && p.y1 > baseRegionBottom && p.x1 > regionXStart && p.x0 < regionXEnd,
+    );
+    if (zoneHasParagraph) hardBottom = baseRegionBottom;
+  }
+
+  if (hardRight > baseRegionRight) {
+    const zoneHasParagraph = paragraphs.some(
+      (p) => p.x0 < hardRight && p.x1 > baseRegionRight && p.y1 > regionYStart && p.y0 < regionYEnd,
+    );
+    if (zoneHasParagraph) hardRight = baseRegionRight;
+  }
+
+  if (hardLeft < baseRegionLeft) {
+    const zoneHasParagraph = paragraphs.some(
+      (p) => p.x1 > hardLeft && p.x0 < baseRegionLeft && p.y1 > regionYStart && p.y0 < regionYEnd,
+    );
+    if (zoneHasParagraph) hardLeft = baseRegionLeft;
   }
 
   return { hardLeft, hardTop, hardRight, hardBottom };

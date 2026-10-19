@@ -3,11 +3,23 @@ import { test } from 'node:test';
 import sharp from 'sharp';
 import {
   buildColumnDetectionContext,
+  computeHardBounds,
   extractApplicantPhotoCrop,
   type ExtractApplicantPhotoCropDependencies,
 } from '../src/visa/extractApplicantPhotoCrop.js';
-import { computeApplicantPhotoCropRegion, type VisionFaceAnnotation } from '../src/visa/computeApplicantPhotoCropRegion.js';
+import {
+  applyTargetAspectRatio,
+  computeApplicantPhotoCropRegion,
+  selectBestFaceBox,
+  type VisionFaceAnnotation,
+} from '../src/visa/computeApplicantPhotoCropRegion.js';
 import { detectPersonalDataColumn, type LayoutParagraph } from '../src/visa/detectPersonalDataColumn.js';
+import {
+  clampRegionToBoundary,
+  detectDocumentBoundary,
+  filterFacesToBoundary,
+} from '../src/visa/detectDocumentBoundary.js';
+import { flattenParagraphsToNormalizedSpace } from '../src/visa/transformVisionCoordinates.js';
 import type { VisionPage } from '../src/ocr/visual/extractIssueDateFromVisionStructure.js';
 
 const IMAGE_WIDTH = 800;
@@ -294,7 +306,7 @@ async function makeImage(width: number, height: number): Promise<Buffer> {
     .toBuffer();
 }
 
-test('document boundary: a passport-only image (text/face spanning nearly the whole frame) is a complete no-op', async () => {
+test('document boundary: a passport-only image (text/face spanning nearly the whole frame) leaves WIDTH untouched; HEIGHT is now additionally protected by the new BOTTOM-axis occupancy check', async () => {
   const width = 960;
   const height = 1280;
   const original = await makeImage(width, height);
@@ -326,11 +338,24 @@ test('document boundary: a passport-only image (text/face spanning nearly the wh
   assert.ok(withoutPages && withPages);
   const faceOnlyMeta = await sharp(withoutPages!).metadata();
   const boundaryMeta = await sharp(withPages!).metadata();
-  // Document boundary alone (no HIGH-confidence column/MRZ in this sparse
-  // fixture) must not shrink the crop below the pure face-only size --
-  // a passport filling the frame has no meaningful background to exclude.
+  // WIDTH: document boundary detection itself (no HIGH-confidence
+  // column/MRZ in this sparse fixture, and no documentBoundary is even
+  // confidently formed here) does not shrink the crop below the pure
+  // face-only size on this axis.
   assert.equal(boundaryMeta.width, faceOnlyMeta.width);
-  assert.equal(boundaryMeta.height, faceOnlyMeta.height);
+  // HEIGHT: this fixture's own 'MRZ LINE SIMULATED LONG TEXT ROW HERE'
+  // paragraph (y0=1230-1260, x0=20-940, i.e. edge-to-edge) sits inside the
+  // BOTTOM expansion gap between baseRegion's own bottom edge and the
+  // image's own bottom edge, and overlaps the region's own x-range -- so
+  // the new BOTTOM occupancy check in computeHardBounds now correctly caps
+  // growth there, same as the pure face-only crop would. Verified by
+  // actually running this exact fixture: boundaryMeta.height is 348 (==
+  // baseRegion's own height, zero growth), vs faceOnlyMeta's 460. This is a
+  // genuinely changed mechanism (this implementation adds BOTTOM-axis
+  // protection; nothing before looked at this axis at all), not a hidden
+  // failure -- the two no longer need to match.
+  assert.equal(boundaryMeta.height, 348);
+  assert.equal(faceOnlyMeta.height, 460);
 });
 
 test('document boundary: a passport photographed with real surrounding background is isolated from that background', async () => {
@@ -704,4 +729,412 @@ test('MEDIUM column (constructed, real pipeline): a 4-member cluster capped at M
     'the MEDIUM-confidence RIGHT constraint must narrow the crop through the real pipeline -- if this fails, the MEDIUM branch is not wired in',
   );
   assert.equal(withMeta.width, 288, 'must match the known-correct constrained width for this fixture');
+});
+
+// =============================================================================
+// V CROP TEXT PROTECTION -- computeHardBounds's four-direction occupancy
+// check (TOP/RIGHT/BOTTOM/LEFT). All fixtures below are synthetic, built
+// from first principles to isolate each axis -- not derived from any real
+// photo. Every number was obtained by actually running the real, exported
+// functions (computeApplicantPhotoCropRegion, detectDocumentBoundary,
+// filterFacesToBoundary, clampRegionToBoundary, computeHardBounds,
+// applyTargetAspectRatio, and the full extractApplicantPhotoCrop pipeline),
+// never hand-derived.
+//
+// Shared fixture convention: "filler" paragraphs are placed strictly INSIDE
+// the face-only baseRegion's own x/y span, so they are provably inert for
+// all four occupancy checks (each check only ever looks at the gap BEYOND
+// baseRegion, never baseRegion's own interior) -- they exist only to reach
+// detectDocumentBoundary's own MIN_PARAGRAPHS_FOR_BOUNDARY floor without
+// contaminating which axis a given test isolates.
+// =============================================================================
+
+function hardBoundsFixtureImage(width: number, height: number): Promise<Buffer> {
+  return sharp({ create: { width, height, channels: 3, background: { r: 220, g: 220, b: 220 } } }).jpeg().toBuffer();
+}
+
+// Tall/narrow face (900x750 image): baseRegion works out to
+// {left:68, top:0, width:315, height:690} -- its own width/height ratio
+// sits well below 0.78, so applyTargetAspectRatio must grow WIDTH to
+// approach the target, isolating the LEFT/RIGHT axes.
+const HB_LR_FACE: VisionFaceAnnotation = { boundingPoly: box(150, 150, 300, 550), detectionConfidence: 0.95 };
+const HB_LR_FILLERS = [
+  paragraphFixture('FILLER A', 100, 50, 200, 70),
+  paragraphFixture('FILLER B', 150, 600, 250, 620),
+  paragraphFixture('FILLER C', 100, 650, 200, 670),
+];
+
+// Wide/short face (900x900 image): baseRegion works out to
+// {left:0, top:90, width:770, height:263} -- ratio sits well above 0.78, so
+// applyTargetAspectRatio must grow HEIGHT, isolating the TOP/BOTTOM axes.
+const HB_TB_FACE: VisionFaceAnnotation = { boundingPoly: box(150, 150, 550, 300), detectionConfidence: 0.95 };
+const HB_TB_FILLERS = [
+  paragraphFixture('FILLER A', 100, 100, 200, 120),
+  paragraphFixture('FILLER B', 300, 150, 400, 170),
+  paragraphFixture('FILLER C', 500, 300, 600, 320),
+];
+
+test('V text protection -- RIGHT alone: a real paragraph in the RIGHT expansion gap caps hardRight at baseRegion.right, through the full pipeline', async () => {
+  const width = 900, height = 750;
+  const pages: VisionPage[] = [
+    { blocks: [{ paragraphs: [paragraphFixture('RIGHT TEXT ROW', 500, 300, 750, 330), ...HB_LR_FILLERS] }] },
+  ];
+  const deps = buildDeps([HB_LR_FACE]);
+  const original = await hardBoundsFixtureImage(width, height);
+  const cropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps, pages);
+  assert.ok(cropped);
+  const meta = await sharp(cropped!).metadata();
+  // Verified via the real pipeline: baseRegion.right=383; without this
+  // protection, growth would reach into the RIGHT TEXT ROW (x0=500).
+  assert.equal(meta.width, 319, 'known-correct width for this fixture -- the crop stops at baseRegion.right (383), confirmed below not to cross x0=500');
+  assert.equal(meta.height, 670);
+});
+
+test('V text protection -- RIGHT alone (unit level): hardRight is capped at exactly baseRegion.right, not the looser document-boundary value', () => {
+  const width = 900, height = 750;
+  const paragraphs = [paragraphFixture('RIGHT TEXT ROW', 500, 300, 750, 330), ...HB_LR_FILLERS];
+  const pages: VisionPage[] = [{ blocks: [{ paragraphs }] }];
+  const normalizedParagraphs = flattenParagraphsToNormalizedSpace(pages, { rawWidth: width, rawHeight: height, orientation: undefined });
+  const faces = [HB_LR_FACE];
+  const documentBoundary = detectDocumentBoundary(normalizedParagraphs, faces, width, height);
+  assert.ok(documentBoundary);
+  const effectiveFaces = filterFacesToBoundary(faces, documentBoundary!);
+  const baseRegion = computeApplicantPhotoCropRegion(effectiveFaces, width, height);
+  assert.ok(baseRegion);
+  assert.equal(baseRegion!.left + baseRegion!.width, 383, 'sanity check: baseRegion.right for this fixture');
+  const faceBox = selectBestFaceBox(effectiveFaces);
+  const region = clampRegionToBoundary(baseRegion!, documentBoundary!, faceBox!);
+
+  const hardBounds = computeHardBounds(region, baseRegion!, width, height, documentBoundary, normalizedParagraphs);
+  assert.equal(hardBounds.hardRight, 383, 'hardRight must be capped at baseRegion.right -- the real text occupies the gap');
+
+  const final = applyTargetAspectRatio(region, 0.78, faceBox!, hardBounds.hardLeft, hardBounds.hardTop, hardBounds.hardRight, hardBounds.hardBottom);
+  assert.ok(final.left + final.width <= 500, 'the final crop must stay clear of the RIGHT text row\'s own left edge (x0=500)');
+});
+
+test('V text protection -- LEFT alone: a real paragraph in the LEFT expansion gap caps hardLeft at baseRegion.left, through the full pipeline', async () => {
+  const width = 900, height = 750;
+  const pages: VisionPage[] = [
+    { blocks: [{ paragraphs: [paragraphFixture('LEFT TEXT ROW', 10, 300, 60, 330), ...HB_LR_FILLERS] }] },
+  ];
+  const deps = buildDeps([HB_LR_FACE]);
+  const original = await hardBoundsFixtureImage(width, height);
+  const cropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps, pages);
+  assert.ok(cropped);
+  const meta = await sharp(cropped!).metadata();
+  assert.equal(meta.width, 268, 'known-correct width -- the crop stops at baseRegion.left (68), confirmed below not to cross x1=60');
+  assert.equal(meta.height, 670);
+});
+
+test('V text protection -- LEFT alone (unit level): hardLeft is capped at exactly baseRegion.left', () => {
+  const width = 900, height = 750;
+  const paragraphs = [paragraphFixture('LEFT TEXT ROW', 10, 300, 60, 330), ...HB_LR_FILLERS];
+  const pages: VisionPage[] = [{ blocks: [{ paragraphs }] }];
+  const normalizedParagraphs = flattenParagraphsToNormalizedSpace(pages, { rawWidth: width, rawHeight: height, orientation: undefined });
+  const faces = [HB_LR_FACE];
+  const documentBoundary = detectDocumentBoundary(normalizedParagraphs, faces, width, height);
+  assert.ok(documentBoundary);
+  const effectiveFaces = filterFacesToBoundary(faces, documentBoundary!);
+  const baseRegion = computeApplicantPhotoCropRegion(effectiveFaces, width, height);
+  assert.ok(baseRegion);
+  assert.equal(baseRegion!.left, 68, 'sanity check: baseRegion.left for this fixture');
+  const faceBox = selectBestFaceBox(effectiveFaces);
+  const region = clampRegionToBoundary(baseRegion!, documentBoundary!, faceBox!);
+
+  const hardBounds = computeHardBounds(region, baseRegion!, width, height, documentBoundary, normalizedParagraphs);
+  assert.equal(hardBounds.hardLeft, 68, 'hardLeft must be capped at baseRegion.left');
+
+  const final = applyTargetAspectRatio(region, 0.78, faceBox!, hardBounds.hardLeft, hardBounds.hardTop, hardBounds.hardRight, hardBounds.hardBottom);
+  assert.ok(final.left >= 60, 'the final crop must stay clear of the LEFT text row\'s own right edge (x1=60)');
+});
+
+test('V text protection -- TOP alone: a real paragraph in the TOP expansion gap caps hardTop at baseRegion.top, through the full pipeline', async () => {
+  const width = 900, height = 900;
+  const pages: VisionPage[] = [
+    { blocks: [{ paragraphs: [paragraphFixture('TOP TEXT ROW', 50, 20, 650, 50), ...HB_TB_FILLERS] }] },
+  ];
+  const deps = buildDeps([HB_TB_FACE]);
+  const original = await hardBoundsFixtureImage(width, height);
+  const cropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps, pages);
+  assert.ok(cropped);
+  const meta = await sharp(cropped!).metadata();
+  assert.equal(meta.width, 672);
+  assert.equal(meta.height, 266, 'known-correct height -- hardTop is capped at baseRegion.top (90), confirmed below not to cross y1=50');
+});
+
+test('V text protection -- TOP alone (unit level): hardTop is capped at exactly baseRegion.top', () => {
+  const width = 900, height = 900;
+  const paragraphs = [paragraphFixture('TOP TEXT ROW', 50, 20, 650, 50), ...HB_TB_FILLERS];
+  const pages: VisionPage[] = [{ blocks: [{ paragraphs }] }];
+  const normalizedParagraphs = flattenParagraphsToNormalizedSpace(pages, { rawWidth: width, rawHeight: height, orientation: undefined });
+  const faces = [HB_TB_FACE];
+  const documentBoundary = detectDocumentBoundary(normalizedParagraphs, faces, width, height);
+  assert.ok(documentBoundary);
+  const effectiveFaces = filterFacesToBoundary(faces, documentBoundary!);
+  const baseRegion = computeApplicantPhotoCropRegion(effectiveFaces, width, height);
+  assert.ok(baseRegion);
+  assert.equal(baseRegion!.top, 90, 'sanity check: baseRegion.top for this fixture');
+  const faceBox = selectBestFaceBox(effectiveFaces);
+  const region = clampRegionToBoundary(baseRegion!, documentBoundary!, faceBox!);
+
+  const hardBounds = computeHardBounds(region, baseRegion!, width, height, documentBoundary, normalizedParagraphs);
+  assert.equal(hardBounds.hardTop, 90, 'hardTop must be capped at baseRegion.top');
+
+  const final = applyTargetAspectRatio(region, 0.78, faceBox!, hardBounds.hardLeft, hardBounds.hardTop, hardBounds.hardRight, hardBounds.hardBottom);
+  assert.ok(final.top >= 50, 'the final crop must stay clear of the TOP text row\'s own bottom edge (y1=50)');
+});
+
+test('V text protection -- BOTTOM alone: a real paragraph in the BOTTOM expansion gap caps hardBottom at baseRegion.bottom, through the full pipeline', async () => {
+  const width = 900, height = 900;
+  const pages: VisionPage[] = [
+    { blocks: [{ paragraphs: [paragraphFixture('BOTTOM TEXT ROW', 50, 420, 650, 450), ...HB_TB_FILLERS] }] },
+  ];
+  const deps = buildDeps([HB_TB_FACE]);
+  const original = await hardBoundsFixtureImage(width, height);
+  const cropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps, pages);
+  assert.ok(cropped);
+  const meta = await sharp(cropped!).metadata();
+  assert.equal(meta.width, 672);
+  assert.equal(meta.height, 289, 'known-correct height -- hardBottom is capped at baseRegion.bottom (353), confirmed below not to cross y0=420');
+});
+
+test('V text protection -- BOTTOM alone (unit level): hardBottom is capped at exactly baseRegion.bottom', () => {
+  const width = 900, height = 900;
+  const paragraphs = [paragraphFixture('BOTTOM TEXT ROW', 50, 420, 650, 450), ...HB_TB_FILLERS];
+  const pages: VisionPage[] = [{ blocks: [{ paragraphs }] }];
+  const normalizedParagraphs = flattenParagraphsToNormalizedSpace(pages, { rawWidth: width, rawHeight: height, orientation: undefined });
+  const faces = [HB_TB_FACE];
+  const documentBoundary = detectDocumentBoundary(normalizedParagraphs, faces, width, height);
+  assert.ok(documentBoundary);
+  const effectiveFaces = filterFacesToBoundary(faces, documentBoundary!);
+  const baseRegion = computeApplicantPhotoCropRegion(effectiveFaces, width, height);
+  assert.ok(baseRegion);
+  assert.equal(baseRegion!.top + baseRegion!.height, 353, 'sanity check: baseRegion.bottom for this fixture');
+  const faceBox = selectBestFaceBox(effectiveFaces);
+  const region = clampRegionToBoundary(baseRegion!, documentBoundary!, faceBox!);
+
+  const hardBounds = computeHardBounds(region, baseRegion!, width, height, documentBoundary, normalizedParagraphs);
+  assert.equal(hardBounds.hardBottom, 353, 'hardBottom must be capped at baseRegion.bottom');
+
+  const final = applyTargetAspectRatio(region, 0.78, faceBox!, hardBounds.hardLeft, hardBounds.hardTop, hardBounds.hardRight, hardBounds.hardBottom);
+  assert.ok(final.top + final.height <= 420, 'the final crop must stay clear of the BOTTOM text row\'s own top edge (y0=420)');
+});
+
+test('V text protection -- regression: an empty RIGHT expansion zone (no paragraph there) leaves hardRight completely uncapped, even though the zone genuinely extends past baseRegion.right', () => {
+  const width = 900, height = 750;
+  // FILLER D's own right edge (380) sits just inside baseRegion.right (383)
+  // -- inert for the occupancy check -- but widens the pre-existing
+  // document-boundary union just enough that hardRight (416) ends up
+  // LOOSER than baseRegion.right (383), so the new check's own guard
+  // (`hardRight > baseRegionRight`) is genuinely exercised here, not
+  // skipped as a trivial no-op.
+  const paragraphs = [
+    paragraphFixture('FILLER A', 100, 50, 200, 70),
+    paragraphFixture('FILLER B', 150, 600, 250, 620),
+    paragraphFixture('FILLER C', 100, 650, 200, 670),
+    paragraphFixture('FILLER D', 150, 100, 380, 120),
+  ];
+  const pages: VisionPage[] = [{ blocks: [{ paragraphs }] }];
+  const normalizedParagraphs = flattenParagraphsToNormalizedSpace(pages, { rawWidth: width, rawHeight: height, orientation: undefined });
+  const faces = [HB_LR_FACE];
+  const documentBoundary = detectDocumentBoundary(normalizedParagraphs, faces, width, height);
+  assert.ok(documentBoundary);
+  const effectiveFaces = filterFacesToBoundary(faces, documentBoundary!);
+  const baseRegion = computeApplicantPhotoCropRegion(effectiveFaces, width, height);
+  assert.ok(baseRegion);
+  const faceBox = selectBestFaceBox(effectiveFaces);
+  const region = clampRegionToBoundary(baseRegion!, documentBoundary!, faceBox!);
+
+  const hardBounds = computeHardBounds(region, baseRegion!, width, height, documentBoundary, normalizedParagraphs);
+  assert.equal(hardBounds.hardRight, 416, 'no paragraph occupies the (baseRegion.right, hardRight) gap -- hardRight must stay at its pre-existing, looser value, unaffected by the new check');
+});
+
+test('V text protection -- precision: a paragraph that only TOUCHES baseRegion.right (zero actual overlap) must not trigger the RIGHT cap', () => {
+  const width = 900, height = 750;
+  // Ends exactly at baseRegion.right (383) -- strict '>' in the occupancy
+  // check means touching the edge, with zero overlap into the gap, is
+  // never mistaken for a real collision.
+  const paragraphs = [paragraphFixture('TOUCH ONLY', 200, 300, 383, 330), ...HB_LR_FILLERS];
+  const pages: VisionPage[] = [{ blocks: [{ paragraphs }] }];
+  const normalizedParagraphs = flattenParagraphsToNormalizedSpace(pages, { rawWidth: width, rawHeight: height, orientation: undefined });
+  const faces = [HB_LR_FACE];
+  const documentBoundary = detectDocumentBoundary(normalizedParagraphs, faces, width, height);
+  assert.ok(documentBoundary);
+  const effectiveFaces = filterFacesToBoundary(faces, documentBoundary!);
+  const baseRegion = computeApplicantPhotoCropRegion(effectiveFaces, width, height);
+  assert.ok(baseRegion);
+  assert.equal(baseRegion!.left + baseRegion!.width, 383, 'sanity check: the paragraph\'s own x1 exactly equals baseRegion.right');
+  const faceBox = selectBestFaceBox(effectiveFaces);
+  const region = clampRegionToBoundary(baseRegion!, documentBoundary!, faceBox!);
+
+  const hardBounds = computeHardBounds(region, baseRegion!, width, height, documentBoundary, normalizedParagraphs);
+  assert.equal(hardBounds.hardRight, 419, 'a paragraph that only touches baseRegion.right, with no actual overlap into the gap, must never trigger the cap');
+});
+
+test('V text protection -- LEFT+RIGHT both active simultaneously: real text on both sides caps both edges, growth stays exactly at baseRegion\'s own width, and the face remains fully contained', async () => {
+  const width = 900, height = 750;
+  const pages: VisionPage[] = [
+    {
+      blocks: [
+        {
+          paragraphs: [
+            paragraphFixture('RIGHT TEXT ROW', 500, 300, 750, 330),
+            paragraphFixture('LEFT TEXT ROW', 10, 300, 60, 330),
+            ...HB_LR_FILLERS,
+          ],
+        },
+      ],
+    },
+  ];
+  const faces = [HB_LR_FACE];
+  const deps = buildDeps(faces);
+  const original = await hardBoundsFixtureImage(width, height);
+  const cropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps, pages);
+  assert.ok(cropped);
+  const meta = await sharp(cropped!).metadata();
+  // Verified via the real pipeline: both sides capped at baseRegion's own
+  // edges (68 and 383) -- zero width growth at all, since baseRegion's own
+  // width (315) already fills the entire [68,383] span.
+  assert.equal(meta.width, 315, 'zero growth -- both LEFT and RIGHT are capped at baseRegion\'s own edges');
+  assert.equal(meta.height, 670);
+
+  // Confirm face containment directly against the known face box for this fixture.
+  const normalizedParagraphs = flattenParagraphsToNormalizedSpace(pages, { rawWidth: width, rawHeight: height, orientation: undefined });
+  const documentBoundary = detectDocumentBoundary(normalizedParagraphs, faces, width, height);
+  const effectiveFaces = filterFacesToBoundary(faces, documentBoundary!);
+  const baseRegion = computeApplicantPhotoCropRegion(effectiveFaces, width, height);
+  const faceBox = selectBestFaceBox(effectiveFaces);
+  const region = clampRegionToBoundary(baseRegion!, documentBoundary!, faceBox!);
+  const hardBounds = computeHardBounds(region, baseRegion!, width, height, documentBoundary, normalizedParagraphs);
+  const final = applyTargetAspectRatio(region, 0.78, faceBox!, hardBounds.hardLeft, hardBounds.hardTop, hardBounds.hardRight, hardBounds.hardBottom);
+  assert.ok(
+    faceBox!.x0 >= final.left && faceBox!.y0 >= final.top && faceBox!.x1 <= final.left + final.width && faceBox!.y1 <= final.top + final.height,
+    'the detected face must remain fully inside the final crop',
+  );
+});
+
+test('V text protection -- TOP+BOTTOM both active simultaneously: real text above and below caps both edges, growth stays exactly at baseRegion\'s own height', async () => {
+  const width = 900, height = 900;
+  const pages: VisionPage[] = [
+    {
+      blocks: [
+        {
+          paragraphs: [
+            paragraphFixture('TOP TEXT ROW', 50, 20, 650, 50),
+            paragraphFixture('BOTTOM TEXT ROW', 50, 420, 650, 450),
+            ...HB_TB_FILLERS,
+          ],
+        },
+      ],
+    },
+  ];
+  const deps = buildDeps([HB_TB_FACE]);
+  const original = await hardBoundsFixtureImage(width, height);
+  const cropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps, pages);
+  assert.ok(cropped);
+  const meta = await sharp(cropped!).metadata();
+  assert.equal(meta.width, 672);
+  assert.equal(meta.height, 263, 'zero growth -- both TOP and BOTTOM are capped at baseRegion\'s own edges');
+});
+
+test('V text protection -- TOP+RIGHT active simultaneously on DIFFERENT axes: each axis is capped independently with no cross-interference, and neither paragraph enters the final crop', async () => {
+  const width = 900, height = 900;
+  const pages: VisionPage[] = [
+    {
+      blocks: [
+        {
+          paragraphs: [
+            paragraphFixture('TOP TEXT ROW', 50, 20, 650, 50),
+            paragraphFixture('RIGHT TEXT ROW', 800, 150, 890, 300),
+            ...HB_TB_FILLERS,
+          ],
+        },
+      ],
+    },
+  ];
+  const faces = [HB_TB_FACE];
+  const deps = buildDeps(faces);
+  const original = await hardBoundsFixtureImage(width, height);
+  const cropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps, pages);
+  assert.ok(cropped);
+  const meta = await sharp(cropped!).metadata();
+  // Verified via the real pipeline: the HEIGHT axis is the one that grows
+  // here (width stays at baseRegion's own 770, already capped by the RIGHT
+  // check); height grows only slightly (263 -> 266), using up a small,
+  // genuinely unprotected-but-empty margin below baseRegion.bottom --
+  // still well clear of both paragraphs.
+  assert.equal(meta.width, 756);
+  assert.equal(meta.height, 266);
+
+  const normalizedParagraphs = flattenParagraphsToNormalizedSpace(pages, { rawWidth: width, rawHeight: height, orientation: undefined });
+  const documentBoundary = detectDocumentBoundary(normalizedParagraphs, faces, width, height);
+  assert.ok(documentBoundary);
+  const effectiveFaces = filterFacesToBoundary(faces, documentBoundary!);
+  const baseRegion = computeApplicantPhotoCropRegion(effectiveFaces, width, height);
+  assert.ok(baseRegion);
+  const faceBox = selectBestFaceBox(effectiveFaces);
+  const region = clampRegionToBoundary(baseRegion!, documentBoundary!, faceBox!);
+  const hardBounds = computeHardBounds(region, baseRegion!, width, height, documentBoundary, normalizedParagraphs);
+  assert.equal(hardBounds.hardTop, 90, 'TOP is capped at baseRegion.top');
+  assert.equal(hardBounds.hardRight, 770, 'RIGHT is capped at baseRegion.right, independently of TOP');
+});
+
+test('V text protection -- crop never exceeds the image bounds, even when a face sits at the image corner with real text nearby', async () => {
+  const width = 500, height = 600;
+  const face: VisionFaceAnnotation = { boundingPoly: box(0, 0, 150, 180), detectionConfidence: 0.95 };
+  const pages: VisionPage[] = [
+    {
+      blocks: [
+        {
+          paragraphs: [
+            paragraphFixture('EDGE LABEL ROW NEAR CORNER', 0, 0, 200, 20),
+            paragraphFixture('ANOTHER FIELD ROW', 0, 220, 300, 250),
+            paragraphFixture('YET ANOTHER FIELD ROW HERE', 0, 280, 320, 310),
+            paragraphFixture('AND ONE MORE FIELD ROW TOO', 0, 340, 330, 370),
+          ],
+        },
+      ],
+    },
+  ];
+  const deps = buildDeps([face]);
+  const original = await hardBoundsFixtureImage(width, height);
+  const cropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps, pages);
+  assert.ok(cropped, 'a document-boundary union touching the image corner must never crash or produce a null crop');
+  const meta = await sharp(cropped!).metadata();
+  assert.ok(meta.width! > 0 && meta.width! <= width, 'crop width must stay within [0, imageWidth]');
+  assert.ok(meta.height! > 0 && meta.height! <= height, 'crop height must stay within [0, imageHeight]');
+});
+
+test('V text protection -- expandDimension redirection mechanism (direct proof): capping hardRight alone, without the LEFT check, would redirect width growth all the way to hardLeft=0, crossing real LEFT-side text; the actual hardLeft=baseRegion.left cap (computed above) prevents this', () => {
+  // Reuses the exact region/faceBox the LEFT+RIGHT simultaneous test above
+  // produces for this fixture (region after document-boundary clamp:
+  // {left:68, top:20, width:315, height:670}), to isolate expandDimension's
+  // own "shift, not shrink" redirection from the rest of the pipeline.
+  const region = { left: 68, top: 20, width: 315, height: 670 };
+  const faceBox = { x0: 150, y0: 150, x1: 300, y1: 550 };
+
+  // Counterfactual: hardRight capped at baseRegion.right (383), but hardLeft
+  // left at its loose, pre-occupancy-check value (0) -- i.e. exactly what a
+  // RIGHT-only fix (with no LEFT protection) would produce.
+  const withoutLeftCheck = applyTargetAspectRatio(region, 0.78, faceBox, /* hardLeft */ 0, /* hardTop */ 20, /* hardRight */ 383, /* hardBottom */ 700);
+  assert.equal(withoutLeftCheck.left, 0, 'without a LEFT check, the RIGHT cap\'s unused growth share shifts entirely onto the LEFT side, all the way out to hardLeft');
+  assert.ok(withoutLeftCheck.left < 60, 'THE RISK: this redirected growth would cross the real LEFT text\'s own right edge (x1=60) -- exactly the exposure a RIGHT-only fix would introduce');
+
+  // The actual fix: hardLeft correctly capped to baseRegion.left (68).
+  const withLeftCheck = applyTargetAspectRatio(region, 0.78, faceBox, /* hardLeft */ 68, /* hardTop */ 20, /* hardRight */ 383, /* hardBottom */ 700);
+  assert.equal(withLeftCheck.left, 68, 'with the LEFT check, growth cannot be redirected past baseRegion.left');
+  assert.ok(withLeftCheck.left >= 60, 'the fixed result stays clear of the LEFT text\'s right edge (x1=60)');
+});
+
+test('V text protection -- expandDimension redirection mechanism (direct proof, TOP/BOTTOM axis): capping hardTop alone, without the BOTTOM check, would redirect height growth all the way to hardBottom=900, crossing real BOTTOM-side text; the actual hardBottom=baseRegion.bottom cap prevents this', () => {
+  const region = { left: 14, top: 90, width: 756, height: 263 };
+  const faceBox = { x0: 150, y0: 150, x1: 550, y1: 300 };
+
+  const withoutBottomCheck = applyTargetAspectRatio(region, 0.78, faceBox, /* hardLeft */ 14, /* hardTop */ 90, /* hardRight */ 770, /* hardBottom */ 900);
+  assert.equal(withoutBottomCheck.height, 810, 'without a BOTTOM check, height growth runs all the way down to hardBottom (900)');
+  assert.ok(withoutBottomCheck.top + withoutBottomCheck.height > 420, 'THE RISK: this redirected growth would cross the real BOTTOM text\'s own top edge (y0=420)');
+
+  const withBottomCheck = applyTargetAspectRatio(region, 0.78, faceBox, /* hardLeft */ 14, /* hardTop */ 90, /* hardRight */ 770, /* hardBottom */ 353);
+  assert.equal(withBottomCheck.height, 263, 'with the BOTTOM check capped at baseRegion.bottom (353), there is zero room left to grow');
+  assert.ok(withBottomCheck.top + withBottomCheck.height <= 420, 'the fixed result stays clear of the BOTTOM text\'s top edge (y0=420)');
 });
