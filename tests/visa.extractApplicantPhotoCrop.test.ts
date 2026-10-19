@@ -18,8 +18,10 @@ import {
   clampRegionToBoundary,
   detectDocumentBoundary,
   filterFacesToBoundary,
+  filterParagraphsToBoundary,
 } from '../src/visa/detectDocumentBoundary.js';
 import { flattenParagraphsToNormalizedSpace } from '../src/visa/transformVisionCoordinates.js';
+import { locateMrzParagraphGeometry } from '../src/ocr/mrz/locateMrzParagraphGeometry.js';
 import type { VisionPage } from '../src/ocr/visual/extractIssueDateFromVisionStructure.js';
 
 const IMAGE_WIDTH = 800;
@@ -1137,4 +1139,142 @@ test('V text protection -- expandDimension redirection mechanism (direct proof, 
   const withBottomCheck = applyTargetAspectRatio(region, 0.78, faceBox, /* hardLeft */ 14, /* hardTop */ 90, /* hardRight */ 770, /* hardBottom */ 353);
   assert.equal(withBottomCheck.height, 263, 'with the BOTTOM check capped at baseRegion.bottom (353), there is zero room left to grow');
   assert.ok(withBottomCheck.top + withBottomCheck.height <= 420, 'the fixed result stays clear of the BOTTOM text\'s top edge (y0=420)');
+});
+
+// --- V text protection -- REAL PASSPORT 381 DATA -------------------------
+// Reuses REAL_381_TEXT_DETECTION_PAGES / makePassport381SizedImage / the
+// face box+confidence already defined above (verbatim real production
+// Vision geometry for passport 381 -- see that fixture's own doc comment
+// and tests/visa.detectPersonalDataColumn.test.ts for the same data at the
+// unit level). Nothing here is synthetic or invented: every coordinate
+// below (the 10 personal-data-column paragraph boxes + the 1 real MRZ
+// paragraph box) is copied verbatim from REAL_381_TEXT_DETECTION_PAGES
+// above. This does NOT prove photo quality on arbitrary real images in
+// general (see the final report for that caveat) -- it proves that for
+// THIS ONE already-studied real passport's actual geometry, the pipeline's
+// face-containment and text-exclusion properties hold end to end, and that
+// the new computeHardBounds occupancy checks are not merely a theoretical
+// concern: this real passport's own MRZ paragraph genuinely sits in the
+// BOTTOM growth gap and would otherwise re-enter the crop.
+const REAL_381_PERSONAL_COLUMN_AND_MRZ_BOXES: Array<[number, number, number, number]> = [
+  [314, 738, 448, 750], // FAMILIYASI SURNAME
+  [317, 753, 477, 773], // IBRAGIMOVA
+  [312, 823, 511, 838], // OTASINING ISMI FATHER'S NAME
+  [315, 840, 463, 860], // BOTIROVNA
+  [313, 867, 477, 882], // FUQAROLIGI NATIONALITY
+  [312, 884, 447, 903], // UZBEKISTAN
+  [312, 908, 528, 920], // TUG'ILGAN SANASI DATE OF BIRTH
+  [316, 921, 478, 941], // 12 03 2018
+  [311, 1011, 523, 1049], // BERILGAN SANASH DATE OF ISSUE 15 03 2024
+  [310, 1055, 554, 1094], // AMAL QILISH MUDDATI DATE OF EXPIRY 14 03 2029
+  [42, 1135, 821, 1222], // MRZ line
+];
+
+function boxIntersectsRegion(box: [number, number, number, number], region: { left: number; top: number; width: number; height: number }): boolean {
+  const [x0, y0, x1, y1] = box;
+  return x0 < region.left + region.width && x1 > region.left && y0 < region.top + region.height && y1 > region.top;
+}
+
+test('V text protection -- REAL PASSPORT 381: the layout-aware + computeHardBounds-protected crop fully contains the real face and excludes every real personal-data/MRZ paragraph', async () => {
+  const width = 960, height = 1280;
+  const original = await makePassport381SizedImage();
+  const faces = [{ boundingPoly: box(60, 776, 264, 1014), detectionConfidence: 0.98828125 }];
+  const deps = buildDeps(faces);
+
+  // Full-pipeline cross-check: the real, public extractApplicantPhotoCrop
+  // must actually produce this exact size -- the lower-level replica below
+  // is only used to recover the {left,top} this public function does not
+  // itself return, never as a parallel/divergent computation.
+  const cropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps, REAL_381_TEXT_DETECTION_PAGES);
+  assert.ok(cropped);
+  const meta = await sharp(cropped!).metadata();
+
+  const normalizedParagraphs = flattenParagraphsToNormalizedSpace(REAL_381_TEXT_DETECTION_PAGES, {
+    rawWidth: width,
+    rawHeight: height,
+    orientation: undefined,
+  });
+  const documentBoundary = detectDocumentBoundary(normalizedParagraphs, faces, width, height);
+  assert.ok(documentBoundary, 'sanity check: this real paragraph set forms a confident document boundary');
+  const effectiveFaces = filterFacesToBoundary(faces, documentBoundary!);
+  const baseRegion = computeApplicantPhotoCropRegion(effectiveFaces, width, height);
+  assert.ok(baseRegion);
+  const faceBox = selectBestFaceBox(effectiveFaces);
+  assert.ok(faceBox);
+
+  const paragraphsForLayout = filterParagraphsToBoundary(normalizedParagraphs, documentBoundary!);
+  const mrzResult = locateMrzParagraphGeometry(paragraphsForLayout, width, height);
+  assert.ok(mrzResult && mrzResult.confidence === 'HIGH', 'sanity check: the real MRZ paragraph is found at HIGH confidence');
+  const expandedFaceRegion = buildColumnDetectionContext(faceBox!);
+  const columnResult = detectPersonalDataColumn(paragraphsForLayout, faceBox!, expandedFaceRegion, width, height, [mrzResult!.paragraph]);
+  assert.ok(columnResult && columnResult.confidence === 'HIGH', 'sanity check: the real personal-data column is found at HIGH confidence');
+
+  // Mirrors buildLayoutConstraintsFromParagraphs's own margin formula in
+  // extractApplicantPhotoCrop.ts (RIGHT_MARGIN_FRACTION / BOTTOM_MARGIN_FRACTION
+  // = 0.012, MIN_MARGIN_PIXELS = 8) -- not a guessed value, copied from that
+  // module's own (unexported) constants, read directly from its source.
+  const rightMargin = Math.max(8, 0.012 * width);
+  const bottomMargin = Math.max(8, 0.012 * height);
+  const layoutConstraints = { right: columnResult!.columnX0 - rightMargin, bottom: mrzResult!.top - bottomMargin };
+  const constrainedRegion = computeApplicantPhotoCropRegion(effectiveFaces, width, height, layoutConstraints);
+  let region = constrainedRegion ?? baseRegion!;
+  const { appliedRightConstraint, appliedBottomConstraint } = region;
+  region = { ...clampRegionToBoundary(region, documentBoundary!, faceBox!), appliedRightConstraint, appliedBottomConstraint };
+
+  const hardBounds = computeHardBounds(region, baseRegion!, width, height, documentBoundary, normalizedParagraphs);
+  // The real MRZ paragraph (y0=1135..y1=1222) sits inside the BOTTOM growth
+  // gap between baseRegion's own bottom (681+417=1098) and the
+  // document-boundary-derived looser value -- the new BOTTOM occupancy
+  // check must engage here, on real data, not just on constructed fixtures.
+  assert.equal(hardBounds.hardBottom, baseRegion!.top + baseRegion!.height, 'the new BOTTOM occupancy check must cap growth at baseRegion.bottom for this real MRZ paragraph');
+
+  const final = applyTargetAspectRatio(region, 0.78, faceBox!, hardBounds.hardLeft, hardBounds.hardTop, hardBounds.hardRight, hardBounds.hardBottom);
+
+  // Cross-check against the real public pipeline's own output size.
+  assert.equal(meta.width, final.width, 'the lower-level replica must match the real extractApplicantPhotoCrop output exactly');
+  assert.equal(meta.height, final.height, 'the lower-level replica must match the real extractApplicantPhotoCrop output exactly');
+
+  assert.ok(
+    faceBox!.x0 >= final.left && faceBox!.y0 >= final.top && faceBox!.x1 <= final.left + final.width && faceBox!.y1 <= final.top + final.height,
+    'the real detected face must remain fully inside the final crop',
+  );
+  assert.ok(final.left >= 0 && final.top >= 0 && final.left + final.width <= width && final.top + final.height <= height, 'the final crop must stay within the image bounds');
+
+  for (const realTextBox of REAL_381_PERSONAL_COLUMN_AND_MRZ_BOXES) {
+    assert.equal(
+      boxIntersectsRegion(realTextBox, final),
+      false,
+      `real passport text box [${realTextBox.join(',')}] must not intersect the final crop`,
+    );
+  }
+});
+
+test('V text protection -- REAL PASSPORT 381 (before/after): without any layout/text awareness at all, the pure face-only crop WOULD have intruded into most of this real passport\'s own printed text -- demonstrating the real-world problem this fix addresses, not just an abstract geometric scenario', async () => {
+  const width = 960, height = 1280;
+  const original = await makePassport381SizedImage();
+  const faces = [{ boundingPoly: box(60, 776, 264, 1014), detectionConfidence: 0.98828125 }];
+  const deps = buildDeps(faces);
+
+  // The pure face-only pipeline call (3-argument form, no textDetectionPages
+  // at all) -- i.e. exactly how this function behaved before ANY of this
+  // engagement's layout/document-boundary/text-protection work existed.
+  const cropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps);
+  assert.ok(cropped);
+  const meta = await sharp(cropped!).metadata();
+
+  const baseRegion = computeApplicantPhotoCropRegion(faces, width, height);
+  assert.ok(baseRegion);
+  const faceBox = selectBestFaceBox(faces);
+  assert.ok(faceBox);
+  const hardBounds = computeHardBounds(baseRegion!, baseRegion!, width, height, null, []);
+  const final = applyTargetAspectRatio(baseRegion!, 0.78, faceBox!, hardBounds.hardLeft, hardBounds.hardTop, hardBounds.hardRight, hardBounds.hardBottom);
+
+  assert.equal(meta.width, final.width, 'the lower-level replica must match the real extractApplicantPhotoCrop output exactly');
+  assert.equal(meta.height, final.height, 'the lower-level replica must match the real extractApplicantPhotoCrop output exactly');
+
+  const intrudedBoxes = REAL_381_PERSONAL_COLUMN_AND_MRZ_BOXES.filter((realTextBox) => boxIntersectsRegion(realTextBox, final));
+  assert.ok(
+    intrudedBoxes.length >= 8,
+    `expected the pure face-only crop to intrude into most of the 11 real text boxes on this real passport (got ${intrudedBoxes.length}) -- this is the real-world exposure the layout-aware + computeHardBounds protection exists to close`,
+  );
 });
