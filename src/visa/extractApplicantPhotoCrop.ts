@@ -456,10 +456,36 @@ export function computeHardBounds(
     if (region.top + region.height <= documentBoundary.y1) hardBottom = Math.min(hardBottom, documentBoundary.y1);
   }
 
-  if (region.appliedRightConstraint !== undefined && region.left + region.width <= region.appliedRightConstraint) {
+  // ROUNDING_EPSILON_PIXELS accounts for a real rounding mismatch found on
+  // production passports 408 and 410 (see tests/visa.extractApplicantPhotoCrop.test.ts's
+  // "REAL PASSPORT 408"/"410" tests): computeApplicantPhotoCropRegion.ts's own
+  // narrowing "attempts" loop rounds `left` and `width` (or `top`/`height`)
+  // INDEPENDENTLY via two separate Math.round() calls, each individually
+  // bounded by that module's own documented 0.5px rounding tolerance --
+  // when both round in the same direction, the compound drift on
+  // region.left+region.width (or region.top+region.height) relative to the
+  // true, pre-rounding appliedRightConstraint/appliedBottomConstraint value
+  // can approach, but never reach, the sum of those two 0.5px tolerances
+  // (1px). Without this tolerance, a ~0.52px compound drift silently
+  // disqualified an already-accepted, already-safe narrowing constraint
+  // here, letting applyTargetAspectRatio's growth step re-admit real
+  // personal-data text that narrowing had successfully excluded moments
+  // earlier. This tolerance only ever makes an ALREADY-accepted constraint
+  // (computeApplicantPhotoCropRegion's own independent acceptance check
+  // already vetted it as face-safe) more likely to be honored here -- it
+  // never relaxes that acceptance check itself, so it carries no risk of
+  // treating a constraint as safe that was not already judged so.
+  const ROUNDING_EPSILON_PIXELS = 1;
+  if (
+    region.appliedRightConstraint !== undefined &&
+    region.left + region.width <= region.appliedRightConstraint + ROUNDING_EPSILON_PIXELS
+  ) {
     hardRight = Math.min(hardRight, region.appliedRightConstraint);
   }
-  if (region.appliedBottomConstraint !== undefined && region.top + region.height <= region.appliedBottomConstraint) {
+  if (
+    region.appliedBottomConstraint !== undefined &&
+    region.top + region.height <= region.appliedBottomConstraint + ROUNDING_EPSILON_PIXELS
+  ) {
     hardBottom = Math.min(hardBottom, region.appliedBottomConstraint);
   }
 

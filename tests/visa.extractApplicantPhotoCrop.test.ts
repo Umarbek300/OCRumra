@@ -1278,3 +1278,487 @@ test('V text protection -- REAL PASSPORT 381 (before/after): without any layout/
     `expected the pure face-only crop to intrude into most of the 11 real text boxes on this real passport (got ${intrudedBoxes.length}) -- this is the real-world exposure the layout-aware + computeHardBounds protection exists to close`,
   );
 });
+
+// --- V text protection -- REAL PASSPORT 414 (RIGHT-side growth protection) ---
+// Coordinates (face box + all 16 paragraph boxes) are copied verbatim from
+// tests/visa.detectPersonalDataColumn.test.ts's own "real passport 414"
+// fixture (896x1280, the only real passport on record whose personal-data
+// column reaches only MEDIUM confidence, x0Range=51px, includes genuine
+// garbled OCR fragments) -- real production Vision geometry, not invented.
+//
+// detectionConfidence = 0.95 below is a PLACEHOLDER, NOT a transcribed real
+// Vision value: that fixture's own file only records FaceBox (x0/y0/x1/y1),
+// because detectPersonalDataColumn never needs a confidence number -- no
+// real detectionConfidence for this face was ever written down anywhere in
+// this engagement. 0.95 is the same placeholder convention this test file
+// already uses for every other non-381 face fixture (e.g. the many
+// `detectionConfidence: 0.95` literals above); it only needs to clear
+// computeApplicantPhotoCropRegion.ts's MIN_DETECTION_CONFIDENCE=0.5 gate,
+// which does not affect geometry. This placeholder means: this test proves
+// the fix's behavior on real column/MRZ/face GEOMETRY, but does NOT prove
+// anything about how a real Vision confidence score for this exact face
+// would interact with the pipeline's own confidence-based branches.
+const REAL_414_PARAGRAPHS: Array<[string, number, number, number, number]> = [
+  ['buf-', 323, 310, 475, 405],
+  ['SHAXSIY IMZO / HOLDERS SIGNATURE', 285, 567, 545, 593],
+  ['UZB', 602, 439, 679, 466],
+  ['DAVLAT KODI / COUNTRY CODE', 393, 660, 569, 683],
+  ['UZB', 467, 684, 502, 698],
+  ['PASPORT RAQAMI / PASSPORT No', 596, 650, 781, 670],
+  ['FA7811218', 638, 672, 770, 696],
+  ['TOSHMATOVA', 300, 731, 451, 760],
+  ['BAKHROMOVNA', 307, 810, 472, 840],
+  ['FUQAROLIGI / NATIONALITY UZBEKISTAN', 295, 833, 447, 877],
+  ["TUG'ILGAN SANASI / DATE OF BIRTH", 312, 869, 460, 892],
+  ['11 04 1964', 311, 885, 463, 914],
+  ['TASHKENT', 440, 918, 561, 945],
+  ['BERILGAN SANASI / DATE OF ISSUE', 336, 963, 498, 986],
+  ['25 05 2023 AMAL QILISH MUDDATI', 307, 980, 533, 1053],
+  ['MIA 26291', 584, 963, 723, 994],
+];
+
+test('V text protection -- REAL PASSPORT 414 (RIGHT-side growth protection, MEDIUM-confidence column, detectionConfidence is a documented PLACEHOLDER): the new RIGHT occupancy check caps growth at baseRegion.right against a real paragraph sitting in the growth gap, through the full real pipeline', async () => {
+  const width = 896, height = 1280;
+  const original = await sharp({ create: { width, height, channels: 3, background: { r: 230, g: 230, b: 230 } } }).jpeg().toBuffer();
+  // PLACEHOLDER confidence -- see the module-level comment above. Face box
+  // itself (88,784,266,991) is the real, recorded passport-414 geometry.
+  const faces = [{ boundingPoly: box(88, 784, 266, 991), detectionConfidence: 0.95 }];
+  const deps = buildDeps(faces);
+  const pages: VisionPage[] = [{ blocks: [{ paragraphs: REAL_414_PARAGRAPHS.map(([t, x0, y0, x1, y1]) => paragraphFixture(t, x0, y0, x1, y1)) }] }];
+
+  // Full-pipeline run through the REAL, unmodified extractApplicantPhotoCrop.
+  const baseCropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps);
+  const layoutCropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps, pages);
+  assert.ok(baseCropped && layoutCropped);
+  const baseMeta = await sharp(baseCropped!).metadata();
+  const layoutMeta = await sharp(layoutCropped!).metadata();
+  // Verified via the real pipeline (not hand-derived): the face-only base
+  // crop is 364x467; with this real paragraph set, the layout-aware crop is
+  // 312x400.
+  assert.equal(baseMeta.width, 364);
+  assert.equal(baseMeta.height, 467);
+  assert.equal(layoutMeta.width, 312);
+  assert.equal(layoutMeta.height, 400);
+
+  // Lower-level replica, for the SAME reason and with the SAME independence
+  // caveat as the passport-381 test above: this recovers {left,top}, which
+  // the public function never returns, by replaying its own exported
+  // building blocks -- it is a fidelity check against the real pipeline's
+  // own output size, never an independent proof of correctness.
+  const normalizedParagraphs = flattenParagraphsToNormalizedSpace(pages, { rawWidth: width, rawHeight: height, orientation: undefined });
+  const documentBoundary = detectDocumentBoundary(normalizedParagraphs, faces, width, height);
+  assert.ok(documentBoundary);
+  const effectiveFaces = filterFacesToBoundary(faces, documentBoundary!);
+  const baseRegion = computeApplicantPhotoCropRegion(effectiveFaces, width, height);
+  assert.ok(baseRegion);
+  const faceBox = selectBestFaceBox(effectiveFaces);
+  assert.ok(faceBox);
+
+  const paragraphsForLayout = filterParagraphsToBoundary(normalizedParagraphs, documentBoundary!);
+  const mrzResult = locateMrzParagraphGeometry(paragraphsForLayout, width, height);
+  // This real fixture contains no MRZ-shaped line at all -- confirmed null,
+  // so the BOTTOM constraint path is never exercised by this test; it
+  // isolates to the RIGHT/column side, as required.
+  assert.equal(mrzResult, null);
+  const expandedFaceRegion = buildColumnDetectionContext(faceBox!);
+  const columnResult = detectPersonalDataColumn(paragraphsForLayout, faceBox!, expandedFaceRegion, width, height, []);
+  assert.ok(columnResult);
+  assert.equal(columnResult!.confidence, 'MEDIUM', 'sanity check: this is the real MEDIUM-confidence passport-414 column, not HIGH');
+
+  const rightMargin = Math.max(8, 0.012 * width);
+  const layoutConstraints = { right: columnResult!.columnX0 - rightMargin };
+  const constrainedRegion = computeApplicantPhotoCropRegion(effectiveFaces, width, height, layoutConstraints);
+  // Verified via the real pipeline: for this real fixture, the MEDIUM-confidence
+  // right constraint is NOT accepted by computeApplicantPhotoCropRegion's own
+  // narrowing guard (it falls back to null), so `region` stays at baseRegion
+  // here -- this is the real, observed behavior, not assumed.
+  let region = constrainedRegion ?? baseRegion!;
+  const { appliedRightConstraint, appliedBottomConstraint } = region;
+  region = { ...clampRegionToBoundary(region, documentBoundary!, faceBox!), appliedRightConstraint, appliedBottomConstraint };
+
+  const hardBounds = computeHardBounds(region, baseRegion!, width, height, documentBoundary, normalizedParagraphs);
+  const baseRegionRight = baseRegion!.left + baseRegion!.width;
+  // THE ACTUAL THING THIS TEST PROVES: the real "MIA 26291" paragraph
+  // (x584-723, y963-994) sits in the RIGHT growth gap beyond baseRegion's
+  // own right edge, overlapping the region's y-span -- the new RIGHT
+  // occupancy check correctly caps hardRight there, on real passport data,
+  // not just on a constructed fixture.
+  assert.equal(hardBounds.hardRight, baseRegionRight, 'the new RIGHT occupancy check must cap growth at baseRegion.right for this real paragraph');
+
+  const final = applyTargetAspectRatio(region, 0.78, faceBox!, hardBounds.hardLeft, hardBounds.hardTop, hardBounds.hardRight, hardBounds.hardBottom);
+  assert.equal(layoutMeta.width, final.width, 'the lower-level replica must match the real extractApplicantPhotoCrop output exactly');
+  assert.equal(layoutMeta.height, final.height, 'the lower-level replica must match the real extractApplicantPhotoCrop output exactly');
+
+  assert.ok(final.left + final.width <= baseRegionRight, 'the final crop must never grow past baseRegion.right on this axis');
+  assert.ok(
+    faceBox!.x0 >= final.left && faceBox!.y0 >= final.top && faceBox!.x1 <= final.left + final.width && faceBox!.y1 <= final.top + final.height,
+    'the real detected face must remain fully inside the final crop',
+  );
+
+  // DOCUMENTED, PRE-EXISTING, OUT-OF-SCOPE LIMITATION -- not a regression
+  // from this fix, and not silently hidden: this real passport's own
+  // personal-data column starts at columnX0=285, which is already INSIDE
+  // baseRegion's own footprint (baseRegion spans x0..364), because the
+  // MEDIUM-confidence narrowing above was rejected. Paragraphs whose text
+  // sits inside baseRegion's own footprint (not in the growth gap beyond
+  // it) are never inspected by any of the four occupancy checks (see
+  // computeHardBounds's own doc comment, limitation #2) -- shrinking below
+  // baseRegion to address this would risk cutting the face baseRegion's own
+  // margins were sized to protect. This assertion makes that real, observed
+  // exposure visible and regression-trackable, instead of pretending it
+  // does not exist.
+  const stillIntrudingRealParagraphs = REAL_414_PARAGRAPHS.filter(([, x0, y0, x1, y1]) =>
+    boxIntersectsRegion([x0, y0, x1, y1], final),
+  );
+  assert.ok(
+    stillIntrudingRealParagraphs.length > 0,
+    'known limitation: real personal-data text inside baseRegion\'s own footprint (e.g. surname/DOB starting at columnX0=285) still appears in this real crop -- out of scope for the RIGHT/TOP/BOTTOM/LEFT growth-limiting fix, not a new regression',
+  );
+});
+
+// --- V text protection -- REAL PASSPORTS 408, 409, 410 (regression baseline) ---
+// Coordinates (face box + all paragraph boxes) are copied verbatim from
+// tests/visa.detectPersonalDataColumn.test.ts's own "real passport 408/409/410"
+// fixtures (960x1280 each, all three real HIGH-confidence columns). Real
+// production Vision geometry, not invented.
+//
+// detectionConfidence = 0.95 for all three below is a PLACEHOLDER, NOT a
+// transcribed real Vision value -- same documented limitation as the
+// passport-414 test above: that fixture file never records a real
+// confidence number for these faces. It only needs to clear
+// MIN_DETECTION_CONFIDENCE=0.5, which does not affect geometry.
+//
+// IMPORTANT FINDING from running these three real fixtures through the
+// real pipeline, NOW FIXED (see ROUNDING_EPSILON_PIXELS in
+// extractApplicantPhotoCrop.ts's computeHardBounds): unlike passport 414
+// (where the RIGHT narrowing constraint was REJECTED outright by
+// computeApplicantPhotoCropRegion's own minFaceRightPadding gate -- a
+// separate, still-open issue, deliberately NOT addressed here), for
+// 408/409/410 the narrowing IS accepted by computeApplicantPhotoCropRegion.
+// The true root cause (traced precisely by reading that function's own
+// narrowing "attempts" loop): it rounds `left` and `width` INDEPENDENTLY
+// via two separate Math.round() calls (unlike applyTargetAspectRatio's own
+// final rounding, which deliberately rounds EDGES first to avoid exactly
+// this), so for 408 and 410 both roundings drifted in the same direction,
+// leaving `region.left + region.width` ~0.52px above the (non-integer)
+// appliedRightConstraint value computeApplicantPhotoCropRegion itself had
+// just computed and accepted as safe. Before the fix, computeHardBounds's
+// guard (`region.left + region.width <= region.appliedRightConstraint`)
+// failed by that sub-pixel amount and silently stopped treating the
+// already-applied narrowing as a hard bound at all, so hardRight fell back
+// to the much looser baseRegion-relative occupancy check, and
+// applyTargetAspectRatio's growth step re-expanded the crop back past the
+// real narrowed boundary, reintroducing real personal-data text that
+// narrowing had successfully excluded moments earlier. Passport 409 was
+// the one case among these three where the post-clamp arithmetic happened
+// to land exactly at-or-under the constraint even before the fix, so its
+// guard already held and no text re-entered there. ROUNDING_EPSILON_PIXELS=1
+// (sized as the sum of two independent 0.5px Math.round tolerances -- the
+// exact, provable worst case this two-independent-roundings mechanism can
+// produce) now makes computeHardBounds correctly honor the already-vetted
+// narrowing for 408 and 410 too, confirmed below by direct assertion on
+// hardRight and by re-checking every real paragraph box against the final
+// crop. This is a DIFFERENT, independent mechanism from 414's
+// baseRegion-footprint limitation, which this fix does NOT touch.
+const REAL_408_PARAGRAPHS: Array<[string, number, number, number, number]> = [
+  ['SHAXSIY IMZO / HOLDERS SIGNATURE', 346, 581, 622, 603],
+  ['UZB', 676, 445, 761, 472],
+  ['FB1836885', 822, 109, 896, 564],
+  ['DAVLAT KODI / COUNTRY CODE', 462, 678, 648, 700],
+  ['PASPORT RAQAMI / PASSPORT No', 678, 665, 888, 688],
+  ['FB1836885', 715, 693, 855, 718],
+  ['FAMILIYASI / SURNAME', 350, 737, 480, 756],
+  ['NODIROV', 355, 756, 467, 779],
+  ['AVAZKHON', 358, 795, 484, 819],
+  ["OTASINING ISMI / FATHER'S NAME", 354, 819, 545, 839],
+  ['BOSITKHON UGLI', 360, 832, 581, 862],
+  ['FUQAROLIGI / NATIONALITY', 358, 861, 515, 879],
+  ['UZBEKISTAN', 359, 878, 487, 898],
+  ["TUG'ILGAN SANASI / DATE OF BIRTH", 359, 896, 564, 914],
+  ['06 08 1990', 366, 912, 520, 935],
+  ["TUG'ILGAN JOYI / PLACE OF BIRTH", 485, 926, 681, 969],
+  ['BERILGAN SANASI / DATE OF ISSUE', 366, 990, 563, 1008],
+  ['08 11 2025', 372, 1007, 526, 1029],
+  ['AMAL QILISH MUDDATI / DATE OF EXPIRY', 369, 1027, 597, 1044],
+  ['07 11 2035', 376, 1045, 529, 1067],
+  ['KIM TOMONIDAN BERILGAN / AUTHORITY', 636, 982, 870, 1000],
+  ['PSC 60001', 648, 1001, 789, 1023],
+];
+
+const REAL_409_PARAGRAPHS: Array<[string, number, number, number, number]> = [
+  ['SHAXSIY IMZO / HOLDERS SIGNATURE', 364, 598, 654, 615],
+  ['UZB', 720, 463, 813, 491],
+  ['DAVLAT KODI / COUNTRY CODE', 482, 705, 676, 722],
+  ['UZB', 564, 730, 601, 742],
+  ['PASPORT RAQAMI / PASSPORT No', 707, 697, 918, 715],
+  ['FB1836966', 744, 722, 884, 746],
+  ["OTASINING ISMI / FATHER'S NAME", 363, 844, 563, 865],
+  ["TUG'ILGAN SANASI / DATE OF BIRTH", 366, 919, 576, 939],
+  ['14 12 1965', 373, 934, 533, 959],
+  ["TUG'ILGAN JOYI / PLACE OF BIRTH", 494, 949, 690, 968],
+  ['TASHKENT', 508, 966, 634, 989],
+  ['BERILGAN SANASI / DATE OF ISSUE', 369, 1007, 570, 1028],
+  ['08 11 2025', 376, 1024, 533, 1048],
+  ['AMAL QILISH MUDDATI / DATE OF EXPIRY', 370, 1041, 601, 1083],
+  ['2035', 471, 1060, 534, 1078],
+  ['KIM TOMONIDAN BERILGAN / AUTHORITY', 642, 995, 867, 1038],
+];
+
+const REAL_410_PARAGRAPHS: Array<[string, number, number, number, number]> = [
+  ['SHAXSIY IMZO / HOLDERS SIGNATURE', 355, 598, 623, 617],
+  ['UZB', 685, 466, 767, 493],
+  ['DAVLAT KODI / COUNTRY CODE', 464, 699, 648, 715],
+  ['UZB', 540, 722, 574, 734],
+  ['PASEORT RAQAMI / PASSPORT No', 675, 690, 884, 708],
+  ['FB1836969', 713, 717, 851, 740],
+  ['FAMILIYASI SURNAME', 355, 753, 481, 768],
+  ['ABDUVALIEVA', 361, 768, 529, 790],
+  ["OTASINING ISMI FATHER'S NAME", 359, 832, 543, 847],
+  ['RASHIDOVNA', 365, 849, 516, 868],
+  ['FUQAROLIGI / NATIONALITY', 362, 872, 512, 886],
+  ['UZBEKISTAN', 363, 889, 487, 903],
+  ["TUG'ILGAN SANASI / DATE OF BIRTH", 363, 905, 560, 919],
+  ['13 07 1969', 371, 920, 518, 937],
+  ["TUG'ILGAN JOYI / PLACE OF BIRTH", 484, 939, 672, 951],
+  ['TASHKENT', 497, 956, 616, 974],
+  ['BERILGAN SANASI / DATE OF ISSUE', 370, 993, 559, 1006],
+  ['08 11 2025', 377, 1009, 522, 1027],
+  ['AMAL QILISH MUDDATI / DATE OF EXPIRY', 371, 1026, 591, 1062],
+  ['KIM TOMONIDAN BERILGAN / AUTHORITY', 629, 997, 857, 1006],
+  ['PSC 60001', 640, 1015, 778, 1031],
+];
+
+test('V text protection -- REAL PASSPORT 408 (RIGHT narrowing accepted AND now honored through growth, after the ROUNDING_EPSILON_PIXELS fix): the previously-observed sub-pixel rounding mismatch in the appliedRightConstraint carry-through no longer lets growth re-admit real surname/father-name text, through the full real pipeline', async () => {
+  const width = 960, height = 1280;
+  const original = await sharp({ create: { width, height, channels: 3, background: { r: 230, g: 230, b: 230 } } }).jpeg().toBuffer();
+  const faces = [{ boundingPoly: box(135, 770, 312, 975), detectionConfidence: 0.95 }];
+  const deps = buildDeps(faces);
+  const pages: VisionPage[] = [{ blocks: [{ paragraphs: REAL_408_PARAGRAPHS.map(([t, x0, y0, x1, y1]) => paragraphFixture(t, x0, y0, x1, y1)) }] }];
+
+  const baseCropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps);
+  const layoutCropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps, pages);
+  assert.ok(baseCropped && layoutCropped);
+  const baseMeta = await sharp(baseCropped!).metadata();
+  const layoutMeta = await sharp(layoutCropped!).metadata();
+  // Verified via the real, now-fixed pipeline. layoutMeta.width changed
+  // from 281 (pre-fix, buggy) to 280 (post-fix) -- a 1px-scale correction,
+  // not a visible behavior regression.
+  assert.equal(baseMeta.width, 372);
+  assert.equal(baseMeta.height, 477);
+  assert.equal(layoutMeta.width, 280);
+  assert.equal(layoutMeta.height, 359);
+
+  const normalizedParagraphs = flattenParagraphsToNormalizedSpace(pages, { rawWidth: width, rawHeight: height, orientation: undefined });
+  const documentBoundary = detectDocumentBoundary(normalizedParagraphs, faces, width, height);
+  assert.ok(documentBoundary);
+  const effectiveFaces = filterFacesToBoundary(faces, documentBoundary!);
+  const baseRegion = computeApplicantPhotoCropRegion(effectiveFaces, width, height);
+  assert.ok(baseRegion);
+  const faceBox = selectBestFaceBox(effectiveFaces);
+  assert.ok(faceBox);
+
+  const paragraphsForLayout = filterParagraphsToBoundary(normalizedParagraphs, documentBoundary!);
+  const mrzResult = locateMrzParagraphGeometry(paragraphsForLayout, width, height);
+  assert.equal(mrzResult, null);
+  const expandedFaceRegion = buildColumnDetectionContext(faceBox!);
+  const columnResult = detectPersonalDataColumn(paragraphsForLayout, faceBox!, expandedFaceRegion, width, height, []);
+  assert.ok(columnResult);
+  assert.equal(columnResult!.confidence, 'HIGH');
+  assert.equal(columnResult!.columnX0, 346);
+
+  const rightMargin = Math.max(8, 0.012 * width);
+  const layoutConstraints = { right: columnResult!.columnX0 - rightMargin };
+  const constrainedRegion = computeApplicantPhotoCropRegion(effectiveFaces, width, height, layoutConstraints);
+  assert.ok(constrainedRegion, 'sanity check: unlike passport 414, this real narrowing IS accepted');
+  let region = constrainedRegion!;
+  const { appliedRightConstraint, appliedBottomConstraint } = region;
+  assert.ok(appliedRightConstraint !== undefined);
+  region = { ...clampRegionToBoundary(region, documentBoundary!, faceBox!), appliedRightConstraint, appliedBottomConstraint };
+  // THE ROUNDING MISMATCH still exists at this exact point (unchanged by
+  // the fix, which acts one step later in computeHardBounds): after the
+  // boundary clamp, region's own right edge still technically exceeds
+  // appliedRightConstraint by under 1px.
+  assert.ok(
+    region.left + region.width > appliedRightConstraint!,
+    `expected the post-clamp region (right edge ${region.left + region.width}) to exceed appliedRightConstraint (${appliedRightConstraint}) by a sub-pixel amount -- this is the mechanism the fix tolerates`,
+  );
+  assert.ok(
+    region.left + region.width - appliedRightConstraint! < 1,
+    'sanity check: the mismatch is under 1px, exactly what ROUNDING_EPSILON_PIXELS=1 is sized to cover',
+  );
+
+  const hardBounds = computeHardBounds(region, baseRegion!, width, height, documentBoundary, normalizedParagraphs);
+  // THE FIX, verified directly: hardRight now stays at the real applied
+  // narrowing (appliedRightConstraint), NOT the looser baseRegion-relative
+  // fallback -- the ROUNDING_EPSILON_PIXELS tolerance in computeHardBounds
+  // now correctly honors this already-accepted constraint.
+  assert.equal(hardBounds.hardRight, appliedRightConstraint, 'hardRight must now stay at the real applied narrowing, not fall back to baseRegion.right');
+
+  const final = applyTargetAspectRatio(region, 0.78, faceBox!, hardBounds.hardLeft, hardBounds.hardTop, hardBounds.hardRight, hardBounds.hardBottom);
+  assert.equal(layoutMeta.width, final.width, 'the lower-level replica must match the real extractApplicantPhotoCrop output exactly');
+  assert.equal(layoutMeta.height, final.height, 'the lower-level replica must match the real extractApplicantPhotoCrop output exactly');
+
+  assert.ok(
+    faceBox!.x0 >= final.left && faceBox!.y0 >= final.top && faceBox!.x1 <= final.left + final.width && faceBox!.y1 <= final.top + final.height,
+    'the real detected face must remain fully inside the final crop',
+  );
+
+  // THE FIXED CONSEQUENCE: real surname/father-name text no longer
+  // re-enters the final crop. Not hidden, not asserted away -- checked
+  // against every real paragraph box for this passport.
+  const stillIntrudingRealParagraphs = REAL_408_PARAGRAPHS.filter(([, x0, y0, x1, y1]) => boxIntersectsRegion([x0, y0, x1, y1], final));
+  assert.equal(
+    stillIntrudingRealParagraphs.length,
+    0,
+    `expected zero intrusion for passport 408 after the fix (got ${stillIntrudingRealParagraphs.length} intruding paragraphs)`,
+  );
+});
+
+test('V text protection -- REAL PASSPORT 409 (RIGHT narrowing accepted AND honored): the clean baseline case where the post-clamp region exactly satisfies appliedRightConstraint, through the full real pipeline', async () => {
+  const width = 960, height = 1280;
+  const original = await sharp({ create: { width, height, channels: 3, background: { r: 230, g: 230, b: 230 } } }).jpeg().toBuffer();
+  const faces = [{ boundingPoly: box(115, 809, 332, 1061), detectionConfidence: 0.95 }];
+  const deps = buildDeps(faces);
+  const pages: VisionPage[] = [{ blocks: [{ paragraphs: REAL_409_PARAGRAPHS.map(([t, x0, y0, x1, y1]) => paragraphFixture(t, x0, y0, x1, y1)) }] }];
+
+  const baseCropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps);
+  const layoutCropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps, pages);
+  assert.ok(baseCropped && layoutCropped);
+  const baseMeta = await sharp(baseCropped!).metadata();
+  const layoutMeta = await sharp(layoutCropped!).metadata();
+  assert.equal(baseMeta.width, 451);
+  assert.equal(baseMeta.height, 578);
+  assert.equal(layoutMeta.width, 333);
+  assert.equal(layoutMeta.height, 427);
+
+  const normalizedParagraphs = flattenParagraphsToNormalizedSpace(pages, { rawWidth: width, rawHeight: height, orientation: undefined });
+  const documentBoundary = detectDocumentBoundary(normalizedParagraphs, faces, width, height);
+  assert.ok(documentBoundary);
+  const effectiveFaces = filterFacesToBoundary(faces, documentBoundary!);
+  const baseRegion = computeApplicantPhotoCropRegion(effectiveFaces, width, height);
+  assert.ok(baseRegion);
+  const faceBox = selectBestFaceBox(effectiveFaces);
+  assert.ok(faceBox);
+
+  const paragraphsForLayout = filterParagraphsToBoundary(normalizedParagraphs, documentBoundary!);
+  const mrzResult = locateMrzParagraphGeometry(paragraphsForLayout, width, height);
+  assert.equal(mrzResult, null);
+  const expandedFaceRegion = buildColumnDetectionContext(faceBox!);
+  const columnResult = detectPersonalDataColumn(paragraphsForLayout, faceBox!, expandedFaceRegion, width, height, []);
+  assert.ok(columnResult);
+  assert.equal(columnResult!.confidence, 'HIGH');
+  assert.equal(columnResult!.columnX0, 363);
+
+  const rightMargin = Math.max(8, 0.012 * width);
+  const layoutConstraints = { right: columnResult!.columnX0 - rightMargin };
+  const constrainedRegion = computeApplicantPhotoCropRegion(effectiveFaces, width, height, layoutConstraints);
+  assert.ok(constrainedRegion);
+  let region = constrainedRegion!;
+  const { appliedRightConstraint, appliedBottomConstraint } = region;
+  assert.ok(appliedRightConstraint !== undefined);
+  region = { ...clampRegionToBoundary(region, documentBoundary!, faceBox!), appliedRightConstraint, appliedBottomConstraint };
+  // THE DIFFERENCE FROM 408/410: here the post-clamp region's right edge
+  // does NOT exceed appliedRightConstraint, so the guard holds.
+  assert.ok(
+    region.left + region.width <= appliedRightConstraint!,
+    `expected the post-clamp region (right edge ${region.left + region.width}) to still satisfy appliedRightConstraint (${appliedRightConstraint}) for this real fixture`,
+  );
+
+  const hardBounds = computeHardBounds(region, baseRegion!, width, height, documentBoundary, normalizedParagraphs);
+  assert.equal(hardBounds.hardRight, appliedRightConstraint, 'hardRight correctly stays at the real applied narrowing for this case');
+
+  const final = applyTargetAspectRatio(region, 0.78, faceBox!, hardBounds.hardLeft, hardBounds.hardTop, hardBounds.hardRight, hardBounds.hardBottom);
+  assert.equal(layoutMeta.width, final.width, 'the lower-level replica must match the real extractApplicantPhotoCrop output exactly');
+  assert.equal(layoutMeta.height, final.height, 'the lower-level replica must match the real extractApplicantPhotoCrop output exactly');
+
+  assert.ok(
+    faceBox!.x0 >= final.left && faceBox!.y0 >= final.top && faceBox!.x1 <= final.left + final.width && faceBox!.y1 <= final.top + final.height,
+    'the real detected face must remain fully inside the final crop',
+  );
+
+  // THE CLEAN RESULT: no real text re-enters for this passport.
+  const stillIntrudingRealParagraphs = REAL_409_PARAGRAPHS.filter(([, x0, y0, x1, y1]) => boxIntersectsRegion([x0, y0, x1, y1], final));
+  assert.equal(
+    stillIntrudingRealParagraphs.length,
+    0,
+    `expected zero intrusion for passport 409 (got ${stillIntrudingRealParagraphs.length}) -- this is the one case among 408/409/410 where the rounding mismatch does not occur`,
+  );
+});
+
+test('V text protection -- REAL PASSPORT 410 (RIGHT narrowing accepted AND now honored through growth, after the ROUNDING_EPSILON_PIXELS fix): the same rounding mismatch as passport 408 no longer lets real surname/DOB/nationality text re-enter, through the full real pipeline', async () => {
+  const width = 960, height = 1280;
+  const original = await sharp({ create: { width, height, channels: 3, background: { r: 230, g: 230, b: 230 } } }).jpeg().toBuffer();
+  const faces = [{ boundingPoly: box(151, 805, 322, 1004), detectionConfidence: 0.95 }];
+  const deps = buildDeps(faces);
+  const pages: VisionPage[] = [{ blocks: [{ paragraphs: REAL_410_PARAGRAPHS.map(([t, x0, y0, x1, y1]) => paragraphFixture(t, x0, y0, x1, y1)) }] }];
+
+  const baseCropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps);
+  const layoutCropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps, pages);
+  assert.ok(baseCropped && layoutCropped);
+  const baseMeta = await sharp(baseCropped!).metadata();
+  const layoutMeta = await sharp(layoutCropped!).metadata();
+  // Verified via the real, now-fixed pipeline. layoutMeta.width changed
+  // from 272 (pre-fix, buggy) to 271 (post-fix) -- a 1px-scale correction.
+  assert.equal(baseMeta.width, 359);
+  assert.equal(baseMeta.height, 460);
+  assert.equal(layoutMeta.width, 271);
+  assert.equal(layoutMeta.height, 348);
+
+  const normalizedParagraphs = flattenParagraphsToNormalizedSpace(pages, { rawWidth: width, rawHeight: height, orientation: undefined });
+  const documentBoundary = detectDocumentBoundary(normalizedParagraphs, faces, width, height);
+  assert.ok(documentBoundary);
+  const effectiveFaces = filterFacesToBoundary(faces, documentBoundary!);
+  const baseRegion = computeApplicantPhotoCropRegion(effectiveFaces, width, height);
+  assert.ok(baseRegion);
+  const faceBox = selectBestFaceBox(effectiveFaces);
+  assert.ok(faceBox);
+
+  const paragraphsForLayout = filterParagraphsToBoundary(normalizedParagraphs, documentBoundary!);
+  const mrzResult = locateMrzParagraphGeometry(paragraphsForLayout, width, height);
+  assert.equal(mrzResult, null);
+  const expandedFaceRegion = buildColumnDetectionContext(faceBox!);
+  const columnResult = detectPersonalDataColumn(paragraphsForLayout, faceBox!, expandedFaceRegion, width, height, []);
+  assert.ok(columnResult);
+  assert.equal(columnResult!.confidence, 'HIGH');
+  assert.equal(columnResult!.columnX0, 355);
+
+  const rightMargin = Math.max(8, 0.012 * width);
+  const layoutConstraints = { right: columnResult!.columnX0 - rightMargin };
+  const constrainedRegion = computeApplicantPhotoCropRegion(effectiveFaces, width, height, layoutConstraints);
+  assert.ok(constrainedRegion, 'sanity check: unlike passport 414, this real narrowing IS accepted');
+  let region = constrainedRegion!;
+  const { appliedRightConstraint, appliedBottomConstraint } = region;
+  assert.ok(appliedRightConstraint !== undefined);
+  region = { ...clampRegionToBoundary(region, documentBoundary!, faceBox!), appliedRightConstraint, appliedBottomConstraint };
+  // THE ROUNDING MISMATCH still exists at this exact point (unchanged by
+  // the fix, which acts one step later in computeHardBounds).
+  assert.ok(
+    region.left + region.width > appliedRightConstraint!,
+    `expected the post-clamp region (right edge ${region.left + region.width}) to exceed appliedRightConstraint (${appliedRightConstraint}) by a sub-pixel amount -- this is the mechanism the fix tolerates`,
+  );
+  assert.ok(
+    region.left + region.width - appliedRightConstraint! < 1,
+    'sanity check: the mismatch is under 1px, exactly what ROUNDING_EPSILON_PIXELS=1 is sized to cover',
+  );
+
+  const hardBounds = computeHardBounds(region, baseRegion!, width, height, documentBoundary, normalizedParagraphs);
+  // THE FIX, verified directly: hardRight now stays at the real applied
+  // narrowing, not the looser baseRegion-relative fallback.
+  assert.equal(hardBounds.hardRight, appliedRightConstraint, 'hardRight must now stay at the real applied narrowing, not fall back to baseRegion.right');
+
+  const final = applyTargetAspectRatio(region, 0.78, faceBox!, hardBounds.hardLeft, hardBounds.hardTop, hardBounds.hardRight, hardBounds.hardBottom);
+  assert.equal(layoutMeta.width, final.width, 'the lower-level replica must match the real extractApplicantPhotoCrop output exactly');
+  assert.equal(layoutMeta.height, final.height, 'the lower-level replica must match the real extractApplicantPhotoCrop output exactly');
+
+  assert.ok(
+    faceBox!.x0 >= final.left && faceBox!.y0 >= final.top && faceBox!.x1 <= final.left + final.width && faceBox!.y1 <= final.top + final.height,
+    'the real detected face must remain fully inside the final crop',
+  );
+
+  const stillIntrudingRealParagraphs = REAL_410_PARAGRAPHS.filter(([, x0, y0, x1, y1]) => boxIntersectsRegion([x0, y0, x1, y1], final));
+  assert.equal(
+    stillIntrudingRealParagraphs.length,
+    0,
+    `expected zero intrusion for passport 410 after the fix (got ${stillIntrudingRealParagraphs.length} intruding paragraphs)`,
+  );
+});
