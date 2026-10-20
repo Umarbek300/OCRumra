@@ -125,6 +125,21 @@ export function selectBestFaceBox(faces: readonly VisionFaceAnnotation[]): Pixel
 }
 
 /**
+ * Minimum safe gap (pixels), scaled by face width and floored at a fixed
+ * minimum, that a RIGHT layout constraint (personal-data column) must clear
+ * past the face's own right edge before computeApplicantPhotoCropRegion's
+ * acceptance check below will trust it. Exported so a caller that needs to
+ * pre-validate a candidate RIGHT value BEFORE calling
+ * computeApplicantPhotoCropRegion (see extractApplicantPhotoCrop.ts's
+ * buildLayoutConstraintsFromParagraphs) uses the exact same formula this
+ * module's own acceptance check applies, instead of an independently
+ * maintained copy that could silently drift out of sync with it.
+ */
+export function computeMinFaceRightPadding(faceWidth: number): number {
+  return Math.max(8, 0.05 * faceWidth);
+}
+
+/**
  * Computes the passport PHOTO rectangle (the full printed portrait, not
  * just the face) from Google Vision's FACE_DETECTION result, by expanding
  * the best-matching detected face's framing bounding box outward by fixed
@@ -174,7 +189,7 @@ export function computeApplicantPhotoCropRegion(
   // width/height, matching the real-passport calibration in this
   // engagement's own diagnostics (see detectPersonalDataColumn.ts,
   // locateMrzParagraphGeometry.ts).
-  const minFaceRightPadding = Math.max(8, 0.05 * faceWidth);
+  const minFaceRightPadding = computeMinFaceRightPadding(faceWidth);
   const minFaceBottomPadding = Math.max(8, 0.05 * faceHeight);
 
   const acceptedRight =

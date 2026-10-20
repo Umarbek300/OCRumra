@@ -1317,7 +1317,7 @@ const REAL_414_PARAGRAPHS: Array<[string, number, number, number, number]> = [
   ['MIA 26291', 584, 963, 723, 994],
 ];
 
-test('V text protection -- REAL PASSPORT 414 (RIGHT-side growth protection, MEDIUM-confidence column, detectionConfidence is a documented PLACEHOLDER): the new RIGHT occupancy check caps growth at baseRegion.right against a real paragraph sitting in the growth gap, through the full real pipeline', async () => {
+test('V text protection -- REAL PASSPORT 414 (Variant G: two-sided feasibility window clamps the RIGHT narrowing UP into the safe gap instead of rejecting it outright, MEDIUM-confidence column, detectionConfidence is a documented PLACEHOLDER): the face stays fully contained and every one of the 16 real paragraphs is excluded, through the full real pipeline', async () => {
   const width = 896, height = 1280;
   const original = await sharp({ create: { width, height, channels: 3, background: { r: 230, g: 230, b: 230 } } }).jpeg().toBuffer();
   // PLACEHOLDER confidence -- see the module-level comment above. Face box
@@ -1326,25 +1326,31 @@ test('V text protection -- REAL PASSPORT 414 (RIGHT-side growth protection, MEDI
   const deps = buildDeps(faces);
   const pages: VisionPage[] = [{ blocks: [{ paragraphs: REAL_414_PARAGRAPHS.map(([t, x0, y0, x1, y1]) => paragraphFixture(t, x0, y0, x1, y1)) }] }];
 
-  // Full-pipeline run through the REAL, unmodified extractApplicantPhotoCrop.
+  // Full-pipeline run through the REAL, Variant-G-fixed extractApplicantPhotoCrop.
   const baseCropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps);
   const layoutCropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps, pages);
   assert.ok(baseCropped && layoutCropped);
   const baseMeta = await sharp(baseCropped!).metadata();
   const layoutMeta = await sharp(layoutCropped!).metadata();
-  // Verified via the real pipeline (not hand-derived): the face-only base
-  // crop is 364x467; with this real paragraph set, the layout-aware crop is
-  // 312x400.
+  // Verified via the real, fixed pipeline (not hand-derived): the face-only
+  // base crop is still 364x467 (unchanged by this fix -- Variant G only
+  // ever narrows, never widens, the face-only envelope); with this real
+  // paragraph set, the layout-aware crop is now 275x362 -- narrower than
+  // the pre-fix 312x400, because the RIGHT constraint (274.9) is now
+  // accepted instead of rejected outright.
   assert.equal(baseMeta.width, 364);
   assert.equal(baseMeta.height, 467);
-  assert.equal(layoutMeta.width, 312);
-  assert.equal(layoutMeta.height, 400);
+  assert.equal(layoutMeta.width, 275);
+  assert.equal(layoutMeta.height, 362);
 
   // Lower-level replica, for the SAME reason and with the SAME independence
   // caveat as the passport-381 test above: this recovers {left,top}, which
   // the public function never returns, by replaying its own exported
   // building blocks -- it is a fidelity check against the real pipeline's
-  // own output size, never an independent proof of correctness.
+  // own output size, never an independent proof of correctness. It
+  // deliberately mirrors buildLayoutConstraintsFromParagraphs's own NEW
+  // Variant G formula (read directly from extractApplicantPhotoCrop.ts),
+  // not the old single-value formula the pre-fix version of this test used.
   const normalizedParagraphs = flattenParagraphsToNormalizedSpace(pages, { rawWidth: width, rawHeight: height, orientation: undefined });
   const documentBoundary = detectDocumentBoundary(normalizedParagraphs, faces, width, height);
   assert.ok(documentBoundary);
@@ -1364,56 +1370,156 @@ test('V text protection -- REAL PASSPORT 414 (RIGHT-side growth protection, MEDI
   const columnResult = detectPersonalDataColumn(paragraphsForLayout, faceBox!, expandedFaceRegion, width, height, []);
   assert.ok(columnResult);
   assert.equal(columnResult!.confidence, 'MEDIUM', 'sanity check: this is the real MEDIUM-confidence passport-414 column, not HIGH');
+  assert.equal(columnResult!.columnX0, 285, 'sanity check: real, recorded columnX0 for this passport');
 
   const rightMargin = Math.max(8, 0.012 * width);
-  const layoutConstraints = { right: columnResult!.columnX0 - rightMargin };
+  const candidateRight = columnResult!.columnX0 - rightMargin;
+  const faceWidth = faceBox!.x1 - faceBox!.x0;
+  const minFaceRightPadding = Math.max(8, 0.05 * faceWidth);
+  const minSafeRight = faceBox!.x1 + minFaceRightPadding;
+  const textCeiling = columnResult!.columnX0 - 8; // MIN_MARGIN_PIXELS, read from extractApplicantPhotoCrop.ts
+  assert.equal(Math.round(candidateRight * 1000) / 1000, 274.248, 'sanity check: the OLD single-value candidate, pre-Variant-G');
+  assert.equal(minSafeRight, 274.9, 'sanity check: the face-safety floor');
+  assert.equal(textCeiling, 277, 'sanity check: the text-safety ceiling');
+  assert.ok(minSafeRight <= textCeiling, 'sanity check: for this real passport the feasibility window is non-empty');
+  const layoutConstraints = { right: Math.max(minSafeRight, candidateRight) };
+  assert.equal(layoutConstraints.right, 274.9, 'sanity check: Variant G clamps UP to the face-safety floor, not the old (too-low) candidate');
+
   const constrainedRegion = computeApplicantPhotoCropRegion(effectiveFaces, width, height, layoutConstraints);
-  // Verified via the real pipeline: for this real fixture, the MEDIUM-confidence
-  // right constraint is NOT accepted by computeApplicantPhotoCropRegion's own
-  // narrowing guard (it falls back to null), so `region` stays at baseRegion
-  // here -- this is the real, observed behavior, not assumed.
-  let region = constrainedRegion ?? baseRegion!;
+  // THE CORE BEHAVIOR CHANGE THIS TEST PROVES: unlike before this fix, the
+  // RIGHT constraint IS now accepted by computeApplicantPhotoCropRegion's
+  // own narrowing guard (274.9 >= box.x1+minFaceRightPadding=274.9, and
+  // 274.9 < clampedX1), so `region` is the real constrained region, never
+  // the face-only baseRegion fallback.
+  assert.ok(constrainedRegion, 'the RIGHT constraint must now be accepted, not rejected');
+  let region = constrainedRegion!;
+  assert.equal(region.appliedRightConstraint, 274.9);
   const { appliedRightConstraint, appliedBottomConstraint } = region;
   region = { ...clampRegionToBoundary(region, documentBoundary!, faceBox!), appliedRightConstraint, appliedBottomConstraint };
 
   const hardBounds = computeHardBounds(region, baseRegion!, width, height, documentBoundary, normalizedParagraphs);
-  const baseRegionRight = baseRegion!.left + baseRegion!.width;
-  // THE ACTUAL THING THIS TEST PROVES: the real "MIA 26291" paragraph
-  // (x584-723, y963-994) sits in the RIGHT growth gap beyond baseRegion's
-  // own right edge, overlapping the region's y-span -- the new RIGHT
-  // occupancy check correctly caps hardRight there, on real passport data,
-  // not just on a constructed fixture.
-  assert.equal(hardBounds.hardRight, baseRegionRight, 'the new RIGHT occupancy check must cap growth at baseRegion.right for this real paragraph');
+  // THE ACTUAL THING THIS TEST PROVES: hardRight is now capped at the real,
+  // accepted appliedRightConstraint (274.9) -- not at the much looser
+  // baseRegion.right (364) the pre-fix version of this test observed.
+  assert.equal(hardBounds.hardRight, 274.9, 'hardRight must be capped at the accepted RIGHT constraint, not the looser baseRegion.right');
 
   const final = applyTargetAspectRatio(region, 0.78, faceBox!, hardBounds.hardLeft, hardBounds.hardTop, hardBounds.hardRight, hardBounds.hardBottom);
   assert.equal(layoutMeta.width, final.width, 'the lower-level replica must match the real extractApplicantPhotoCrop output exactly');
   assert.equal(layoutMeta.height, final.height, 'the lower-level replica must match the real extractApplicantPhotoCrop output exactly');
 
-  assert.ok(final.left + final.width <= baseRegionRight, 'the final crop must never grow past baseRegion.right on this axis');
+  assert.ok(final.left + final.width <= 275, 'the final crop must not grow past the accepted RIGHT constraint on this axis');
   assert.ok(
     faceBox!.x0 >= final.left && faceBox!.y0 >= final.top && faceBox!.x1 <= final.left + final.width && faceBox!.y1 <= final.top + final.height,
     'the real detected face must remain fully inside the final crop',
   );
 
-  // DOCUMENTED, PRE-EXISTING, OUT-OF-SCOPE LIMITATION -- not a regression
-  // from this fix, and not silently hidden: this real passport's own
-  // personal-data column starts at columnX0=285, which is already INSIDE
-  // baseRegion's own footprint (baseRegion spans x0..364), because the
-  // MEDIUM-confidence narrowing above was rejected. Paragraphs whose text
-  // sits inside baseRegion's own footprint (not in the growth gap beyond
-  // it) are never inspected by any of the four occupancy checks (see
-  // computeHardBounds's own doc comment, limitation #2) -- shrinking below
-  // baseRegion to address this would risk cutting the face baseRegion's own
-  // margins were sized to protect. This assertion makes that real, observed
-  // exposure visible and regression-trackable, instead of pretending it
-  // does not exist.
-  const stillIntrudingRealParagraphs = REAL_414_PARAGRAPHS.filter(([, x0, y0, x1, y1]) =>
-    boxIntersectsRegion([x0, y0, x1, y1], final),
+  // THE FIX'S WHOLE POINT, now verified against every one of the 16 real
+  // paragraphs (not merely the subset that used to sit in the growth gap):
+  // with the RIGHT constraint now actually accepted and honored, NONE of
+  // this real passport's printed text intrudes into the final crop. Before
+  // this fix, this same assertion (inverted) was a documented, accepted
+  // limitation -- this is the genuine, root-cause fix, not a weakened
+  // assertion papering over the same behavior.
+  const intrudingRealParagraphs = REAL_414_PARAGRAPHS.filter(([, x0, y0, x1, y1]) => boxIntersectsRegion([x0, y0, x1, y1], final));
+  assert.deepEqual(
+    intrudingRealParagraphs,
+    [],
+    `expected zero real paragraphs to intrude the final crop, got: ${intrudingRealParagraphs.map((p) => p[0]).join(', ')}`,
   );
-  assert.ok(
-    stillIntrudingRealParagraphs.length > 0,
-    'known limitation: real personal-data text inside baseRegion\'s own footprint (e.g. surname/DOB starting at columnX0=285) still appears in this real crop -- out of scope for the RIGHT/TOP/BOTTOM/LEFT growth-limiting fix, not a new regression',
-  );
+});
+
+// --- Variant G counter-examples -- PURELY SYNTHETIC fixtures (no real Vision
+// data of any kind, geometry or confidence), deliberately constructed to
+// exercise the two edge branches real passport data on record (381/408/409/
+// 410/414) never reaches: an infeasible feasibility window, and no column
+// detected at all. Face box (40x100) and paragraph geometry are hand-picked
+// purely to control detectPersonalDataColumn's own scoring formula
+// (dispersionScore/faceGapScore/fieldCountScore, read directly from
+// detectPersonalDataColumn.ts) -- not representative of any real passport
+// layout.
+test('V text protection -- Variant G SYNTHETIC counter-example: face-text gap too tight for any single RIGHT value to protect both -- the feasibility window is empty, so the existing safe face-only fallback must be preserved, not a guessed narrower value', async () => {
+  const width = 300, height = 1000;
+  // faceWidth=40, faceHeight=100 (not a real passport proportion -- chosen
+  // only to keep the expanded face-only crop above MIN_CROP_DIMENSION_PIXELS
+  // while keeping minFaceRightPadding floored at the fixed 8px minimum).
+  const faces = [{ boundingPoly: box(100, 300, 140, 400), detectionConfidence: 0.95 }];
+  const deps = buildDeps(faces);
+  // 4 synthetic paragraphs, columnX0=154 -- gap=14px past faceBox.x1=140.
+  // Verified via this engagement's own scratchpad simulation against the
+  // real, unmodified detectPersonalDataColumn: this gap is wide enough to
+  // clear its "mostly inside the expanded face region" candidate filter
+  // (20% area overlap, well under its 50% exclusion threshold) AND lands
+  // inside its GAP_MIN/MAX_FRACTION ideal-gap band, so confidence reaches
+  // real MEDIUM (fieldCountScore=0.5, dispersionScore=1, faceGapScore=1) --
+  // not LOW, so this genuinely exercises buildLayoutConstraintsFromParagraphs's
+  // HIGH-or-MEDIUM branch, not the separate confidence-gate fallback below.
+  const paragraphs: Array<[string, number, number, number, number]> = [
+    ['SYNTH1', 154, 300, 194, 330],
+    ['SYNTH2', 154, 450, 194, 480],
+    ['SYNTH3', 154, 600, 194, 630],
+    ['SYNTH4', 154, 750, 194, 780],
+  ];
+  const pages: VisionPage[] = [{ blocks: [{ paragraphs: paragraphs.map(([t, x0, y0, x1, y1]) => paragraphFixture(t, x0, y0, x1, y1)) }] }];
+  const original = await sharp({ create: { width, height, channels: 3, background: { r: 230, g: 230, b: 230 } } }).jpeg().toBuffer();
+
+  const baseCropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps);
+  const layoutCropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps, pages);
+  assert.ok(baseCropped && layoutCropped);
+  const baseMeta = await sharp(baseCropped!).metadata();
+  const layoutMeta = await sharp(layoutCropped!).metadata();
+
+  // Independently confirm the feasibility window really is empty for this
+  // fixture (minSafeRight=148 > textCeiling=146), i.e. this test exercises
+  // the REJECT branch, not accidentally the ACCEPT branch.
+  const faceBox = selectBestFaceBox(faces)!;
+  const normalizedParagraphs = flattenParagraphsToNormalizedSpace(pages, { rawWidth: width, rawHeight: height, orientation: undefined });
+  const expandedFaceRegion = buildColumnDetectionContext(faceBox);
+  const columnResult = detectPersonalDataColumn(normalizedParagraphs, faceBox, expandedFaceRegion, width, height, []);
+  assert.ok(columnResult, 'sanity check: a column must actually be detected here (not the separate null-column case below)');
+  assert.equal(columnResult!.confidence, 'MEDIUM', 'sanity check: real MEDIUM confidence, not LOW -- this must exercise Variant G, not the confidence gate');
+  const minFaceRightPadding = Math.max(8, 0.05 * (faceBox.x1 - faceBox.x0));
+  const minSafeRight = faceBox.x1 + minFaceRightPadding;
+  const textCeiling = columnResult!.columnX0 - 8;
+  assert.equal(minSafeRight, 148);
+  assert.equal(textCeiling, 146);
+  assert.ok(minSafeRight > textCeiling, 'sanity check: the feasibility window must be empty for this fixture');
+
+  // THE ACTUAL BEHAVIOR THIS TEST PROVES: with the window empty, Variant G
+  // must leave constraints.right unset entirely -- the layout-aware crop
+  // must be byte-identical to the pure face-only crop, exactly as it was
+  // before Variant G existed. A narrower, guessed value here would risk
+  // clamping into either the face or the (synthetic) text column.
+  assert.equal(layoutMeta.width, baseMeta.width, 'an infeasible window must fall back to the unchanged face-only crop width');
+  assert.equal(layoutMeta.height, baseMeta.height, 'an infeasible window must fall back to the unchanged face-only crop height');
+});
+
+test('V text protection -- Variant G SYNTHETIC counter-example: no personal-data column detected at all (fewer than MIN_FIELD_COUNT candidates) -- the existing face-only fallback must be completely unchanged by Variant G', async () => {
+  const width = 300, height = 1000;
+  const faces = [{ boundingPoly: box(100, 300, 200, 400), detectionConfidence: 0.95 }];
+  const deps = buildDeps(faces);
+  // Only 2 candidate paragraphs -- below detectPersonalDataColumn's own
+  // MIN_FIELD_COUNT=4, so it returns null (not LOW) for this fixture.
+  const paragraphs: Array<[string, number, number, number, number]> = [
+    ['SYNTH1', 260, 300, 290, 330],
+    ['SYNTH2', 260, 450, 290, 480],
+  ];
+  const pages: VisionPage[] = [{ blocks: [{ paragraphs: paragraphs.map(([t, x0, y0, x1, y1]) => paragraphFixture(t, x0, y0, x1, y1)) }] }];
+  const original = await sharp({ create: { width, height, channels: 3, background: { r: 230, g: 230, b: 230 } } }).jpeg().toBuffer();
+
+  const baseCropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps);
+  const layoutCropped = await extractApplicantPhotoCrop(original, 'image/jpeg', deps, pages);
+  assert.ok(baseCropped && layoutCropped);
+  const baseMeta = await sharp(baseCropped!).metadata();
+  const layoutMeta = await sharp(layoutCropped!).metadata();
+
+  const faceBox = selectBestFaceBox(faces)!;
+  const normalizedParagraphs = flattenParagraphsToNormalizedSpace(pages, { rawWidth: width, rawHeight: height, orientation: undefined });
+  const expandedFaceRegion = buildColumnDetectionContext(faceBox);
+  const columnResult = detectPersonalDataColumn(normalizedParagraphs, faceBox, expandedFaceRegion, width, height, []);
+  assert.equal(columnResult, null, 'sanity check: this fixture must produce no column result at all');
+
+  assert.equal(layoutMeta.width, baseMeta.width, 'no detected column must fall back to the unchanged face-only crop width');
+  assert.equal(layoutMeta.height, baseMeta.height, 'no detected column must fall back to the unchanged face-only crop height');
 });
 
 // --- V text protection -- REAL PASSPORTS 408, 409, 410 (regression baseline) ---

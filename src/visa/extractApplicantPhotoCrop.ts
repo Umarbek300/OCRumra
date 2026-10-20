@@ -5,6 +5,7 @@ import type { VisionPage } from '../ocr/visual/extractIssueDateFromVisionStructu
 import {
   applyTargetAspectRatio,
   computeApplicantPhotoCropRegion,
+  computeMinFaceRightPadding,
   selectBestFaceBox,
   type LayoutConstraints,
   type PixelBox,
@@ -105,11 +106,39 @@ export function buildColumnDetectionContext(faceBox: PixelBox): PixelBox {
  * acceptance check (`right >= box.x1 + minFaceRightPadding`) is the ONLY
  * thing that decides whether a given `right` value is safe, and it takes
  * no confidence parameter at all -- it is exactly as strict for a
- * MEDIUM-sourced value as for a HIGH-sourced one. Real passport 414 (the
- * only real MEDIUM example on record, gap=19px, tighter than every other
- * real sample at 30-56px) is REJECTED by that exact check even with this
- * identical margin (274.25 < 266+8.9), falling back to the face-only
- * region -- proving the check's protection does not weaken for MEDIUM.
+ * MEDIUM-sourced value as for a HIGH-sourced one.
+ *
+ * "Variant G" two-sided feasibility window: `columnResult.columnX0 -
+ * margin` above is only ever a CANDIDATE from here on, never the final
+ * value. A single RIGHT value must simultaneously satisfy the
+ * face-safety floor (`minSafeRight = faceBox.x1 +
+ * computeMinFaceRightPadding(faceWidth)`, the exact inequality
+ * computeApplicantPhotoCropRegion's own acceptance check enforces) AND a
+ * text-safety ceiling (`columnX0 - MIN_MARGIN_PIXELS` -- never closer than
+ * MIN_MARGIN_PIXELS to the real, pre-margin text boundary). When
+ * minSafeRight <= that ceiling, the window is non-empty and
+ * `constraints.right = max(minSafeRight, candidate)` -- clamping UP into
+ * the safe window instead of rejecting outright. When the window is empty
+ * (the face sits too close to the text column for any single value to
+ * protect both), constraints.right is left unset -- the exact same safe
+ * face-only fallback as before this fix, never a guess.
+ *
+ * Real passport 414 (gap=19px, tighter than every other real sample at
+ * 30-56px) is the only real case on record that exercises the non-trivial
+ * branch: minSafeRight=274.9, ceiling=285-8=277 -> window non-empty,
+ * constraints.right=max(274.9,274.248)=274.9. Previously (single-value
+ * formula, no ceiling) this was REJECTED outright (274.248 < 274.9),
+ * letting real printed text re-enter the crop once applyTargetAspectRatio
+ * grew it back out -- see tests/visa.extractApplicantPhotoCrop.test.ts's
+ * "REAL PASSPORT 414" tests. Every other real sample on record
+ * (381/408/409/410, gap >= 30px) already satisfied the OLD single-value
+ * check (candidate >= minSafeRight); this window is PROVABLY feasible
+ * whenever that old check was, because margin >= MIN_MARGIN_PIXELS
+ * always, so candidate = columnX0-margin <= columnX0-MIN_MARGIN_PIXELS =
+ * ceiling, i.e. minSafeRight <= candidate (old check) implies minSafeRight
+ * <= ceiling (feasible) and max(minSafeRight, candidate) = candidate --
+ * byte-identical to the old accepted value. Zero regression for any
+ * passport that was already safe under the old formula.
  * The MRZ/BOTTOM side deliberately never acts on MEDIUM or LOW:
  * locateMrzParagraphGeometry.ts's MEDIUM tier has a confirmed
  * false-positive mode (see tests/mrz.locateMrzParagraphGeometry.test.ts --
@@ -143,7 +172,13 @@ function buildLayoutConstraintsFromParagraphs(
   const constraints: LayoutConstraints = {};
   if (columnResult && (columnResult.confidence === 'HIGH' || columnResult.confidence === 'MEDIUM')) {
     const margin = Math.max(MIN_MARGIN_PIXELS, RIGHT_MARGIN_FRACTION * normalizedWidth);
-    constraints.right = columnResult.columnX0 - margin;
+    const candidateRight = columnResult.columnX0 - margin;
+    const faceWidth = faceBox.x1 - faceBox.x0;
+    const minSafeRight = faceBox.x1 + computeMinFaceRightPadding(faceWidth);
+    const textCeiling = columnResult.columnX0 - MIN_MARGIN_PIXELS;
+    if (minSafeRight <= textCeiling) {
+      constraints.right = Math.max(minSafeRight, candidateRight);
+    }
   }
   // mrzResult: HIGH only -- MEDIUM/LOW MRZ confidence is deliberately never
   // used (see this function's own doc comment above for why).
