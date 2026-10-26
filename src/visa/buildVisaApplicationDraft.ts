@@ -7,10 +7,15 @@ import type { KsaVisaApplicationDraft, VerifiedApplicantData, VisaApplicationDra
  *
  * VisitSaudi's own draft structurally omits passportScanUrl entirely --
  * per real-world field testing, VisitSaudi never asks for a separate
- * passport scan upload, only the personal/biometric photo. The field is
- * absent from VisitSaudiApplicationDraft's own type (see types.ts), not
- * merely left blank, so a future caller cannot accidentally read a
- * passport-scan value out of a VisitSaudi draft at all.
+ * passport scan upload, only the personal/biometric photo. It also
+ * structurally omits personalPhotoUrl: the real portal only accepts a
+ * face-cropped portrait, never the full, uncropped photo -- so it carries
+ * personalPortraitUrl instead, sourced independently from data's own
+ * personalPortraitUrl (never falls back to data.personalPhotoUrl under
+ * any circumstance). Both fields are absent from VisitSaudiApplicationDraft's
+ * own type (see types.ts), not merely left blank, so a future caller
+ * cannot accidentally read a passport-scan or full-photo value out of a
+ * VisitSaudi draft at all.
  */
 export function buildVisaApplicationDraft(data: VerifiedApplicantData, portal: 'visitsaudi'): VisitSaudiApplicationDraft;
 export function buildVisaApplicationDraft(data: VerifiedApplicantData, portal: 'ksavisa'): KsaVisaApplicationDraft;
@@ -26,11 +31,10 @@ export function buildVisaApplicationDraft(data: VerifiedApplicantData, portal: V
     nationality: data.nationality,
     email: data.email,
     arrivalDate: data.arrivalDate,
-    personalPhotoUrl: data.personalPhotoUrl,
   };
 
   if (portal === 'ksavisa') {
-    return { ...base, portal: 'ksavisa', passportScanUrl: data.passportScanUrl };
+    return { ...base, portal: 'ksavisa', personalPhotoUrl: data.personalPhotoUrl, passportScanUrl: data.passportScanUrl };
   }
-  return { ...base, portal: 'visitsaudi' };
+  return { ...base, portal: 'visitsaudi', personalPortraitUrl: data.personalPortraitUrl };
 }

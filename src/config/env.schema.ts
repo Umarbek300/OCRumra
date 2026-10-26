@@ -50,6 +50,44 @@ export const envSchema = z.object({
       ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'SHEETS_SYNC_ENABLED must be "true" or "false" if set' });
       return z.NEVER;
     }),
+  // Master switch for the VisitSaudi stale-record recovery loop
+  // (src/visa/runVisaRecoveryLoop.ts, started via src/visa/start.ts /
+  // `npm run visa:worker`). Defaults to false so this feature ships
+  // dormant until explicitly turned on -- Package 5.17 deliberately makes
+  // no production-enablement decision itself. Unlike SHEETS_SYNC_ENABLED
+  // (which the sync loop itself polls every cycle, so it can be toggled
+  // without a restart), this flag is only read ONCE at worker startup
+  // (src/visa/start.ts): recovery never submits, claims, or finalizes
+  // anything, and never invokes portal automation, so there is no
+  // "mid-run" state that needs live toggling -- when disabled, the worker
+  // exits cleanly before the recovery loop (or either store) is ever
+  // constructed.
+  //
+  // Same z.coerce.boolean() pitfall and fix as SHEETS_SYNC_ENABLED above:
+  // only the exact strings "true"/"false" (or unset, defaulting to false)
+  // are accepted; anything else is a validation error at startup.
+  VISA_RECOVERY_ENABLED: z
+    .string()
+    .optional()
+    .transform((value, ctx) => {
+      if (value === undefined) return false;
+      if (value === 'true') return true;
+      if (value === 'false') return false;
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'VISA_RECOVERY_ENABLED must be "true" or "false" if set' });
+      return z.NEVER;
+    }),
+  // Phase 2e / B-bosqich (Package 5.45): the loopback HTTP endpoint
+  // (e.g. "http://127.0.0.1:9222") this process connects to, as a Chrome
+  // DevTools Protocol CLIENT, to reach an operator's own, manually-
+  // logged-in VisitSaudi Chrome session -- reached ONLY via that
+  // operator's own reverse SSH tunnel (see scripts/windows/README.md);
+  // this server-side process never opens a port of its own for this, and
+  // never stores or transmits a credential. Optional and unset by
+  // default: visaStartSubmissionCommand.ts's own getConfiguredVisitSaudiSession
+  // falls back to getNoActiveVisitSaudiSession (always unavailable)
+  // whenever this is unset, so /visa_start_submission ships OFF until an
+  // operator explicitly configures this.
+  VISITSAUDI_CDP_ENDPOINT: z.string().url().optional(),
   // Per-request timeout (ms) applied to every Google Sheets/Drive API call
   // this pipeline makes (see src/sheets/sheetsAuth.ts's
   // getConfiguredApiTimeoutMs()). Bounds how long one stuck/slow Google API

@@ -89,3 +89,28 @@ test('parseEnv rejects an invalid SHEETS_SYNC_ENABLED value', () => {
   assert.throws(() => parseEnv({ ...VALID_BASE, SHEETS_SYNC_ENABLED: '0' }));
   assert.throws(() => parseEnv({ ...VALID_BASE, SHEETS_SYNC_ENABLED: 'abc' }));
 });
+
+test('Package 5.17: parseEnv defaults VISA_RECOVERY_ENABLED to false when unset', () => {
+  const env = parseEnv({ ...VALID_BASE });
+  assert.equal(env.VISA_RECOVERY_ENABLED, false);
+});
+
+test('Package 5.17: parseEnv parses VISA_RECOVERY_ENABLED="false" as false', () => {
+  // Same z.coerce.boolean() regression guard as SHEETS_SYNC_ENABLED's own
+  // test above -- the literal string "false" must never coerce to true.
+  const env = parseEnv({ ...VALID_BASE, VISA_RECOVERY_ENABLED: 'false' });
+  assert.equal(env.VISA_RECOVERY_ENABLED, false);
+});
+
+test('Package 5.17: parseEnv parses VISA_RECOVERY_ENABLED="true" as true', () => {
+  const env = parseEnv({ ...VALID_BASE, VISA_RECOVERY_ENABLED: 'true' });
+  assert.equal(env.VISA_RECOVERY_ENABLED, true);
+});
+
+test('Package 5.17: parseEnv rejects an invalid VISA_RECOVERY_ENABLED value', () => {
+  assert.throws(() => parseEnv({ ...VALID_BASE, VISA_RECOVERY_ENABLED: 'yes' }));
+  assert.throws(() => parseEnv({ ...VALID_BASE, VISA_RECOVERY_ENABLED: 'no' }));
+  assert.throws(() => parseEnv({ ...VALID_BASE, VISA_RECOVERY_ENABLED: '1' }));
+  assert.throws(() => parseEnv({ ...VALID_BASE, VISA_RECOVERY_ENABLED: '0' }));
+  assert.throws(() => parseEnv({ ...VALID_BASE, VISA_RECOVERY_ENABLED: 'abc' }));
+});

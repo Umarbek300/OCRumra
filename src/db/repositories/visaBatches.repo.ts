@@ -1,6 +1,7 @@
 import type { PoolClient } from 'pg';
 import { pool } from '../pool.js';
 import type { VisaBatch, VisaBatchApplicant, VisaBatchApplicantStatus, VisaBatchStatus, VisaPortal } from '../../visa/types.js';
+import { retireApplicantWithConflictCheckWithClient } from './visaSubmissionQueue.repo.js';
 
 interface VisaBatchRow {
   id: string;
@@ -98,6 +99,33 @@ export async function countActiveApplicantsInBatch(batchId: string): Promise<num
   return Number(rows[0]?.count ?? '0');
 }
 
+export interface ActiveApplicantPosition {
+  passportIdentityId: string;
+  positionInBatch: number;
+}
+
+/**
+ * Every ACTIVE applicant currently in this batch, ordered by their own
+ * canonical position_in_batch -- the SAME column assignVisaBatch.ts itself
+ * assigns on insert and never reassigns (see that file's own doc comment:
+ * "A batch_number, once created, is NEVER reassigned or renumbered"; the
+ * same stability applies to each row's own position_in_batch). Read-only,
+ * no schema change -- added so a caller (the VisitSaudi submission
+ * worker-loop) can verify a GIVEN applicant list is both complete and
+ * correctly ordered against the batch's real membership before trusting
+ * any list-position-derived signal (e.g. "is this the last applicant"),
+ * rather than trusting the given list's own order blindly.
+ */
+export async function findActiveApplicantPositionsForBatch(batchId: string): Promise<ActiveApplicantPosition[]> {
+  const { rows } = await pool.query<{ passport_identity_id: string; position_in_batch: number }>(
+    `SELECT passport_identity_id, position_in_batch FROM visa_batch_applicants
+     WHERE batch_id = $1 AND status = 'active'
+     ORDER BY position_in_batch ASC`,
+    [batchId],
+  );
+  return rows.map((row) => ({ passportIdentityId: row.passport_identity_id, positionInBatch: row.position_in_batch }));
+}
+
 /** The lowest 1..10 position not currently held by an active applicant in this batch, or null if all 10 are taken. */
 export async function findFreePositionInBatch(batchId: string): Promise<number | null> {
   const { rows } = await pool.query<{ position_in_batch: number }>(
@@ -171,12 +199,25 @@ export async function updateBatchStatus(batchId: string, status: VisaBatchStatus
  * the given terminal status. Takes an explicit client so
  * applyIdentityStateChange.ts can call this INSIDE its own existing
  * transaction (same convention as insertReconciliationJobWithClient) --
- * never opens its own connection/transaction.
+ * never opens its own connection/transaction. External signature and
+ * Promise<void> return type unchanged by Package 5.6 -- any conflict found
+ * is handled entirely internally (a durable alert, never a thrown error or
+ * a value the caller must react to).
  *
  * A no-op (0 rows affected) when there was no active assignment at all,
  * which is the common case today (visa automation is Phase 1 only --
  * nothing has actually been assigned to a batch yet for most identities) --
  * never throws for that.
+ *
+ * Package 5.6: each matching assignment is now retired via
+ * retireApplicantWithConflictCheckWithClient (visaSubmissionQueue.repo.ts)
+ * -- same applicant-FIRST, queue-SECOND lock order and SUBMITTING-conflict/
+ * alert behavior cancelWithConflictCheck already uses, closing the gap
+ * Package 5.5's audit found (this function previously never looked at
+ * visa_submission_queue at all). The matching ids are read in a fixed,
+ * deterministic order (ORDER BY id) before any lock is taken, so multiple
+ * matches (one per portal) are always processed in the same order on every
+ * call -- no new lock-ordering ambiguity.
  */
 export async function updateActiveAssignmentsStatusWithClient(
   client: PoolClient,
@@ -184,9 +225,52 @@ export async function updateActiveAssignmentsStatusWithClient(
   passportIdentityId: string,
   status: Extract<VisaBatchApplicantStatus, 'cancelled' | 'removed'>,
 ): Promise<void> {
-  await client.query(
-    `UPDATE visa_batch_applicants SET status = $3
-     WHERE group_id = $1 AND passport_identity_id = $2 AND status = 'active'`,
-    [groupId, passportIdentityId, status],
+  const { rows } = await client.query<{ id: string }>(
+    `SELECT id FROM visa_batch_applicants WHERE group_id = $1 AND passport_identity_id = $2 AND status = 'active' ORDER BY id`,
+    [groupId, passportIdentityId],
   );
+  for (const row of rows) {
+    await retireApplicantWithConflictCheckWithClient(
+      client,
+      row.id,
+      status,
+      `conflict detected while retiring visa_batch_applicant ${row.id} (group/identity state change)`,
+    );
+  }
+}
+
+/**
+ * Transitions every ACTIVE visa assignment for passportIdentityId, across
+ * EVERY group and portal -- the identity-merge counterpart of
+ * updateActiveAssignmentsStatusWithClient above, which is scoped to one
+ * group. Used only by mergeIdentitiesTransaction (applyIdentityStateChange.ts)
+ * to retire the LOSER identity's active assignments when two identities are
+ * merged (Package 5.6, Package 5.5's own "M1: retire" decision) -- the
+ * survivor never automatically inherits or gets a new assignment; an
+ * operator who wants the survivor batched runs /visa_assign explicitly,
+ * same discipline MOVE_TO_GROUP's own hook already follows.
+ *
+ * Same lock order, same SUBMITTING-conflict/alert behavior, same
+ * deterministic (ORDER BY id) processing order as
+ * updateActiveAssignmentsStatusWithClient -- only the WHERE scope differs
+ * (identity only, no group_id filter, since a merge's loser may hold active
+ * assignments in several different groups at once).
+ */
+export async function retireAllActiveAssignmentsForIdentityWithClient(
+  client: PoolClient,
+  passportIdentityId: string,
+  status: Extract<VisaBatchApplicantStatus, 'cancelled' | 'removed'>,
+): Promise<void> {
+  const { rows } = await client.query<{ id: string }>(
+    `SELECT id FROM visa_batch_applicants WHERE passport_identity_id = $1 AND status = 'active' ORDER BY id`,
+    [passportIdentityId],
+  );
+  for (const row of rows) {
+    await retireApplicantWithConflictCheckWithClient(
+      client,
+      row.id,
+      status,
+      `conflict detected while retiring visa_batch_applicant ${row.id} (identity merge, loser=${passportIdentityId})`,
+    );
+  }
 }

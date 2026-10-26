@@ -1,0 +1,7 @@
+{
+  "SshHost": "your-server-hostname-or-ip",
+  "SshUser": "your-restricted-tunnel-username",
+  "SshKeyPath": "C:\\Users\\YourWindowsUsername\\.ssh\\id_ed25519_visitsaudi",
+  "RemotePort": 9222,
+  "LocalPort": 9222
+}

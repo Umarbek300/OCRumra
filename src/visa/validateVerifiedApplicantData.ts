@@ -1,6 +1,6 @@
 import type { ValidationResult, VerifiedApplicantData, VisaPortal } from './types.js';
 
-const VISITSAUDI_REQUIRED_FIELDS: ReadonlyArray<[keyof VerifiedApplicantData, string]> = [
+const SHARED_REQUIRED_FIELDS: ReadonlyArray<[keyof VerifiedApplicantData, string]> = [
   ['firstName', 'Ism'],
   ['surname', 'Familiya'],
   ['passportNumber', 'Passport №'],
@@ -11,10 +11,15 @@ const VISITSAUDI_REQUIRED_FIELDS: ReadonlyArray<[keyof VerifiedApplicantData, st
   ['nationality', 'Fuqarolik'],
   ['email', 'Email'],
   ['arrivalDate', 'Kirish sanasi'],
-  ['personalPhotoUrl', 'Shaxsiy rasm URL'],
+];
+
+/** The real VisitSaudi portal only accepts a face-cropped portrait -- never the full photo or a passport scan (see types.ts's own VerifiedApplicantData doc comment). */
+const VISITSAUDI_ADDITIONAL_REQUIRED_FIELDS: ReadonlyArray<[keyof VerifiedApplicantData, string]> = [
+  ['personalPortraitUrl', 'Portret surat URL'],
 ];
 
 const KSAVISA_ADDITIONAL_REQUIRED_FIELDS: ReadonlyArray<[keyof VerifiedApplicantData, string]> = [
+  ['personalPhotoUrl', 'Shaxsiy rasm URL'],
   ['passportScanUrl', 'Pasport skani URL'],
 ];
 
@@ -48,11 +53,17 @@ function isValidUrl(value: string): boolean {
  * never re-derives or falls back to any OCR/DB value itself.
  *
  * Required-field list differs by portal: ksavisa additionally needs
- * passportScanUrl (VisitSaudi's own draft never carries that field at all --
- * see buildVisaApplicationDraft.ts).
+ * personalPhotoUrl (the full photo) and passportScanUrl; visitsaudi instead
+ * requires personalPortraitUrl (the face-cropped portrait) -- never
+ * personalPhotoUrl, and never falls back to it when personalPortraitUrl is
+ * blank or invalid (VisitSaudi's own draft never carries personalPhotoUrl
+ * at all -- see buildVisaApplicationDraft.ts).
  */
 export function validateVerifiedApplicantData(data: VerifiedApplicantData, portal: VisaPortal): ValidationResult {
-  const requiredFields = portal === 'ksavisa' ? [...VISITSAUDI_REQUIRED_FIELDS, ...KSAVISA_ADDITIONAL_REQUIRED_FIELDS] : VISITSAUDI_REQUIRED_FIELDS;
+  const requiredFields =
+    portal === 'ksavisa'
+      ? [...SHARED_REQUIRED_FIELDS, ...KSAVISA_ADDITIONAL_REQUIRED_FIELDS]
+      : [...SHARED_REQUIRED_FIELDS, ...VISITSAUDI_ADDITIONAL_REQUIRED_FIELDS];
 
   const missingFields = requiredFields.filter(([key]) => data[key].trim() === '').map(([, label]) => label);
   if (missingFields.length > 0) {
@@ -74,11 +85,17 @@ export function validateVerifiedApplicantData(data: VerifiedApplicantData, porta
   if (!isValidEmail(data.email)) {
     return { ready: false, reason: 'INVALID_EMAIL' };
   }
-  if (!isValidUrl(data.personalPhotoUrl)) {
-    return { ready: false, reason: 'INVALID_PHOTO_URL' };
-  }
-  if (portal === 'ksavisa' && !isValidUrl(data.passportScanUrl)) {
-    return { ready: false, reason: 'INVALID_SCAN_URL' };
+  if (portal === 'ksavisa') {
+    if (!isValidUrl(data.personalPhotoUrl)) {
+      return { ready: false, reason: 'INVALID_PHOTO_URL' };
+    }
+    if (!isValidUrl(data.passportScanUrl)) {
+      return { ready: false, reason: 'INVALID_SCAN_URL' };
+    }
+  } else {
+    if (!isValidUrl(data.personalPortraitUrl)) {
+      return { ready: false, reason: 'INVALID_PORTRAIT_URL' };
+    }
   }
 
   return { ready: true };

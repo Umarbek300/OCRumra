@@ -16,6 +16,7 @@ function sampleData(): VerifiedApplicantData {
     email: 'jane@example.com',
     arrivalDate: '2026-10-05',
     personalPhotoUrl: 'https://example.com/jane-photo.jpg',
+    personalPortraitUrl: 'https://example.com/jane-portrait.jpg',
     passportScanUrl: 'https://example.com/jane-scan.jpg',
   };
 }
@@ -26,10 +27,19 @@ test('VisitSaudi draft never carries passportScanUrl', () => {
   assert.equal('passportScanUrl' in draft, false, 'the key itself must not exist on a VisitSaudi draft');
 });
 
-test('KSA Visa draft carries passportScanUrl', () => {
+test('VisitSaudi draft never carries personalPhotoUrl (uses personalPortraitUrl instead)', () => {
+  const draft = buildVisaApplicationDraft(sampleData(), 'visitsaudi');
+  assert.equal(draft.portal, 'visitsaudi');
+  assert.equal('personalPhotoUrl' in draft, false, 'the key itself must not exist on a VisitSaudi draft');
+  assert.equal(draft.personalPortraitUrl, 'https://example.com/jane-portrait.jpg');
+});
+
+test('KSA Visa draft carries passportScanUrl and personalPhotoUrl, never personalPortraitUrl', () => {
   const draft = buildVisaApplicationDraft(sampleData(), 'ksavisa');
   assert.equal(draft.portal, 'ksavisa');
   assert.equal(draft.passportScanUrl, 'https://example.com/jane-scan.jpg');
+  assert.equal(draft.personalPhotoUrl, 'https://example.com/jane-photo.jpg');
+  assert.equal('personalPortraitUrl' in draft, false, 'the key itself must not exist on a KSA Visa draft');
 });
 
 test('Sheet values map correctly into the draft (VisitSaudi)', () => {
@@ -45,12 +55,13 @@ test('Sheet values map correctly into the draft (VisitSaudi)', () => {
   assert.equal(draft.nationality, data.nationality);
   assert.equal(draft.email, data.email);
   assert.equal(draft.arrivalDate, data.arrivalDate);
-  assert.equal(draft.personalPhotoUrl, data.personalPhotoUrl);
+  assert.equal(draft.personalPortraitUrl, data.personalPortraitUrl);
 });
 
-test('Sheet values map correctly into the draft (KSA Visa), including passportScanUrl', () => {
+test('Sheet values map correctly into the draft (KSA Visa), including passportScanUrl and personalPhotoUrl', () => {
   const data = sampleData();
   const draft = buildVisaApplicationDraft(data, 'ksavisa');
   assert.equal(draft.firstName, data.firstName);
   assert.equal(draft.passportScanUrl, data.passportScanUrl);
+  assert.equal(draft.personalPhotoUrl, data.personalPhotoUrl);
 });

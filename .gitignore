@@ -4,3 +4,5 @@ dist/
 *.log
 coverage/
 .DS_Store
+visitsaudi-evidence.json
+scripts/windows/visitsaudi-tunnel.config.json

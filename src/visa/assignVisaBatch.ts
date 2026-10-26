@@ -10,8 +10,35 @@ import { buildVisaBatchName } from './buildVisaBatchName.js';
 import type { VisaBatchApplicant } from './types.js';
 
 const MAX_BATCH_SIZE = 10;
-/** Same shared-attempt-budget convention as MAX_RECONCILIATION_ATTEMPTS elsewhere in this codebase -- real-world concurrency here is a handful of workers at most, never thousands. */
-const MAX_ASSIGNMENT_ATTEMPTS = 5;
+/**
+ * Same shared-attempt-budget convention as MAX_RECONCILIATION_ATTEMPTS
+ * elsewhere in this codebase -- real-world concurrency here is a handful
+ * of workers at most, never thousands. Raised from 5 to 12: a 20-run
+ * empirical reproduction of 11 truly concurrent callers racing for 10
+ * batch-1 slots (tests/visa.assignVisaBatch.test.ts's own concurrency
+ * test) showed a 25% failure rate at 5 attempts under real Postgres
+ * timing -- a reliability gap, not a correctness one (every failure was
+ * `could not assign ... after N attempts`, never a bad/duplicate row).
+ */
+const MAX_ASSIGNMENT_ATTEMPTS = 12;
+
+/**
+ * Small, bounded delay between retries only -- never before the first
+ * attempt, and never large enough to make a normal (uncontended) call
+ * noticeably slower. Spreads out immediately-retrying losers so repeat
+ * collisions against the same still-racing competitors are less likely,
+ * without introducing any locking.
+ */
+const RETRY_BACKOFF_BASE_MS = 5;
+const RETRY_BACKOFF_JITTER_MS = 15;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function backoffBeforeRetry(): Promise<void> {
+  await sleep(RETRY_BACKOFF_BASE_MS + Math.random() * RETRY_BACKOFF_JITTER_MS);
+}
 
 export interface AssignVisaBatchDependencies {
   findActiveAssignment: typeof findActiveAssignment;
@@ -34,8 +61,43 @@ const defaultDependencies: AssignVisaBatchDependencies = {
 /** Postgres' own unique_violation SQLSTATE -- see pg's own error.code convention, already relied on implicitly elsewhere in this codebase's ON CONFLICT-guarded inserts. */
 const POSTGRES_UNIQUE_VIOLATION = '23505';
 
-function isUniqueViolation(error: unknown): boolean {
-  return typeof error === 'object' && error !== null && 'code' in error && (error as { code: unknown }).code === POSTGRES_UNIQUE_VIOLATION;
+/**
+ * visa_batches' own UNIQUE(group_id, portal, batch_number) -- violated
+ * when two callers race to create the SAME next batch_number. Retrying
+ * (with a fresh read) is always safe: the loser simply sees the winner's
+ * batch on its next findLastBatchForGroup call.
+ */
+const BATCH_NUMBER_UNIQUE_CONSTRAINT = 'visa_batches_group_id_portal_batch_number_key';
+
+/**
+ * visa_batch_applicants' OTHER partial unique index (batch_id,
+ * position_in_batch) -- see createVisaBatchAssignment's own ON CONFLICT
+ * comment: that clause only targets the identity-uniqueness index below,
+ * so a violation of THIS index still raises here, exactly when two
+ * DIFFERENT applicants raced for the same computed free position.
+ * Retrying (with a fresh findFreePositionInBatch read) is always safe.
+ */
+const POSITION_UNIQUE_INDEX = 'idx_visa_batch_applicants_position_active';
+
+/**
+ * Checks for a unique_violation on a SPECIFIC named constraint/index,
+ * never just "any unique_violation" -- a violation of
+ * idx_visa_batch_applicants_one_active_assignment (duplicate identity)
+ * is already suppressed earlier by createVisaBatchAssignment's own ON
+ * CONFLICT (it never reaches a catch block as a real error at all), so
+ * if a unique_violation with a DIFFERENT constraint name ever reaches
+ * either catch block below, it is a genuinely unexpected error -- it
+ * must propagate, not be silently retried, exactly as before this fix.
+ */
+function isUniqueViolationOn(error: unknown, constraintName: string): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    (error as { code: unknown }).code === POSTGRES_UNIQUE_VIOLATION &&
+    'constraint' in error &&
+    (error as { constraint: unknown }).constraint === constraintName
+  );
 }
 
 /**
@@ -84,6 +146,10 @@ export async function assignVisaBatch(
   }
 
   for (let attempt = 0; attempt < MAX_ASSIGNMENT_ATTEMPTS; attempt += 1) {
+    if (attempt > 0) {
+      await backoffBeforeRetry();
+    }
+
     const lastBatch = await deps.findLastBatchForGroup(groupId, portal);
 
     let targetBatchId: string | null = null;
@@ -106,7 +172,7 @@ export async function assignVisaBatch(
         });
         targetBatchId = batch.id;
       } catch (error) {
-        if (isUniqueViolation(error)) {
+        if (isUniqueViolationOn(error, BATCH_NUMBER_UNIQUE_CONSTRAINT)) {
           continue; // another caller already created this batch_number -- retry with a fresh read
         }
         throw error;
@@ -139,7 +205,12 @@ export async function assignVisaBatch(
       // classic read-then-write gap). Retrying with a fresh read is always
       // safe: the DB never actually persists the conflicting duplicate
       // row, this is purely a losing-side retry, not a correctness issue.
-      if (isUniqueViolation(error)) {
+      // A unique_violation on any OTHER constraint here -- in particular
+      // idx_visa_batch_applicants_one_active_assignment, the identity-
+      // uniqueness index this same INSERT's ON CONFLICT already targets
+      // and should therefore never actually raise for -- is genuinely
+      // unexpected and must propagate, not be retried blindly.
+      if (isUniqueViolationOn(error, POSITION_UNIQUE_INDEX)) {
         continue;
       }
       throw error;

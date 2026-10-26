@@ -16,6 +16,7 @@ function completeData(overrides: Partial<VerifiedApplicantData> = {}): VerifiedA
     email: 'john@example.com',
     arrivalDate: '2026-10-05',
     personalPhotoUrl: 'https://example.com/photo.jpg',
+    personalPortraitUrl: 'https://example.com/portrait.jpg',
     passportScanUrl: 'https://example.com/scan.jpg',
     ...overrides,
   };
@@ -71,13 +72,44 @@ test('expired passport (valid date, but in the past) -> not ready (PASSPORT_EXPI
   assert.deepEqual(result, { ready: false, reason: 'PASSPORT_EXPIRED' });
 });
 
-test('invalid personal photo URL -> not ready (INVALID_PHOTO_URL)', () => {
-  const result = validateVerifiedApplicantData(completeData({ personalPhotoUrl: 'not a url' }), 'visitsaudi');
-  assert.deepEqual(result, { ready: false, reason: 'INVALID_PHOTO_URL' });
+test('invalid personal portrait URL -> not ready (INVALID_PORTRAIT_URL) for VisitSaudi', () => {
+  const result = validateVerifiedApplicantData(completeData({ personalPortraitUrl: 'not a url' }), 'visitsaudi');
+  assert.deepEqual(result, { ready: false, reason: 'INVALID_PORTRAIT_URL' });
+});
+
+test('missing personal portrait URL -> not ready (MISSING_FIELDS) for VisitSaudi, even when the full photo URL is present and valid -- never falls back to it', () => {
+  const result = validateVerifiedApplicantData(completeData({ personalPortraitUrl: '' }), 'visitsaudi');
+  assert.equal(result.ready, false);
+  if (result.ready) throw new Error('unreachable');
+  assert.equal(result.reason, 'MISSING_FIELDS');
+  assert.ok(result.missingFields?.includes('Portret surat URL'));
 });
 
 test('VisitSaudi never requires passport scan URL, even when blank', () => {
   const result = validateVerifiedApplicantData(completeData({ passportScanUrl: '' }), 'visitsaudi');
+  assert.deepEqual(result, { ready: true });
+});
+
+test('VisitSaudi never requires the full personal photo URL, even when blank', () => {
+  const result = validateVerifiedApplicantData(completeData({ personalPhotoUrl: '' }), 'visitsaudi');
+  assert.deepEqual(result, { ready: true });
+});
+
+test('KSA Visa missing personal photo URL -> not ready (MISSING_FIELDS)', () => {
+  const result = validateVerifiedApplicantData(completeData({ personalPhotoUrl: '' }), 'ksavisa');
+  assert.equal(result.ready, false);
+  if (result.ready) throw new Error('unreachable');
+  assert.equal(result.reason, 'MISSING_FIELDS');
+  assert.ok(result.missingFields?.includes('Shaxsiy rasm URL'));
+});
+
+test('KSA Visa invalid personal photo URL -> not ready (INVALID_PHOTO_URL)', () => {
+  const result = validateVerifiedApplicantData(completeData({ personalPhotoUrl: 'not a url' }), 'ksavisa');
+  assert.deepEqual(result, { ready: false, reason: 'INVALID_PHOTO_URL' });
+});
+
+test('KSA Visa never requires the personal portrait URL, even when blank', () => {
+  const result = validateVerifiedApplicantData(completeData({ personalPortraitUrl: '' }), 'ksavisa');
   assert.deepEqual(result, { ready: true });
 });
 

@@ -86,6 +86,7 @@ function completeData(overrides: Partial<VerifiedApplicantData> = {}): VerifiedA
     email: 'john@example.com',
     arrivalDate: '2026-10-05',
     personalPhotoUrl: 'https://example.com/photo.jpg',
+    personalPortraitUrl: 'https://example.com/portrait.jpg',
     passportScanUrl: '',
     ...overrides,
   };

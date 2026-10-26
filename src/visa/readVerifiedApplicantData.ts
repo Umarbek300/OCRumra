@@ -107,6 +107,7 @@ export async function readVerifiedApplicantData(
     email: cell(matchedRow, VISA_COLUMN_INDEX.email),
     arrivalDate: cell(matchedRow, VISA_COLUMN_INDEX.arrivalDate),
     personalPhotoUrl: cell(matchedRow, VISA_COLUMN_INDEX.personalPhotoUrl),
+    personalPortraitUrl: cell(matchedRow, VISA_COLUMN_INDEX.personalPortraitUrl),
     passportScanUrl: cell(matchedRow, VISA_COLUMN_INDEX.passportScanUrl),
   };
 }

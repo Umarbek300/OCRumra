@@ -46,7 +46,10 @@ export interface VerifiedApplicantData {
   nationality: string;
   email: string;
   arrivalDate: string;
+  /** Always read from the Sheet regardless of portal -- only REQUIRED for ksavisa (see validateVerifiedApplicantData.ts). The full, uncropped applicant photo (Sheet column T) -- never used for visitsaudi, which needs the face-cropped portrait instead (see personalPortraitUrl below). */
   personalPhotoUrl: string;
+  /** The face-cropped applicant portrait (Sheet column V, written by the applicant-photo-crop pipeline) -- REQUIRED for visitsaudi (the real portal only accepts a face-only portrait, never the full photo or a passport scan). Not used by ksavisa. */
+  personalPortraitUrl: string;
   /** Always read from the Sheet regardless of portal -- only REQUIRED for ksavisa (see validateVerifiedApplicantData.ts). May be '' for a visitsaudi-only applicant. */
   passportScanUrl: string;
 }
@@ -59,6 +62,7 @@ export type ValidationFailureReason =
   | 'PASSPORT_EXPIRED'
   | 'INVALID_EMAIL'
   | 'INVALID_PHOTO_URL'
+  | 'INVALID_PORTRAIT_URL'
   | 'INVALID_SCAN_URL';
 
 export type ValidationResult =
@@ -76,16 +80,18 @@ export interface VisaApplicationDraftBase {
   nationality: string;
   email: string;
   arrivalDate: string;
-  personalPhotoUrl: string;
 }
 
+/** personalPhotoUrl structurally does not exist on this variant -- the real VisitSaudi portal only accepts a face-cropped portrait, never the full photo (see types.ts's own VerifiedApplicantData doc comment and buildVisaApplicationDraft.ts). personalPortraitUrl exists ONLY here, enforced at the type level, not just by convention. */
 export interface VisitSaudiApplicationDraft extends VisaApplicationDraftBase {
   portal: 'visitsaudi';
+  personalPortraitUrl: string;
 }
 
-/** passportScanUrl exists ONLY on this variant -- a VisitSaudi draft structurally cannot carry one, enforced at the type level, not just by convention (see buildVisaApplicationDraft.ts's own doc comment). */
+/** personalPhotoUrl/passportScanUrl exist ONLY on this variant -- a VisitSaudi draft structurally cannot carry either, enforced at the type level, not just by convention (see buildVisaApplicationDraft.ts's own doc comment). */
 export interface KsaVisaApplicationDraft extends VisaApplicationDraftBase {
   portal: 'ksavisa';
+  personalPhotoUrl: string;
   passportScanUrl: string;
 }
 
