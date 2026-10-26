@@ -356,6 +356,24 @@ test('syncPassportRowToSheet writes Paket but leaves Depozit/Qoldiq empty when o
   assert.equal(capturedRow![11], '', 'no balance without a reliable deposit amount too');
 });
 
+test('syncPassportRowToSheet leaves Qoldiq blank (never a negative number) when the caption\'s deposit exceeds its package price', async () => {
+  let capturedRow: readonly string[] | null = null;
+  const { deps } = buildDeps({
+    telegramMessage: { ...TELEGRAM_MESSAGE, captionText: 'Package: $200\nDeposit: $1400' },
+    upsertRowImpl: async (input) => {
+      capturedRow = input.row;
+      return { action: 'appended', rowNumber: 5 };
+    },
+  });
+
+  await syncPassportRowToSheet('job-1', deps);
+
+  assert.ok(capturedRow);
+  assert.equal(capturedRow![9], '$200', 'Paket is still written as parsed');
+  assert.equal(capturedRow![10], '$1400', 'Depozit is still written as parsed');
+  assert.equal(capturedRow![11], '', 'Qoldiq (L) must stay blank, never a negative number, when deposit exceeds package price');
+});
+
 test('syncPassportRowToSheet never lets package/deposit parsing affect the passport OCR fields written to the row', async () => {
   let capturedRow: readonly string[] | null = null;
   const { deps } = buildDeps({

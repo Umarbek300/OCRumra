@@ -168,6 +168,30 @@ test('computeGroupGenderStats called twice in a row (simulating a sheet-sync ret
   }
 });
 
+test('a later correction to an OCR result\'s gender (an UPDATE, not a new row) is reflected correctly on the very next call -- no stale cached count', async () => {
+  const fixture = await createGroup();
+  try {
+    const messageId = await addPassenger(fixture, 'male');
+    await addPassenger(fixture, 'female');
+
+    const before = await computeGroupGenderStats(fixture.groupId);
+    assert.deepEqual(before, { male: 1, female: 1, unspecified: 0, total: 2 });
+
+    // Simulate an operator correction of a misread gender -- a plain
+    // UPDATE on the existing row, never a new passport_ocr_results row.
+    await pool.query(`UPDATE passport_ocr_results SET gender = 'female' WHERE telegram_message_id = $1`, [messageId]);
+
+    const after = await computeGroupGenderStats(fixture.groupId);
+    assert.deepEqual(
+      after,
+      { male: 0, female: 2, unspecified: 0, total: 2 },
+      'the correction must be reflected immediately -- computeGroupGenderStats always recomputes fresh from the DB, never from a stale/cached total',
+    );
+  } finally {
+    await cleanupGroup(fixture);
+  }
+});
+
 test('a duplicate Telegram message, blocked by telegram_messages own UNIQUE(telegram_chat_id, telegram_message_id) constraint, never inflates the count', async () => {
   const fixture = await createGroup();
   try {

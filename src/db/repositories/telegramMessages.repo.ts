@@ -140,20 +140,30 @@ export async function findCaptionForMediaGroup(telegramChatId: number, mediaGrou
  * that was recorded earlier without one -- covering the case where the
  * caption-carrying message in the album isn't the first to arrive. Only
  * ever fills a NULL caption_text; never overwrites a sibling's own
- * already-known caption. Returns the number of sibling rows updated.
+ * already-known caption.
+ *
+ * Returns the ids of every sibling row actually updated (not just a count)
+ * -- a sibling backfilled here may already have been synced to its Google
+ * Sheet row BEFORE this caption ever arrived (its own Paket/Depozit/Qoldiq
+ * columns written as blank, since caption_text was still NULL at that
+ * time). The caller (ingestPhotoMessage.ts) uses these ids to requeue each
+ * one for a real re-sync via requeueSheetSyncForResync, so the Sheet row
+ * picks up the now-available package/deposit amounts instead of staying
+ * permanently blank.
  */
 export async function backfillCaptionForMediaGroup(
   telegramChatId: number,
   mediaGroupId: string,
   captionText: string,
-): Promise<number> {
-  const { rowCount } = await pool.query(
+): Promise<string[]> {
+  const { rows } = await pool.query<{ id: string }>(
     `UPDATE telegram_messages
      SET caption_text = $3
-     WHERE telegram_chat_id = $1 AND media_group_id = $2 AND caption_text IS NULL`,
+     WHERE telegram_chat_id = $1 AND media_group_id = $2 AND caption_text IS NULL
+     RETURNING id`,
     [telegramChatId, mediaGroupId, captionText],
   );
-  return rowCount ?? 0;
+  return rows.map((row) => row.id);
 }
 
 export async function findTelegramMessageById(id: string): Promise<TelegramMessageRecord | null> {

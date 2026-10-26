@@ -108,7 +108,21 @@ export const MAX_SHEET_SYNC_ATTEMPTS = 5;
  * Jobs ready to (re)attempt: 'pending' (never tried) or 'failed' (retry
  * eligible again) whose next_attempt_at has arrived AND whose attempts
  * count hasn't yet reached maxAttempts, oldest first. Never selects
- * 'syncing' (already claimed) or 'synced' (done) rows.
+ * 'syncing' (already claimed) rows.
+ *
+ * ALSO selects an already-'synced' row whose confirmation_sent_at is still
+ * NULL — i.e. the Sheet write itself genuinely succeeded, but the process
+ * was killed/crashed/OOM'd before the post-sync Telegram confirmation was
+ * sent (and therefore before markSheetSyncConfirmationSent ever ran). Such
+ * a row would otherwise be permanently stuck: its status is 'synced', so
+ * it is done as far as any status-based query is concerned, yet its
+ * confirmation was never delivered and nothing else in this codebase ever
+ * revisits a 'synced' row. Re-offering it here lets syncPassportRowToSheet
+ * run again for it -- the Sheets upsert it repeats is an idempotent,
+ * already-relied-upon no-op (same row, same spreadsheet cell range), and
+ * its own sendPassportConfirmation only actually sends when
+ * confirmationSentAt is still false, so this never risks a duplicate send
+ * for a row that already has one.
  *
  * A 'failed' row that reached maxAttempts is deliberately excluded here —
  * it is a permanent failure, not silently dropped: it stays visible at
@@ -117,7 +131,13 @@ export const MAX_SHEET_SYNC_ATTEMPTS = 5;
  * AND attempts >= 5`), it is simply never offered to this function again.
  * next_attempt_at is left as whatever markSheetSyncFailed's caller last
  * set (never NULL — the column is NOT NULL) — it just stops mattering once
- * this WHERE clause excludes the row on attempts alone.
+ * this WHERE clause excludes the row on attempts alone. The SAME
+ * attempts < maxAttempts cap is reused, unchanged, for the synced-but-
+ * unconfirmed branch -- a row that happened to need every one of its sync
+ * attempts before finally succeeding, and then crashed in the narrow
+ * window before confirming, stops being auto-retried once attempts is
+ * exhausted (same residual, accepted edge case as everywhere else in this
+ * module; an operator can still see and resend such a row by hand).
  */
 export async function findDueSheetSyncJobs(
   limit: number = DEFAULT_DUE_JOBS_LIMIT,
@@ -125,7 +145,12 @@ export async function findDueSheetSyncJobs(
 ): Promise<SheetSyncQueueRecord[]> {
   const { rows } = await pool.query<SheetSyncQueueRow>(
     `SELECT ${SELECT_COLUMNS} FROM sheet_sync_queue
-     WHERE status IN ('pending', 'failed') AND next_attempt_at <= now() AND attempts < $2
+     WHERE next_attempt_at <= now()
+       AND attempts < $2
+       AND (
+         status IN ('pending', 'failed')
+         OR (status = 'synced' AND confirmation_sent_at IS NULL)
+       )
      ORDER BY next_attempt_at
      LIMIT $1`,
     [limit, maxAttempts],
@@ -135,15 +160,27 @@ export async function findDueSheetSyncJobs(
 
 /**
  * Atomically claims a due job: pending/failed -> syncing, attempts += 1.
- * Returns null if the row wasn't in a claimable state (already claimed by
- * another worker, already synced, or not yet due) — the guard against
- * double-processing, same shape as markPassportProcessingStarted.
+ * ALSO claims an already-'synced' row whose confirmation_sent_at is still
+ * NULL (see findDueSheetSyncJobs's own doc comment for why that state is
+ * real and must remain retryable) -- same transition, syncing, attempts +=
+ * 1. Returns null if the row wasn't in a claimable state (already claimed
+ * by another worker, already fully done with its confirmation sent, or
+ * not yet due) — the guard against double-processing/double-sending, same
+ * shape as markPassportProcessingStarted. Exactly this single atomic
+ * UPDATE...RETURNING, scoped by id AND the claimable-state check, is what
+ * makes two concurrent callers racing for the SAME synced-but-unconfirmed
+ * row safe: only one can ever move it out of 'synced', so only one will
+ * ever go on to call sendPassportConfirmation for it.
  */
 export async function markSheetSyncStarted(id: string): Promise<SheetSyncQueueRecord | null> {
   const { rows } = await pool.query<SheetSyncQueueRow>(
     `UPDATE sheet_sync_queue
      SET status = 'syncing', attempts = attempts + 1
-     WHERE id = $1 AND status IN ('pending', 'failed')
+     WHERE id = $1
+       AND (
+         status IN ('pending', 'failed')
+         OR (status = 'synced' AND confirmation_sent_at IS NULL)
+       )
      RETURNING ${SELECT_COLUMNS}`,
     [id],
   );

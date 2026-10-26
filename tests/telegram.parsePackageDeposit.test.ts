@@ -142,6 +142,16 @@ test('calculateBalance returns null when only one side has an explicit currency 
   assert.equal(balance, null);
 });
 
+test('calculateBalance returns null (never a negative amount) when the deposit exceeds the package price', () => {
+  const balance = calculateBalance({ amount: 200, currency: '$' }, { amount: 1400, currency: '$' });
+  assert.equal(balance, null, 'a deposit larger than the package price is a data error, never reported as a negative balance');
+});
+
+test('calculateBalance returns exactly zero (a real, valid "fully paid" balance) when deposit equals package price', () => {
+  const balance = calculateBalance({ amount: 1400, currency: '$' }, { amount: 1400, currency: '$' });
+  assert.deepEqual(balance, { amount: 0, currency: '$' });
+});
+
 // --- formatMoneyForSheet ---
 
 test('formatMoneyForSheet prefixes the currency symbol onto the integer amount', () => {

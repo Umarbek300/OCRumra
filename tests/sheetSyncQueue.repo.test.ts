@@ -86,18 +86,26 @@ async function backdateNextAttemptAt(id: string, minutesFromNow: number): Promis
 async function backdateUpdatedAtMinutes(id: string, minutesAgo: number): Promise<void> {
   // updated_at is normally maintained by the set_updated_at trigger, which
   // unconditionally overwrites it to now() on every UPDATE — including a
-  // naive attempt to backdate it. session_replication_role=replica (scoped
-  // to this one transaction via SET LOCAL) suppresses that trigger just
-  // long enough to simulate a "stale" row for the recovery tests below;
-  // it never touches the schema or affects any other connection.
+  // naive attempt to backdate it. ocrumra_test_role is not a superuser, so
+  // SET (LOCAL) session_replication_role is denied (that GUC's context is
+  // 'superuser' in Postgres, unconditionally) -- ALTER TABLE ...
+  // DISABLE/ENABLE TRIGGER achieves the exact same bypass needing only
+  // table ownership (already held, since this role created the table),
+  // and the inner try/finally guarantees the trigger is always re-enabled
+  // before COMMIT, even if the UPDATE throws; it never touches the schema
+  // or affects any other connection.
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query('SET LOCAL session_replication_role = replica');
-    await client.query(`UPDATE sheet_sync_queue SET updated_at = now() - ($2 * interval '1 minute') WHERE id = $1`, [
-      id,
-      minutesAgo,
-    ]);
+    await client.query('ALTER TABLE sheet_sync_queue DISABLE TRIGGER sheet_sync_queue_set_updated_at');
+    try {
+      await client.query(`UPDATE sheet_sync_queue SET updated_at = now() - ($2 * interval '1 minute') WHERE id = $1`, [
+        id,
+        minutesAgo,
+      ]);
+    } finally {
+      await client.query('ALTER TABLE sheet_sync_queue ENABLE TRIGGER sheet_sync_queue_set_updated_at');
+    }
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');
@@ -169,7 +177,7 @@ test('findDueSheetSyncJobs excludes a job whose next_attempt_at is scheduled in 
   }
 });
 
-test('findDueSheetSyncJobs excludes syncing and synced jobs', async () => {
+test('findDueSheetSyncJobs excludes a syncing job, and excludes a FULLY done (synced + confirmation sent) job, but RE-INCLUDES a synced job whose confirmation was never sent', async () => {
   const fixture = await createLinkedTelegramMessage();
   try {
     const job = await enqueueSheetSync(fixture.telegramMessageId);
@@ -181,8 +189,17 @@ test('findDueSheetSyncJobs excludes syncing and synced jobs', async () => {
     assert.ok(!due.some((row) => row.id === job.id), 'a syncing job must not be re-selected');
 
     await markSheetSyncSynced(job.id, 5);
+    // The Sheets write succeeded, but confirmation_sent_at is still NULL
+    // here -- exactly the state left behind by a process that crashed
+    // between markSheetSyncSynced and the Telegram send. This row MUST
+    // stay retryable, or the confirmation would be lost forever (see
+    // findDueSheetSyncJobs's own doc comment).
     due = await findDueSheetSyncJobs(50);
-    assert.ok(!due.some((row) => row.id === job.id), 'a synced job must never be selected again');
+    assert.ok(due.some((row) => row.id === job.id), 'a synced-but-unconfirmed job must still be offered, so its confirmation can be retried');
+
+    await markSheetSyncConfirmationSent(job.id);
+    due = await findDueSheetSyncJobs(50);
+    assert.ok(!due.some((row) => row.id === job.id), 'once the confirmation is actually sent, the job is fully done and must never be selected again');
   } finally {
     await cleanup(fixture);
   }
@@ -212,6 +229,42 @@ test('markSheetSyncStarted returns null when the job is already syncing (guards 
 
     const secondClaim = await markSheetSyncStarted(job.id);
     assert.equal(secondClaim, null);
+  } finally {
+    await cleanup(fixture);
+  }
+});
+
+test('markSheetSyncStarted can re-claim a synced-but-unconfirmed job (synced -> syncing, attempts += 1 again)', async () => {
+  const fixture = await createLinkedTelegramMessage();
+  try {
+    const job = await enqueueSheetSync(fixture.telegramMessageId);
+    assert.ok(job);
+    const firstAttempt = await markSheetSyncStarted(job.id);
+    assert.ok(firstAttempt);
+    await markSheetSyncSynced(job.id, 5);
+    // confirmation_sent_at is still NULL -- the process "crashed" before ever sending it.
+
+    const reclaimed = await markSheetSyncStarted(job.id);
+    assert.ok(reclaimed, 'a synced-but-unconfirmed job must be claimable again');
+    assert.equal(reclaimed.status, 'syncing');
+    assert.equal(reclaimed.attempts, 2, 'attempts keeps counting from where the original sync left it');
+    assert.equal(reclaimed.sheetRowNumber, 5, 'the earlier successful sheet write is not undone by reclaiming it');
+  } finally {
+    await cleanup(fixture);
+  }
+});
+
+test('markSheetSyncStarted returns null for a job that is synced AND already has its confirmation sent (fully done, never reclaimed)', async () => {
+  const fixture = await createLinkedTelegramMessage();
+  try {
+    const job = await enqueueSheetSync(fixture.telegramMessageId);
+    assert.ok(job);
+    await markSheetSyncStarted(job.id);
+    await markSheetSyncSynced(job.id, 5);
+    await markSheetSyncConfirmationSent(job.id);
+
+    const reclaimed = await markSheetSyncStarted(job.id);
+    assert.equal(reclaimed, null, 'a fully done job (synced + confirmed) must never be claimable again');
   } finally {
     await cleanup(fixture);
   }
@@ -365,6 +418,33 @@ test('findDueSheetSyncJobs stops returning a job once its attempts reach MAX_SHE
     assert.ok(
       !due.some((row) => row.id === job.id),
       'a job that has exhausted MAX_SHEET_SYNC_ATTEMPTS must never be offered for another automatic retry',
+    );
+  } finally {
+    await cleanup(fixture);
+  }
+});
+
+test('findDueSheetSyncJobs also stops re-offering a synced-but-unconfirmed job once its attempts reach MAX_SHEET_SYNC_ATTEMPTS (same shared cap)', async () => {
+  const fixture = await createLinkedTelegramMessage();
+  try {
+    const job = await enqueueSheetSync(fixture.telegramMessageId);
+    assert.ok(job);
+
+    // Exhaust every attempt right up to the LAST one via ordinary failures...
+    for (let i = 0; i < MAX_SHEET_SYNC_ATTEMPTS - 1; i++) {
+      await failOnce(job.id);
+    }
+    // ...then let the final attempt actually succeed, landing on 'synced'
+    // with attempts === MAX_SHEET_SYNC_ATTEMPTS, confirmation never sent.
+    const lastClaim = await markSheetSyncStarted(job.id);
+    assert.ok(lastClaim);
+    assert.equal(lastClaim.attempts, MAX_SHEET_SYNC_ATTEMPTS);
+    await markSheetSyncSynced(job.id, 5);
+
+    const due = await findDueSheetSyncJobs(50);
+    assert.ok(
+      !due.some((row) => row.id === job.id),
+      'a synced-but-unconfirmed job that already used every sync attempt must not be auto-retried forever for its confirmation either',
     );
   } finally {
     await cleanup(fixture);

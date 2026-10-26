@@ -1,5 +1,6 @@
 import { findAgentByTelegramUserId } from '../db/repositories/agents.repo.js';
 import { createPassportProcessingRecord } from '../db/repositories/passportProcessing.repo.js';
+import { requeueSheetSyncForResync } from '../db/repositories/sheetSyncQueue.repo.js';
 import {
   backfillCaptionForMediaGroup,
   findCaptionForMediaGroup,
@@ -63,6 +64,15 @@ export interface IngestResult {
  *     media_group_id, backfill any earlier sibling in the same album that
  *     is still missing one (see backfillCaptionForMediaGroup) — covering
  *     the case where the caption-carrying photo isn't the first to arrive.
+ *     Any backfilled sibling that was ALREADY synced to its Google Sheet
+ *     row (written with blank Paket/Depozit/Qoldiq, since it had no
+ *     caption yet at sync time) is requeued via requeueSheetSyncForResync
+ *     so the next sheets-sync poll re-syncs it with the now-available
+ *     package/deposit amounts — never left permanently blank just because
+ *     the caption happened to arrive on a later message in the same
+ *     album. A sibling that was never synced at all (requeueSheetSyncForResync
+ *     is a no-op then — it only ever resets a 'synced' row) simply picks up
+ *     its own caption_text the ordinary way, the next time it is synced.
  * A standalone message (no media_group_id) is completely unaffected by
  * either step, so this never changes behavior for the common non-album
  * case.
@@ -100,7 +110,10 @@ export async function ingestPhotoMessage(event: PhotoMessageEvent): Promise<Inge
   });
 
   if (result.outcome === 'inserted' && event.captionText !== null && event.mediaGroupId !== null) {
-    await backfillCaptionForMediaGroup(event.chatId, event.mediaGroupId, event.captionText);
+    const backfilledMessageIds = await backfillCaptionForMediaGroup(event.chatId, event.mediaGroupId, event.captionText);
+    for (const backfilledMessageId of backfilledMessageIds) {
+      await requeueSheetSyncForResync(backfilledMessageId);
+    }
   }
 
   let processingEnqueued = false;

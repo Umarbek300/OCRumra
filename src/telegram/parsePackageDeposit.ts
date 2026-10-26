@@ -106,6 +106,22 @@ export interface CalculatedBalance {
  * subtracting two amounts in different, explicitly-stated currencies would
  * be a silent unit error, not a real balance, so that case returns null
  * rather than a misleading number.
+ *
+ * Also returns null (never a negative amount) when the parsed deposit
+ * exceeds the parsed package price. A real, fully-paid balance is
+ * naturally zero at the lowest -- a negative result only ever means one of
+ * the two caption amounts was mistyped, misread, or the two numbers were
+ * matched to the wrong keyword entirely (e.g. the deposit figure parsed as
+ * the package price). Writing that straight into the Qoldiq Sheet column,
+ * or silently reporting it in the Telegram confirmation, would present a
+ * clearly-wrong number as if it were a real balance. Routing it through
+ * the SAME null result this function already returns for "insufficient
+ * data" reuses the existing, already-tested caller behavior on both sides
+ * without inventing a new warning type: buildSheetRow leaves Qoldiq blank
+ * (see formatMoneyForSheet's own callers), and buildConfirmationMessage
+ * shows its existing "⚠️ Qoldiq hisoblanmadi" line -- both already correct
+ * for "could not determine a real balance", which is exactly what a
+ * negative result means here.
  */
 export function calculateBalance(
   packageAmount: ParsedMoneyAmount | null,
@@ -113,7 +129,9 @@ export function calculateBalance(
 ): CalculatedBalance | null {
   if (!packageAmount || !depositAmount) return null;
   if (packageAmount.currency !== depositAmount.currency) return null;
-  return { amount: packageAmount.amount - depositAmount.amount, currency: packageAmount.currency };
+  const amount = packageAmount.amount - depositAmount.amount;
+  if (amount < 0) return null;
+  return { amount, currency: packageAmount.currency };
 }
 
 /** Renders a parsed/calculated money value for a Sheet cell -- never reformats the currency, just prefixes it back onto the number. */

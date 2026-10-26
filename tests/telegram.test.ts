@@ -4,6 +4,12 @@ import { findPassportProcessingByTelegramMessageId } from '../src/db/repositorie
 import { pool } from '../src/db/pool.js';
 import { findGroupByTelegramChatId } from '../src/db/repositories/groups.repo.js';
 import { listLinkedMessages, listUnlinkedMessages } from '../src/db/repositories/telegramMessages.repo.js';
+import {
+  enqueueSheetSync,
+  findSheetSyncQueueByTelegramMessageId,
+  markSheetSyncStarted,
+  markSheetSyncSynced,
+} from '../src/db/repositories/sheetSyncQueue.repo.js';
 import { PASSPORT_PROCESSING_QUEUE, dequeuePassportProcessing } from '../src/queue/passportProcessingQueue.js';
 import { ensureRedisConnected, redisClient } from '../src/queue/redis.js';
 import { ingestPhotoMessage } from '../src/telegram/ingestPhotoMessage.js';
@@ -603,6 +609,111 @@ test('a caption-carrying message backfills an earlier sibling in the same album 
     const linked = await listLinkedMessages();
     const early = linked.find((m) => m.telegramPhotoFileId === 'FILE_ALBUM_EARLY');
     assert.equal(early?.captionText, 'Deposit: $200', 'the earlier sibling was backfilled once the caption arrived');
+  } finally {
+    await deleteFixtures(chatId, groupId, agentId);
+  }
+});
+
+test('a sibling ALREADY synced to its Sheet row (before any caption arrived) is requeued for re-sync once a later album message backfills its caption', async () => {
+  const chatId = uniqueChatId();
+  const senderId = uniqueUserId();
+  const groupId = await createGroup(chatId);
+  const agentId = await createAgent(senderId);
+  const mediaGroupId = `album-${uniqueMessageId()}`;
+  try {
+    // First photo arrives without a caption and gets synced to its Sheet
+    // row (Paket/Depozit/Qoldiq necessarily blank at that point, since
+    // there is no caption anywhere in the album yet).
+    const early = await ingestPhotoMessage({
+      chatId,
+      messageId: uniqueMessageId(),
+      senderUserId: senderId,
+      senderDisplayName: 'Test Sender',
+      timestamp: new Date(),
+      photoFileId: 'FILE_ALBUM_ALREADY_SYNCED',
+      source: 'photo',
+      captionText: null,
+      mediaGroupId,
+    });
+    assert.equal(early.outcome, 'inserted');
+
+    const linkedBefore = await listLinkedMessages();
+    const earlyMessage = linkedBefore.find((m) => m.telegramPhotoFileId === 'FILE_ALBUM_ALREADY_SYNCED');
+    assert.ok(earlyMessage);
+
+    const queueJob = await enqueueSheetSync(earlyMessage.id);
+    assert.ok(queueJob, 'expected a fresh sheet-sync job for the early message');
+    await markSheetSyncStarted(queueJob.id);
+    await markSheetSyncSynced(queueJob.id, 7);
+    const beforeBackfill = await findSheetSyncQueueByTelegramMessageId(earlyMessage.id);
+    assert.equal(beforeBackfill?.status, 'synced', 'simulates the early message already having been synced with blank Paket/Depozit/Qoldiq');
+
+    // Second photo in the SAME album carries the caption with a real
+    // deposit amount — arriving only now, after the first one already synced.
+    await ingestPhotoMessage({
+      chatId,
+      messageId: uniqueMessageId(),
+      senderUserId: senderId,
+      senderDisplayName: 'Test Sender',
+      timestamp: new Date(),
+      photoFileId: 'FILE_ALBUM_LATE_CAPTION',
+      source: 'photo',
+      captionText: 'Deposit: $200',
+      mediaGroupId,
+    });
+
+    const afterBackfill = await findSheetSyncQueueByTelegramMessageId(earlyMessage.id);
+    assert.equal(
+      afterBackfill?.status,
+      'pending',
+      'the early message\'s already-synced job must be requeued to pending so the next poll re-syncs it with the now-available Deposit amount',
+    );
+    assert.equal(afterBackfill?.sheetRowNumber, 7, 'the known sheet row number from the earlier sync is preserved, not lost, across the requeue');
+  } finally {
+    await deleteFixtures(chatId, groupId, agentId);
+  }
+});
+
+test('a sibling that was NEVER synced at all is unaffected by the backfill (nothing to requeue, no error)', async () => {
+  const chatId = uniqueChatId();
+  const senderId = uniqueUserId();
+  const groupId = await createGroup(chatId);
+  const agentId = await createAgent(senderId);
+  const mediaGroupId = `album-${uniqueMessageId()}`;
+  try {
+    const early = await ingestPhotoMessage({
+      chatId,
+      messageId: uniqueMessageId(),
+      senderUserId: senderId,
+      senderDisplayName: 'Test Sender',
+      timestamp: new Date(),
+      photoFileId: 'FILE_ALBUM_NEVER_SYNCED',
+      source: 'photo',
+      captionText: null,
+      mediaGroupId,
+    });
+    assert.equal(early.outcome, 'inserted');
+    const linkedBefore = await listLinkedMessages();
+    const earlyMessage = linkedBefore.find((m) => m.telegramPhotoFileId === 'FILE_ALBUM_NEVER_SYNCED');
+    assert.ok(earlyMessage);
+    // Deliberately never enqueued/synced — no sheet_sync_queue row exists for it at all.
+
+    await assert.doesNotReject(() =>
+      ingestPhotoMessage({
+        chatId,
+        messageId: uniqueMessageId(),
+        senderUserId: senderId,
+        senderDisplayName: 'Test Sender',
+        timestamp: new Date(),
+        photoFileId: 'FILE_ALBUM_LATE_CAPTION_2',
+        source: 'photo',
+        captionText: 'Deposit: $200',
+        mediaGroupId,
+      }),
+    );
+
+    const stillNoQueueRow = await findSheetSyncQueueByTelegramMessageId(earlyMessage.id);
+    assert.equal(stillNoQueueRow, null, 'requeueSheetSyncForResync must stay a safe no-op when there was never a queue row to begin with');
   } finally {
     await deleteFixtures(chatId, groupId, agentId);
   }
