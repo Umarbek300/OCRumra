@@ -45,6 +45,23 @@ function normalizeForMatch(text: string): string {
   return text.toUpperCase().replace(/[^A-Z0-9<]/g, '');
 }
 
+/**
+ * Tests for a long, UNBROKEN run of MRZ-alphabet characters in the
+ * paragraph's own ORIGINAL text -- deliberately NOT run against
+ * normalizeForMatch()'s output, which strips whitespace/punctuation
+ * first and would therefore collapse any sufficiently long ordinary
+ * sentence into one artificial unbroken "run" (an ordinary printed
+ * footer has no delimiter-free run in its own text, only in the
+ * post-strip concatenation of its separate words). Uppercasing only
+ * (no stripping) lets the regex's own character class treat every
+ * space/punctuation mark as the delimiter it actually is, so this can
+ * only match a genuinely unbroken MRZ-style token, exactly like the
+ * real MRZ's own (space-free) merged TD3 lines.
+ */
+function hasLongUnbrokenAlphabetRun(text: string): boolean {
+  return LONG_ALPHABET_RUN_PATTERN.test(text.toUpperCase());
+}
+
 function normalizeLettersOnly(text: string): string {
   return text.toUpperCase().replace(/[^A-Z]/g, '');
 }
@@ -112,7 +129,7 @@ export function locateMrzParagraphGeometry(
     if (p.y0 < MIN_Y0_FRACTION_HARD * pageHeight) return false;
     if (p.x1 - p.x0 < MIN_WIDTH_FRACTION * pageWidth) return false;
     const startsWithP = normalized.startsWith('P<');
-    const longRun = LONG_ALPHABET_RUN_PATTERN.test(normalized);
+    const longRun = hasLongUnbrokenAlphabetRun(p.text);
     if (!startsWithP && !longRun) return false;
     return true;
   });
@@ -126,7 +143,7 @@ export function locateMrzParagraphGeometry(
   const startsWithP = normalized.startsWith('P<');
   const widthRatio = (best.x1 - best.x0) / pageWidth;
   const y0Ratio = best.y0 / pageHeight;
-  const longRun = LONG_ALPHABET_RUN_PATTERN.test(normalized);
+  const longRun = hasLongUnbrokenAlphabetRun(best.text);
   const plausibleLength = normalized.length >= PLAUSIBLE_LENGTH_MIN && normalized.length <= PLAUSIBLE_LENGTH_MAX;
 
   const identityMatches = countIdentityMatches(normalized, paragraphs, best);
