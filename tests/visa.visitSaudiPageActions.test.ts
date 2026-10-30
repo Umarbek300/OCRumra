@@ -245,10 +245,10 @@ test('Package 5.26: confirmSaveOutcome remains explicitly NOT-IMPLEMENTED, faili
   await assert.rejects(() => confirmSaveOutcome(), /NOT IMPLEMENTED/);
 });
 
-test('Package 5.36: answerApplyingOnBehalfOfSomeoneElse clicks the pill button bearing the EXACT given answer text, never confused by the other', async () => {
+test('Real-run fix: answerApplyingOnBehalfOfSomeoneElse clicks the pill button bearing the real, Title-Case DOM text ("Yes"/"No"), never confused by the other', async () => {
   await page.setContent(`
-    <button onclick="window.__onBehalf = 'YES'">YES</button>
-    <button onclick="window.__onBehalf = 'NO'">NO</button>
+    <button onclick="window.__onBehalf = 'YES'">Yes</button>
+    <button onclick="window.__onBehalf = 'NO'">No</button>
   `);
   assert.equal(CONFIRMED_APPLYING_ON_BEHALF_OF_SOMEONE_ELSE_ANSWER, 'YES');
 

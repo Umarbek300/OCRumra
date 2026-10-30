@@ -95,8 +95,8 @@ after(async () => {
  */
 async function setApplicantPageFixture(): Promise<void> {
   await page.setContent(`
-    <button onclick="window.__onBehalfClicked = 'YES'">YES</button>
-    <button onclick="window.__onBehalfClicked = 'NO'">NO</button>
+    <button onclick="window.__onBehalfClicked = 'YES'">Yes</button>
+    <button onclick="window.__onBehalfClicked = 'NO'">No</button>
 
     <button id="uploadBtn">UPLOAD FILE</button>
     <input type="file" id="fileInput" style="display:none" />
@@ -305,7 +305,7 @@ async function setApplicantPageFixtureWithTripDetailsPage(revealInsuranceOnNext 
       for (const button of Array.from(doc.querySelectorAll('button'))) {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const text = (button as any).textContent;
-        if (text === 'YES' || text === 'NO' || (typeof text === 'string' && text.trim().toLowerCase().startsWith('next'))) {
+        if (text === 'Yes' || text === 'No' || (typeof text === 'string' && text.trim().toLowerCase().startsWith('next'))) {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           (button as any).remove();
         }

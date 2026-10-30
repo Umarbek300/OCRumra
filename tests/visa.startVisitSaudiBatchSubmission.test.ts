@@ -97,8 +97,8 @@ async function setBatchFixture(): Promise<void> {
       <button onclick="window.__eventLog.push('confirmGroup:' + document.getElementById('groupName').value); document.getElementById('groupForm').style.display='none'; document.getElementById('applicantPage').style.display='block';">+</button>
     </div>
     <div id="applicantPage" style="display:none">
-      <button onclick="window.__eventLog.push('onBehalf:YES')">YES</button>
-      <button onclick="window.__eventLog.push('onBehalf:NO')">NO</button>
+      <button onclick="window.__eventLog.push('onBehalf:YES')">Yes</button>
+      <button onclick="window.__eventLog.push('onBehalf:NO')">No</button>
       <button id="uploadBtn" onclick="window.__eventLog.push('uploadClicked')">UPLOAD FILE</button>
       <input type="file" id="fileInput" style="display:none" />
 

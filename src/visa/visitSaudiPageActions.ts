@@ -277,19 +277,26 @@ export async function clickSave(page: Page): Promise<void> {
 export const CONFIRMED_APPLYING_ON_BEHALF_OF_SOMEONE_ELSE_ANSWER = 'YES' as const;
 
 /**
- * Package 5.36: the widget is now confirmed -- a recovered real-portal
- * screenshot (found in this session's own raw history, not re-asked for)
- * shows the question followed by two separate, pill-shaped button
- * elements with the literal visible text `YES` and `NO`. This matches
- * the same text-based button convention already used throughout this
- * file (clickApplyForGroup, clickSave, etc.) -- getByText, exact match,
- * never an invented selector. The underlying element type (<button> vs
- * a styled <div>) was not determinable from a screenshot alone, but
- * Playwright's text locator resolves to whichever element carries the
- * text regardless.
+ * CORRECTED (real-run evidence): a recovered real-portal SCREENSHOT had
+ * suggested the visible text reads ALL-CAPS "YES"/"NO" -- but a
+ * screenshot cannot distinguish real DOM text from CSS-driven visual
+ * uppercasing (text-transform), and the former is what Playwright's
+ * text locator actually matches. A real automated run against the real
+ * portal timed out waiting for exact-text "YES" (Playwright's exact
+ * match is case-sensitive), which is exactly this mismatch surfacing.
+ * The operator's own real Inspect-element capture confirms the actual
+ * markup is Title Case: `<label for="ApplyingVisaForSomeoneElseYes"
+ * class="radio-custom-label copy">Yes</label>` (id corroborates, but
+ * text remains the selector, same established convention as
+ * clickSave). DOM_LABEL_FOR_ON_BEHALF_ANSWER maps the business-level
+ * 'YES'/'NO' answer (CONFIRMED_APPLYING_ON_BEHALF_OF_SOMEONE_ELSE_ANSWER,
+ * unchanged) to the real, confirmed DOM text -- nothing about the
+ * business answer itself changes, only how it is matched on screen.
  */
+const DOM_LABEL_FOR_ON_BEHALF_ANSWER: Record<'YES' | 'NO', string> = { YES: 'Yes', NO: 'No' };
+
 export async function answerApplyingOnBehalfOfSomeoneElse(page: Page, answer: 'YES' | 'NO'): Promise<void> {
-  await page.getByText(answer, { exact: true }).click();
+  await page.getByText(DOM_LABEL_FOR_ON_BEHALF_ANSWER[answer], { exact: true }).click();
 }
 
 /**
