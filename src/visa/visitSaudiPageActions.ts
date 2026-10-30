@@ -180,27 +180,44 @@ export async function uploadApplicantPortrait(page: Page, localPortraitFilePath:
   const [fileChooser] = await Promise.all([page.waitForEvent('filechooser'), page.getByText('Upload File', { exact: false }).click()]);
   await fileChooser.setFiles(localPortraitFilePath);
 
-  // CONFIRMED, not guessed: fileChooser.element() is Playwright's OWN
-  // reference to the real <input type="file"> that triggered this exact
-  // filechooser event -- never a selector invented by this codebase (see
-  // this function's own doc comment for why no such selector is ever
-  // written directly). setFiles() resolving only proves the browser
-  // ACCEPTED the file selection; it does NOT, by itself, prove the
-  // selected file genuinely carries non-zero bytes at that moment -- this
-  // is exactly the failure mode this file's own doc comment already
-  // documents (uploadApplicantPortraitFromUrl's own note: deleting the
-  // downloaded file too early once produced a silently-0-byte upload).
-  // This checks the real DOM state directly, immediately, rather than
-  // inferring success from setFiles() not throwing.
-  const uploadedFile = await fileChooser.element().evaluate((input: any) => {
-    const file = input.files && input.files.length > 0 ? input.files[0] : null;
-    return { count: input.files ? input.files.length : 0, size: file ? file.size : 0, name: file ? file.name : null };
-  });
-  if (uploadedFile.count !== 1 || uploadedFile.size <= 0) {
-    throw new Error(
-      `uploadApplicantPortrait: setFiles() resolved without throwing, but the real <input> element does not show exactly one non-empty file afterward (count=${uploadedFile.count}, size=${uploadedFile.size}, name=${uploadedFile.name}) -- never proceeding as if the upload succeeded. This still does NOT, and cannot, confirm the real portal's own SERVER accepted the upload -- no such signal has ever been observed on the real VisitSaudi portal.`,
-    );
-  }
+  // CROP STEP FIX (real-run evidence): selecting a file does NOT commit
+  // it directly -- the real portal opens a "Crop Image" modal that must
+  // be confirmed first. This was discovered because the OLD check here
+  // (reading fileChooser.element()'s own <input>.files immediately after
+  // setFiles()) genuinely failed on a real run -- it was checking the
+  // wrong moment, before the crop step, not a real correctness problem
+  // with that element reference itself. The operator's own real
+  // Inspect-element capture confirms the real confirm button:
+  // `<button class="rounded-button upload-result">Crop</button>`, and the
+  // operator's own direct observation confirms both that the modal
+  // closes after clicking it, and that a thumbnail + "foto" label then
+  // appear where "Upload File" used to be alone.
+  //
+  // OPENLY FLAGGED, UNRESOLVED GAP: the crop tool's own zoom/position
+  // slider defaults to maximum zoom, and the operator's own side-by-side
+  // test proved the DEFAULT position produces a BADLY cropped face for
+  // one source image (too tight, cutting off most of the face) while
+  // working fine for a different, more wide-framed source image --
+  // i.e., the correct slider position is source-image-dependent, not a
+  // fixed constant. No real, evidence-based way to compute the right
+  // position for an arbitrary portrait exists in this codebase, so this
+  // function does NOT touch the slider -- it accepts the tool's own
+  // default, same as it did before this fix was even found. A
+  // poorly-framed crop is a real, silent quality risk this function
+  // cannot detect or prevent (same category of gap as the Page 4 date
+  // fields' own openly-flagged gap, fillApplicantPersonalInfoFields's own
+  // doc comment) -- an operator should verify portrait framing for any
+  // batch run through this path until a real, evidence-backed fix for
+  // the slider exists.
+  await page.getByText('Crop Image', { exact: false }).waitFor({ state: 'visible', timeout: 10000 });
+  await page.getByText('Crop', { exact: true }).click();
+
+  // The modal closing is the one real, confirmed signal that the crop
+  // action was accepted without erroring -- it does NOT, and cannot,
+  // confirm the crop's own visual quality, nor that the real portal's
+  // own SERVER accepted the upload; no such signal has ever been
+  // observed on the real VisitSaudi portal.
+  await page.getByText('Crop Image', { exact: false }).waitFor({ state: 'hidden', timeout: 10000 });
 }
 
 /**

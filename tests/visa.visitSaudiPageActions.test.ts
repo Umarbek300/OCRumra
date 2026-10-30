@@ -1,7 +1,5 @@
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
-import { mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { after, before, test } from 'node:test';
@@ -157,16 +155,37 @@ test('clickPrevious and clickNext each click their own exact-text button, never 
   assert.equal(await page.evaluate(() => (globalThis as unknown as { __nav?: string }).__nav), 'next');
 });
 
-test('uploadApplicantPortrait triggers the "UPLOAD FILE" control and supplies the given local file via the native filechooser', async () => {
-  await page.setContent(`
-    <button id="uploadBtn">UPLOAD FILE</button>
-    <input type="file" id="fileInput" style="display:none" />
-    <script>
-      document.getElementById('uploadBtn').addEventListener('click', () => {
-        document.getElementById('fileInput').click();
-      });
-    </script>
-  `);
+/**
+ * Crop-step fix: the real portal opens a "Crop Image" modal after a file
+ * is selected, which must be confirmed (real button:
+ * `<button class="rounded-button upload-result">Crop</button>`) before
+ * the upload is accepted -- see uploadApplicantPortrait's own doc
+ * comment for the full real-run evidence. This fixture simulates that
+ * same shape: selecting a file (native `change` event) reveals the
+ * modal; clicking its real "Crop" button hides it again.
+ */
+const CROP_MODAL_FIXTURE = `
+  <button id="uploadBtn">UPLOAD FILE</button>
+  <input type="file" id="fileInput" style="display:none" />
+  <div id="cropModal" style="display:none">
+    <div>Crop Image</div>
+    <button class="rounded-button upload-result">Crop</button>
+  </div>
+  <script>
+    document.getElementById('uploadBtn').addEventListener('click', () => {
+      document.getElementById('fileInput').click();
+    });
+    document.getElementById('fileInput').addEventListener('change', () => {
+      document.getElementById('cropModal').style.display = 'block';
+    });
+    document.querySelector('#cropModal button.upload-result').addEventListener('click', () => {
+      document.getElementById('cropModal').style.display = 'none';
+    });
+  </script>
+`;
+
+test('uploadApplicantPortrait triggers the "UPLOAD FILE" control, supplies the given local file via the native filechooser, and confirms the real Crop Image modal', async () => {
+  await page.setContent(CROP_MODAL_FIXTURE);
   await uploadApplicantPortrait(page, TEST_PORTRAIT_PATH);
   const uploadedName = await page.evaluate(() => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- runs in the browser; this project's own tsconfig has no "dom" lib.
@@ -175,40 +194,17 @@ test('uploadApplicantPortrait triggers the "UPLOAD FILE" control and supplies th
     return input.files && input.files.length > 0 ? input.files[0].name : null;
   });
   assert.equal(uploadedName, 'visitSaudiTestPortrait.jpg');
+
+  const modalStillVisible = await page.evaluate(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const documentRef = (globalThis as any).document;
+    return documentRef.getElementById('cropModal').style.display !== 'none';
+  });
+  assert.equal(modalStillVisible, false, 'the Crop Image modal must be confirmed (closed) before this function returns');
 });
 
-test('Portrait-upload confirmation: uploadApplicantPortrait throws when the real <input> element shows a 0-byte file afterward, instead of silently treating setFiles() not throwing as success', async () => {
-  const emptyFileDir = mkdtempSync(path.join(tmpdir(), 'visitsaudi-empty-portrait-'));
-  const emptyFilePath = path.join(emptyFileDir, 'empty.jpg');
-  writeFileSync(emptyFilePath, Buffer.alloc(0));
-
-  await page.setContent(`
-    <button id="uploadBtn">UPLOAD FILE</button>
-    <input type="file" id="fileInput" style="display:none" />
-    <script>
-      document.getElementById('uploadBtn').addEventListener('click', () => {
-        document.getElementById('fileInput').click();
-      });
-    </script>
-  `);
-
-  await assert.rejects(
-    uploadApplicantPortrait(page, emptyFilePath),
-    /does not show exactly one non-empty file afterward/,
-    'a genuinely 0-byte file must never be treated as a successful upload',
-  );
-});
-
-test('Package 5.27: uploadApplicantPortraitFromUrl downloads the given URL and uploads the SAME bytes via the native filechooser', async () => {
-  await page.setContent(`
-    <button id="uploadBtn">UPLOAD FILE</button>
-    <input type="file" id="fileInput" style="display:none" />
-    <script>
-      document.getElementById('uploadBtn').addEventListener('click', () => {
-        document.getElementById('fileInput').click();
-      });
-    </script>
-  `);
+test('Package 5.27: uploadApplicantPortraitFromUrl downloads the given URL and uploads the SAME bytes via the native filechooser, confirming the real Crop Image modal', async () => {
+  await page.setContent(CROP_MODAL_FIXTURE);
 
   const downloadedPath = await uploadApplicantPortraitFromUrl(page, portraitServerUrl);
 

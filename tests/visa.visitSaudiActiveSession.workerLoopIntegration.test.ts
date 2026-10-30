@@ -104,6 +104,10 @@ async function setApplicantFixture(page: import('playwright').Page): Promise<voi
     </div>
     <button id="uploadBtn">UPLOAD FILE</button>
     <input type="file" id="fileInput" style="display:none" />
+    <div id="cropModal" style="display:none">
+      <div>Crop Image</div>
+      <button class="rounded-button upload-result">Crop</button>
+    </div>
 
     <label for="nationality">Country of Nationality*</label>
     <select id="nationality"><option value="">Select</option><option>Uzbekistan</option></select>
@@ -138,6 +142,12 @@ async function setApplicantFixture(page: import('playwright').Page): Promise<voi
       window.__saveClickLog = window.__saveClickLog || [];
       document.getElementById('uploadBtn').addEventListener('click', () => {
         document.getElementById('fileInput').click();
+      });
+      document.getElementById('fileInput').addEventListener('change', () => {
+        document.getElementById('cropModal').style.display = 'block';
+      });
+      document.querySelector('#cropModal button.upload-result').addEventListener('click', () => {
+        document.getElementById('cropModal').style.display = 'none';
       });
     </script>
   `);

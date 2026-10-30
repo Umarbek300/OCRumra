@@ -208,10 +208,16 @@ after(async () => {
 /** Same group-creation + Page 3 fixture as visa.startVisitSaudiBatchSubmission.test.ts's own setBatchFixture -- deliberately NOT re-derived differently, so this test exercises the SAME real page-action/automation code the sibling test already proves correct. */
 /** Package 5.46: the same applicant-page field markup, reused by BOTH fixtures below -- never re-derived differently for the fresh vs resumed case. */
 const APPLICANT_PAGE_HTML = `
-  <button onclick="window.__eventLog.push('onBehalf:YES')">YES</button>
-  <button onclick="window.__eventLog.push('onBehalf:NO')">NO</button>
+  <div id="formPersonalInfo">
+    <button onclick="window.__eventLog.push('onBehalf:YES')">Yes</button>
+    <button onclick="window.__eventLog.push('onBehalf:NO')">No</button>
+  </div>
   <button id="uploadBtn">UPLOAD FILE</button>
   <input type="file" id="fileInput" style="display:none" />
+  <div id="cropModal" style="display:none">
+    <div>Crop Image</div>
+    <button class="rounded-button upload-result">Crop</button>
+  </div>
 
   <label for="nationality">Country of Nationality*</label>
   <select id="nationality"><option value="">Select</option><option>Uzbekistan</option></select>
@@ -262,6 +268,12 @@ async function setBatchFixture(): Promise<void> {
       document.getElementById('uploadBtn').addEventListener('click', () => {
         document.getElementById('fileInput').click();
       });
+      document.getElementById('fileInput').addEventListener('change', () => {
+        document.getElementById('cropModal').style.display = 'block';
+      });
+      document.querySelector('#cropModal button.upload-result').addEventListener('click', () => {
+        document.getElementById('cropModal').style.display = 'none';
+      });
     </script>
   `);
 }
@@ -285,6 +297,12 @@ async function setResumedApplicantFixture(): Promise<void> {
       window.__eventLog = [];
       document.getElementById('uploadBtn').addEventListener('click', () => {
         document.getElementById('fileInput').click();
+      });
+      document.getElementById('fileInput').addEventListener('change', () => {
+        document.getElementById('cropModal').style.display = 'block';
+      });
+      document.querySelector('#cropModal button.upload-result').addEventListener('click', () => {
+        document.getElementById('cropModal').style.display = 'none';
       });
     </script>
   `);
