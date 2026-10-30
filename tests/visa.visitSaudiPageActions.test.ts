@@ -43,6 +43,84 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TEST_PORTRAIT_PATH = path.join(__dirname, 'fixtures', 'visitSaudiTestPortrait.jpg');
 
+/**
+ * Calendar-widget fix: a hand-built stand-in for the real jQuery
+ * "datepick"-family widget selectDateFromCalendarWidget now drives (see
+ * that function's own doc comment, visitSaudiPageActions.ts, for the
+ * full real evidence it is built from -- a readonly input that opens a
+ * popup with two `<select class="datepick-month-year"
+ * title="Change the month"|"Change the year">` dropdowns and day
+ * `<a title="Select {Day}, {MonAbbrev} {day}, {year}">` links). Reused
+ * by every fixture below that has a date field, for each given field id.
+ */
+function calendarWidgetFixtureHtml(fieldIds: string[]): string {
+  return `
+    <div id="calendarPopup" style="display:none">
+      <select class="datepick-month-year" title="Change the month"></select>
+      <select class="datepick-month-year" title="Change the year"></select>
+      <div id="calendarDays"></div>
+    </div>
+    <script>
+      (function() {
+        var MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+        var ABBR = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+        var activeFieldId = null;
+        var calYear = 2026, calMonth = 9;
+        function renderCalendar() {
+          var monthSelect = document.querySelector('select[title="Change the month"]');
+          var yearSelect = document.querySelector('select[title="Change the year"]');
+          var monthHtml = '';
+          for (var i = 0; i < 12; i++) {
+            monthHtml += '<option value="' + (i + 1) + '/' + calYear + '"' + (i === calMonth ? ' selected' : '') + '>' + MONTHS[i] + '</option>';
+          }
+          monthSelect.innerHTML = monthHtml;
+          var yearHtml = '';
+          for (var y = 1926; y <= 2040; y++) {
+            yearHtml += '<option value="' + (calMonth + 1) + '/' + y + '"' + (y === calYear ? ' selected' : '') + '>' + y + '</option>';
+          }
+          yearSelect.innerHTML = yearHtml;
+          var daysInMonth = new Date(calYear, calMonth + 1, 0).getDate();
+          var dayNames = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+          var daysDiv = document.getElementById('calendarDays');
+          var html = '';
+          for (var d = 1; d <= daysInMonth; d++) {
+            var dow = dayNames[new Date(calYear, calMonth, d).getDay()];
+            html += '<a href="javascript:void(0)" class="dp' + d + '" title="Select ' + dow + ', ' + ABBR[calMonth] + ' ' + d + ', ' + calYear + '">' + d + '</a>';
+          }
+          daysDiv.innerHTML = html;
+          var links = daysDiv.querySelectorAll('a');
+          for (var j = 0; j < links.length; j++) {
+            links[j].addEventListener('click', (function(day) {
+              return function() {
+                var mm = String(calMonth + 1).padStart(2, '0');
+                var dd = String(day).padStart(2, '0');
+                document.getElementById(activeFieldId).value = dd + '/' + mm + '/' + calYear;
+                document.getElementById('calendarPopup').style.display = 'none';
+              };
+            })(j + 1));
+          }
+        }
+        document.querySelector('select[title="Change the month"]').addEventListener('change', function(e) {
+          var parts = e.target.value.split('/');
+          calMonth = Number(parts[0]) - 1; calYear = Number(parts[1]);
+          renderCalendar();
+        });
+        document.querySelector('select[title="Change the year"]').addEventListener('change', function(e) {
+          var parts = e.target.value.split('/');
+          calMonth = Number(parts[0]) - 1; calYear = Number(parts[1]);
+          renderCalendar();
+        });
+        ${fieldIds
+          .map(
+            (id) =>
+              `document.getElementById('${id}').addEventListener('click', function() { activeFieldId = '${id}'; document.getElementById('calendarPopup').style.display = 'block'; renderCalendar(); });`,
+          )
+          .join('\n        ')}
+      })();
+    </script>
+  `;
+}
+
 let browser: Browser;
 let page: Page;
 let portraitServer: Server;
@@ -280,7 +358,7 @@ async function setPersonalInfoFieldsFixture(): Promise<void> {
     <select id="maritalStatus"><option value="">Select</option><option>Single</option><option>Married</option></select>
 
     <label for="dateOfBirth">Date of Birth *</label>
-    <input type="text" id="dateOfBirth" />
+    <input type="text" id="dateOfBirth" readonly style="cursor:pointer" />
 
     <label for="countryOfBirth">Country of Birth*</label>
     <select id="countryOfBirth"><option value="">Select</option><option>Uzbekistan</option></select>
@@ -298,6 +376,7 @@ async function setPersonalInfoFieldsFixture(): Promise<void> {
     <input type="text" id="residenceCity" />
     <label for="residenceAddress">Address*</label>
     <input type="text" id="residenceAddress" />
+    ${calendarWidgetFixtureHtml(['dateOfBirth'])}
   `);
 }
 
@@ -398,13 +477,14 @@ async function setTripDetailsFixture(): Promise<void> {
     <label for="passportIssuePlace">Passport Issue Place (Country or City)*</label>
     <input type="text" id="passportIssuePlace" />
     <label for="passportIssueDate">Passport Issue Date*</label>
-    <input type="text" id="passportIssueDate" />
+    <input type="text" id="passportIssueDate" readonly style="cursor:pointer" />
     <label for="passportExpiryDate">Passport Expiry Date*</label>
-    <input type="text" id="passportExpiryDate" />
+    <input type="text" id="passportExpiryDate" readonly style="cursor:pointer" />
     <label for="expectedArrival">Expected Date of Arrival*</label>
-    <input type="text" id="expectedArrival" />
+    <input type="text" id="expectedArrival" readonly style="cursor:pointer" />
     <label for="expectedDeparture">Expected Date of Departure*</label>
-    <input type="text" id="expectedDeparture" />
+    <input type="text" id="expectedDeparture" readonly style="cursor:pointer" />
+    ${calendarWidgetFixtureHtml(['passportIssueDate', 'passportExpiryDate', 'expectedArrival', 'expectedDeparture'])}
 
     <p>Additional Purpose of Visit *</p>
     <span id="selectAllLog"></span>

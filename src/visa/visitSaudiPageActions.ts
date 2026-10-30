@@ -433,36 +433,64 @@ async function selectDropdownOptionCaseInsensitive(select: ReturnType<Page['getB
 
 const ISO_DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
 
+const CALENDAR_MONTH_NAMES = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December',
+] as const;
+const CALENDAR_MONTH_ABBREVIATIONS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'] as const;
+
 /**
- * Reformats an ISO date (YYYY-MM-DD, this codebase's own internal
- * convention -- see computeMaritalStatusForVisitSaudi.ts) to DD/MM/YYYY,
- * confirmed as the real `Date of Birth` field's own displayed format
- * from a recovered screenshot ("15/04/1950" -- unambiguous, since 15
- * cannot be a month). Throws on a malformed input rather than writing a
- * partially-wrong date.
+ * CALENDAR WIDGET FIX (real-run evidence): `.fill()` on `Date of Birth`
+ * timed out on a real run -- Playwright's own error log shows WHY, the
+ * real `<input>` carries `readonly="readonly"` (confirmed, not a guess):
+ * `<input ... id="DateOfBirth" name="DateOfBirth" readonly="readonly"
+ * ... class="copy-01 datepicker1 disablePaste is-datepick" .../>`.
+ * The operator's own real Inspect-element capture of the OPENED calendar
+ * confirms a jQuery "datepick"-family widget with two real
+ * `<select class="datepick-month-year" title="Change the month"|"Change
+ * the year">` dropdowns (option VALUES encode "month/year" together, but
+ * option LABELS are plain month names / bare years, e.g. `<option
+ * value="10/1966">1966</option>`, `<option value="9/2026"
+ * selected>September</option>`) and day cells as `<a href="javascript:void(0)"
+ * class="dp<unique-per-day>" title="Select Friday, Oct 16, 2026">16</a>`
+ * -- the day `<a>`'s own class is NOT a stable selector (regenerated per
+ * day), but its `title` attribute's "{MonAbbrev} {day}, {year}" suffix
+ * is stable and is built directly from the same ISO date this function
+ * is given, reformatted with a month abbreviation.
  *
- * FLAGGED, OPEN GAP (Page3->Page7 flow fix phase): every caller of this
- * function below still fills its date field via `.fill()`, a direct
- * value-set. This project's own requirement is that date fields be
- * selected through the real portal's calendar widget instead -- but no
- * screenshot or other evidence anywhere in this codebase shows that
- * widget's actual DOM structure (does it open on focus? on a separate
- * icon click? does it use <input type="date">, a custom popup, something
- * else?) once opened. Writing a calendar-interaction helper now would
- * mean guessing that structure, which this engagement never does.
- * `.fill()` is therefore deliberately LEFT AS IS here, not replaced with
- * a guess -- a future package may implement the real calendar-based
- * helper once real evidence of the open widget is recovered, the same
- * way every other function in this file was implemented only after its
- * own evidence arrived.
+ * Opens the widget by clicking the real field (confirmed clickable:
+ * `style="cursor: pointer;"`), selects the year by its OPTION LABEL
+ * (never the value string, which depends on whatever month happens to
+ * be currently selected), then the month the same way, then clicks the
+ * day `<a>` matching the confirmed title-suffix pattern. Scoped to
+ * whichever such elements are currently VISIBLE, not a guessed
+ * container id -- at most one calendar instance is ever open at a time.
+ *
+ * CONFIRMED directly for `Date of Birth` only. The other four date
+ * fields below (Passport Issue/Expiry Date, Expected Date of
+ * Arrival/Departure) are INFERRED, not independently confirmed, to use
+ * the SAME widget -- same page, same form, same established
+ * site-wide-component convention this codebase already relies on
+ * elsewhere (e.g. clickNext reused across two distinct Next buttons).
+ * If that inference is wrong for any of them, this throws/times out
+ * loudly (the day-cell locator simply never resolves) rather than
+ * silently writing a wrong date -- the same safe failure mode `.fill()`
+ * itself already had.
  */
-function formatIsoDateAsDdMmYyyy(isoDate: string): string {
+async function selectDateFromCalendarWidget(page: Page, fieldLabel: string, isoDate: string): Promise<void> {
   const match = ISO_DATE_PATTERN.exec(isoDate);
   if (!match) {
-    throw new Error(`formatIsoDateAsDdMmYyyy: "${isoDate}" is not a valid ISO (YYYY-MM-DD) date`);
+    throw new Error(`selectDateFromCalendarWidget: "${isoDate}" is not a valid ISO (YYYY-MM-DD) date`);
   }
-  const [, year, month, day] = match;
-  return `${day}/${month}/${year}`;
+  const [, yearStr, monthStr, dayStr] = match;
+  const year = Number(yearStr);
+  const monthIndex = Number(monthStr) - 1;
+  const day = Number(dayStr);
+
+  await page.getByLabel(fieldLabel, { exact: false }).click();
+  await page.locator('select.datepick-month-year[title="Change the year"]').selectOption({ label: String(year) });
+  await page.locator('select.datepick-month-year[title="Change the month"]').selectOption({ label: CALENDAR_MONTH_NAMES[monthIndex] });
+  await page.locator(`a[title*="${CALENDAR_MONTH_ABBREVIATIONS[monthIndex]} ${day}, ${year}"]`).click();
 }
 
 /**
@@ -524,22 +552,13 @@ function formatIsoDateAsDdMmYyyy(isoDate: string): string {
  *     computeMaritalStatusForVisitSaudi.ts) is Title-Cased to match
  *     ("Single"/"Married") -- a direct, lossless rendering of an
  *     already-known two-value enum, not a guess.
- *   - `Date of Birth *` -- the SAME screenshot shows this field's own
- *     filled value: `"15/04/1950"`. Since 15 cannot be a month, this
- *     unambiguously confirms DD/MM/YYYY. Filled via `.fill()` with
- *     dateOfBirth (ISO YYYY-MM-DD) reformatted to that confirmed
- *     pattern. The ONE residual, OPENLY FLAGGED assumption left: the
- *     screenshot confirms the FORMAT, not whether this specific field
- *     accepts direct typed input versus requiring the calendar popup --
- *     inferred here from this field sharing the exact same plain
- *     bordered-text-input styling as every other text field on this
- *     page (First/Last Name, City of Birth, Profession, Address), all
- *     of which ARE confirmed-working `.fill()` targets, rather than
- *     guessed independently. If this assumption is wrong on the real
- *     portal, `.fill()` itself will not silently "succeed" with a wrong
- *     value -- it sets the field's real value, so an incompatible
- *     widget would either reject it outright or leave the field looking
- *     unfilled, not misrepresent a different date.
+ *   - `Date of Birth *` -- CORRECTED (real-run evidence): a real
+ *     automated run proved the earlier `.fill()` assumption wrong -- the
+ *     real field is `readonly`, requiring the real calendar widget
+ *     (selectDateFromCalendarWidget, this file's own doc comment above
+ *     has the full real evidence: confirmed `readonly` input, confirmed
+ *     month/year `<select>` dropdowns, confirmed day `<a>` title
+ *     pattern).
  */
 export async function fillApplicantPersonalInfoFields(page: Page, input: VisitSaudiPersonalInfoFieldsInput): Promise<void> {
   await selectDropdownOptionCaseInsensitive(page.getByLabel('Country of Nationality', { exact: false }), input.countryOfBirth);
@@ -555,7 +574,7 @@ export async function fillApplicantPersonalInfoFields(page: Page, input: VisitSa
   const maritalStatusOption = input.maritalStatus === 'SINGLE' ? 'Single' : 'Married';
   await selectDropdownOptionCaseInsensitive(page.getByLabel('Marital Status', { exact: false }), maritalStatusOption);
 
-  await page.getByLabel('Date of Birth', { exact: false }).fill(formatIsoDateAsDdMmYyyy(input.draft.dateOfBirth));
+  await selectDateFromCalendarWidget(page, 'Date of Birth', input.draft.dateOfBirth);
 
   await selectDropdownOptionCaseInsensitive(page.getByLabel('Country of Birth', { exact: false }), input.countryOfBirth);
   await page.getByLabel('City of Birth', { exact: false }).fill(input.cityOfBirth);
@@ -829,10 +848,16 @@ export async function fillApplicantTripDetailsFields(page: Page, input: VisitSau
   await selectDropdownOptionCaseInsensitive(page.getByLabel('Passport Type', { exact: false }), CONFIRMED_VISIT_SAUDI_FORM_VALUES.passportType);
   await page.getByLabel('Passport No.', { exact: false }).fill(input.draft.passportNumber);
   await page.getByLabel('Passport Issue Place', { exact: false }).fill(input.countryOfBirth);
-  await page.getByLabel('Passport Issue Date', { exact: false }).fill(formatIsoDateAsDdMmYyyy(input.draft.passportIssueDate));
-  await page.getByLabel('Passport Expiry Date', { exact: false }).fill(formatIsoDateAsDdMmYyyy(input.draft.passportExpiryDate));
-  await page.getByLabel('Expected Date of Arrival', { exact: false }).fill(formatIsoDateAsDdMmYyyy(input.expectedDateOfArrival));
-  await page.getByLabel('Expected Date of Departure', { exact: false }).fill(formatIsoDateAsDdMmYyyy(input.expectedDateOfDeparture));
+  // CORRECTED (real-run evidence, same finding as Date of Birth above):
+  // these four date fields are INFERRED, not independently confirmed, to
+  // share the SAME readonly calendar-widget convention Date of Birth was
+  // directly proven to use -- see selectDateFromCalendarWidget's own doc
+  // comment for the full reasoning and the confirmed evidence it IS
+  // grounded in.
+  await selectDateFromCalendarWidget(page, 'Passport Issue Date', input.draft.passportIssueDate);
+  await selectDateFromCalendarWidget(page, 'Passport Expiry Date', input.draft.passportExpiryDate);
+  await selectDateFromCalendarWidget(page, 'Expected Date of Arrival', input.expectedDateOfArrival);
+  await selectDateFromCalendarWidget(page, 'Expected Date of Departure', input.expectedDateOfDeparture);
 
   // This project's own updated rule: ONLY UMRAH is clicked -- see
   // CONFIRMED_VISIT_SAUDI_FORM_VALUES's own doc comment for why LEISURE

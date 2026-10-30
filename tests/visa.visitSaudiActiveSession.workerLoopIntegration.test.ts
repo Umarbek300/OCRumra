@@ -120,7 +120,12 @@ async function setApplicantFixture(page: import('playwright').Page): Promise<voi
     <label for="maritalStatus">Marital Status*</label>
     <select id="maritalStatus"><option value="">Select</option><option>Single</option><option>Married</option></select>
     <label for="dateOfBirth">Date of Birth *</label>
-    <input type="text" id="dateOfBirth" />
+    <input type="text" id="dateOfBirth" readonly style="cursor:pointer" />
+    <div id="calendarPopup" style="display:none">
+      <select class="datepick-month-year" title="Change the month"></select>
+      <select class="datepick-month-year" title="Change the year"></select>
+      <div id="calendarDays"></div>
+    </div>
     <label for="countryOfBirth">Country of Birth*</label>
     <select id="countryOfBirth"><option value="">Select</option><option>Uzbekistan</option></select>
     <label for="cityOfBirth">City of Birth*</label>
@@ -149,6 +154,64 @@ async function setApplicantFixture(page: import('playwright').Page): Promise<voi
       document.querySelector('#cropModal button.upload-result').addEventListener('click', () => {
         document.getElementById('cropModal').style.display = 'none';
       });
+
+      // Calendar-widget fix: a hand-built stand-in for the real jQuery
+      // "datepick"-family widget (see selectDateFromCalendarWidget's own
+      // doc comment, visitSaudiPageActions.ts, for the full real
+      // evidence this fixture mirrors).
+      (function() {
+        var MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+        var ABBR = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+        var calYear = 2026, calMonth = 9;
+        function renderCalendar() {
+          var monthSelect = document.querySelector('select[title="Change the month"]');
+          var yearSelect = document.querySelector('select[title="Change the year"]');
+          var monthHtml = '';
+          for (var i = 0; i < 12; i++) {
+            monthHtml += '<option value="' + (i + 1) + '/' + calYear + '"' + (i === calMonth ? ' selected' : '') + '>' + MONTHS[i] + '</option>';
+          }
+          monthSelect.innerHTML = monthHtml;
+          var yearHtml = '';
+          for (var y = 1926; y <= 2040; y++) {
+            yearHtml += '<option value="' + (calMonth + 1) + '/' + y + '"' + (y === calYear ? ' selected' : '') + '>' + y + '</option>';
+          }
+          yearSelect.innerHTML = yearHtml;
+          var daysInMonth = new Date(calYear, calMonth + 1, 0).getDate();
+          var dayNames = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+          var daysDiv = document.getElementById('calendarDays');
+          var html = '';
+          for (var d = 1; d <= daysInMonth; d++) {
+            var dow = dayNames[new Date(calYear, calMonth, d).getDay()];
+            html += '<a href="javascript:void(0)" class="dp' + d + '" title="Select ' + dow + ', ' + ABBR[calMonth] + ' ' + d + ', ' + calYear + '">' + d + '</a>';
+          }
+          daysDiv.innerHTML = html;
+          var links = daysDiv.querySelectorAll('a');
+          for (var j = 0; j < links.length; j++) {
+            links[j].addEventListener('click', (function(day) {
+              return function() {
+                var mm = String(calMonth + 1).padStart(2, '0');
+                var dd = String(day).padStart(2, '0');
+                document.getElementById('dateOfBirth').value = dd + '/' + mm + '/' + calYear;
+                document.getElementById('calendarPopup').style.display = 'none';
+              };
+            })(j + 1));
+          }
+        }
+        document.querySelector('select[title="Change the month"]').addEventListener('change', function(e) {
+          var parts = e.target.value.split('/');
+          calMonth = Number(parts[0]) - 1; calYear = Number(parts[1]);
+          renderCalendar();
+        });
+        document.querySelector('select[title="Change the year"]').addEventListener('change', function(e) {
+          var parts = e.target.value.split('/');
+          calMonth = Number(parts[0]) - 1; calYear = Number(parts[1]);
+          renderCalendar();
+        });
+        document.getElementById('dateOfBirth').addEventListener('click', function() {
+          document.getElementById('calendarPopup').style.display = 'block';
+          renderCalendar();
+        });
+      })();
     </script>
   `);
 }
