@@ -224,14 +224,24 @@ test('a job that reaches MAX_RECONCILIATION_ATTEMPTS is excluded from findDueRec
 });
 
 async function backdateUpdatedAtMinutes(id: string, minutesAgo: number): Promise<void> {
+  // ocrumra_test_role is not a superuser, so SET (LOCAL) session_replication_role
+  // is denied (that GUC's context is 'superuser' in Postgres, unconditionally).
+  // ALTER TABLE ... DISABLE/ENABLE TRIGGER achieves the same set_updated_at
+  // bypass needing only table ownership (already held), and the inner
+  // try/finally guarantees the trigger is always re-enabled before COMMIT,
+  // even if the UPDATE throws.
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query('SET LOCAL session_replication_role = replica');
-    await client.query(`UPDATE sheet_reconciliation_jobs SET updated_at = now() - ($2 * interval '1 minute') WHERE id = $1`, [
-      id,
-      minutesAgo,
-    ]);
+    await client.query('ALTER TABLE sheet_reconciliation_jobs DISABLE TRIGGER sheet_reconciliation_jobs_set_updated_at');
+    try {
+      await client.query(`UPDATE sheet_reconciliation_jobs SET updated_at = now() - ($2 * interval '1 minute') WHERE id = $1`, [
+        id,
+        minutesAgo,
+      ]);
+    } finally {
+      await client.query('ALTER TABLE sheet_reconciliation_jobs ENABLE TRIGGER sheet_reconciliation_jobs_set_updated_at');
+    }
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');

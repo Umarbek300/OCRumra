@@ -363,17 +363,25 @@ async function cleanup(fixture: Fixture): Promise<void> {
 async function backdateUpdatedAtMinutes(id: string, minutesAgo: number): Promise<void> {
   // Same trigger-bypass technique as tests/sheetSyncQueue.repo.test.ts: the
   // set_updated_at trigger unconditionally overwrites updated_at to now()
-  // on every UPDATE, so a plain UPDATE cannot backdate it. session_replication_role
-  // = replica, scoped to this one transaction via SET LOCAL, suppresses
-  // that trigger just long enough to simulate a "stale" row.
+  // on every UPDATE, so a plain UPDATE cannot backdate it. ocrumra_test_role
+  // is not a superuser, so SET (LOCAL) session_replication_role is denied
+  // (that GUC's context is 'superuser' in Postgres, unconditionally) --
+  // ALTER TABLE ... DISABLE/ENABLE TRIGGER achieves the same bypass needing
+  // only table ownership (already held), and the inner try/finally
+  // guarantees the trigger is always re-enabled before COMMIT, even if the
+  // UPDATE throws.
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query('SET LOCAL session_replication_role = replica');
-    await client.query(`UPDATE sheet_sync_queue SET updated_at = now() - ($2 * interval '1 minute') WHERE id = $1`, [
-      id,
-      minutesAgo,
-    ]);
+    await client.query('ALTER TABLE sheet_sync_queue DISABLE TRIGGER sheet_sync_queue_set_updated_at');
+    try {
+      await client.query(`UPDATE sheet_sync_queue SET updated_at = now() - ($2 * interval '1 minute') WHERE id = $1`, [
+        id,
+        minutesAgo,
+      ]);
+    } finally {
+      await client.query('ALTER TABLE sheet_sync_queue ENABLE TRIGGER sheet_sync_queue_set_updated_at');
+    }
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');
