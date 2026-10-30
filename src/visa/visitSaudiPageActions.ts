@@ -152,17 +152,32 @@ export async function clickNext(page: Page): Promise<void> {
 }
 
 /**
- * Page 3: triggers the `UPLOAD FILE` control for the Personal Picture
- * field and supplies the given local file. Uses Playwright's native
- * `filechooser` event rather than locating the underlying <input
+ * Page 3: triggers the real `Upload File` control for the Personal
+ * Picture field and supplies the given local file. Uses Playwright's
+ * native `filechooser` event rather than locating the underlying <input
  * type="file"> directly -- this works correctly regardless of that
- * input's own selector (never observed), as long as clicking the
- * confirmed `UPLOAD FILE` text opens a native OS file dialog, which is
- * the normal behavior for this kind of control and is what Playwright's
- * filechooser event is specifically designed to intercept.
+ * input's own selector, as long as clicking the confirmed `Upload File`
+ * label opens a native OS file dialog, which is the normal behavior for
+ * this kind of control and is what Playwright's filechooser event is
+ * specifically designed to intercept.
+ *
+ * CORRECTED (real-run evidence): a real automated run against the real
+ * portal timed out waiting for the filechooser event -- the earlier
+ * ALL-CAPS "UPLOAD FILE" exact-text match (from a recovered screenshot,
+ * same CSS-uppercase-vs-real-DOM-text mismatch already found and fixed
+ * for the on-behalf Yes/No question) never matched the real label. The
+ * operator's own real Inspect-element capture confirms the real markup:
+ * `<label for="AttachmentPersonalPicture" class="cta my-4">Upload File
+ * <span ...><svg>...</svg></span>*</label>` -- Title Case, AND the
+ * label's own full text also includes a trailing "*" (required-field
+ * marker) after the icon, so an exact match on "Upload File" alone would
+ * still fail even after fixing the case. Matched with exact:false (this
+ * file's own established convention for exactly this situation -- see
+ * confirmInsuranceConsent's own prefix-only match for its own varying
+ * trailing content) instead.
  */
 export async function uploadApplicantPortrait(page: Page, localPortraitFilePath: string): Promise<void> {
-  const [fileChooser] = await Promise.all([page.waitForEvent('filechooser'), page.getByText('UPLOAD FILE', { exact: true }).click()]);
+  const [fileChooser] = await Promise.all([page.waitForEvent('filechooser'), page.getByText('Upload File', { exact: false }).click()]);
   await fileChooser.setFiles(localPortraitFilePath);
 
   // CONFIRMED, not guessed: fileChooser.element() is Playwright's OWN
