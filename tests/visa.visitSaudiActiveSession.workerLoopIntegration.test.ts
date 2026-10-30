@@ -131,6 +131,7 @@ async function setApplicantFixture(page: import('playwright').Page): Promise<voi
 
     <button onclick="window.__saveClickLog.push('save-and-next')">SAVE AND MOVE TO THE NEXT APPLICANT</button>
     <button onclick="window.__saveClickLog.push('save')">SAVE</button>
+    <button onclick="window.__saveClickLog.push('page3-next')">Next &gt;</button>
     <script>
       window.__saveClickLog = window.__saveClickLog || [];
       document.getElementById('uploadBtn').addEventListener('click', () => {
@@ -140,7 +141,7 @@ async function setApplicantFixture(page: import('playwright').Page): Promise<voi
   `);
 }
 
-test('Package 5.45: a Page ACQUIRED OVER CDP (the real operator-tunnel mechanism) correctly drives the existing, unmodified worker loop for a 2-applicant batch -- correct SAVE-AND-MOVE-TO-THE-NEXT-APPLICANT then SAVE order, both reach SAVED, entirely local (no DB, no tunnel, no real portal)', async () => {
+test('Package 5.45, updated for the Page3->Page7 flow fix and the Page3->Page4 trigger fix: a Page ACQUIRED OVER CDP (the real operator-tunnel mechanism) correctly drives the existing, unmodified worker loop for a 2-applicant batch -- SAVE/SAVE AND MOVE TO THE NEXT APPLICANT is never clicked, Page 3\'s own "Next" IS clicked, both end AMBIGUOUS (this fixture has no Page 4 markup), entirely local (no DB, no tunnel, no real portal)', async () => {
   const port = await findFreePort();
   operatorBrowser = await chromium.launch({ args: [`--remote-debugging-port=${port}`] });
   const operatorPage = await operatorBrowser.newPage();
@@ -209,16 +210,23 @@ test('Package 5.45: a Page ACQUIRED OVER CDP (the real operator-tunnel mechanism
 
     assert.equal(result.lockOutcome, 'acquired');
     assert.deepEqual(result.batchValidation, { outcome: 'ok' });
+    const ambiguousDetail =
+      'Page 3\'s forward action was clicked, but Page 4 ("Passport Type") never became visible afterward -- portal page state is unconfirmed';
     assert.deepEqual(result.applicantOutcomes, [
-      { recordId: recordA.id, outcome: 'SAVED' },
-      { recordId: recordB.id, outcome: 'SAVED' },
+      { recordId: recordA.id, outcome: 'AMBIGUOUS', detail: ambiguousDetail },
+      { recordId: recordB.id, outcome: 'AMBIGUOUS', detail: ambiguousDetail },
     ]);
 
     const saveClickLog = await session.page.evaluate(() => (globalThis as unknown as { __saveClickLog: string[] }).__saveClickLog);
     assert.deepEqual(
       saveClickLog.filter((e) => e === 'save-and-next' || e === 'save'),
-      ['save-and-next', 'save'],
-      'applicant 1 of 2 (not last) must use SAVE AND MOVE TO THE NEXT APPLICANT; applicant 2 of 2 (last) must use plain SAVE -- the SAME rule, now proven over a CDP-acquired page',
+      [],
+      'SAVE/SAVE AND MOVE TO THE NEXT APPLICANT must never be clicked immediately after Page 3 -- the same fix, now proven over a CDP-acquired page',
+    );
+    assert.deepEqual(
+      saveClickLog.filter((e) => e === 'page3-next'),
+      ['page3-next', 'page3-next'],
+      'Page 3\'s own "Next" must be clicked once per applicant -- the same Page3->Page4 trigger fix, now proven over a CDP-acquired page',
     );
   } finally {
     await session.release();

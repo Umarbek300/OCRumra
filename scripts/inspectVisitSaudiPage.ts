@@ -92,55 +92,23 @@ function sanitizeAccessibilityNode(node: unknown): Record<string, unknown> | nul
  */
 async function captureDomElements(page: Page): Promise<CapturedDomElement[]> {
   return page.evaluate(() => {
+    // Fix for "ReferenceError: __name is not defined" when this script runs via
+    // tsx/esbuild: esbuild wraps any NAMED function declaration or
+    // const-assigned function/arrow with a call to its own `__name()` helper
+    // (to preserve `.name` on older targets). That helper lives at module
+    // scope. Playwright's page.evaluate() serializes only this callback's own
+    // source text into the browser, so any such `__name` call ends up
+    // orphaned there, throwing at runtime. Anonymous functions passed
+    // directly as arguments (e.g. to .map()/.filter(), or this outer callback
+    // itself) are not given a `__name` wrapper and are unaffected. The fix is
+    // therefore to avoid every named function declaration and named
+    // const/let function assignment inside this callback -- so what were
+    // previously three helper functions (resolveAriaLabelledBy,
+    // resolveAssociatedLabel, optionsFor) are inlined below as plain
+    // procedural blocks instead, with identical behavior.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- runs in the browser; this project's own tsconfig has no "dom" lib.
     const doc = (globalThis as any).document;
     const SENSITIVE = /password|otp|\bpin\b|verification|2fa|security\s*code/i;
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    function resolveAriaLabelledBy(el: any): string | null {
-      const ids = el.getAttribute('aria-labelledby');
-      if (!ids) return null;
-      const texts = ids
-        .split(/\s+/)
-        .map((id: string) => doc.getElementById(id)?.textContent?.trim() ?? '')
-        .filter((t: string) => t.length > 0);
-      return texts.length > 0 ? texts.join(' ') : null;
-    }
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    function resolveAssociatedLabel(el: any): string | null {
-      const id = el.getAttribute('id');
-      if (id) {
-        const forLabel = doc.querySelector(`label[for="${id}"]`);
-        if (forLabel?.textContent) return forLabel.textContent.trim();
-      }
-      const wrapping = el.closest ? el.closest('label') : null;
-      if (wrapping?.textContent) return wrapping.textContent.trim();
-      return null;
-    }
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    function optionsFor(el: any): string[] | null {
-      if (el.tagName === 'SELECT') {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        return Array.from(el.options as any[]).map((o: any) => String(o.text).trim());
-      }
-      const type = el.type;
-      const name = el.getAttribute('name');
-      if ((type === 'radio' || type === 'checkbox') && name) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const group = Array.from(doc.querySelectorAll(`input[name="${name}"]`)) as any[];
-        return group
-          .map((input: any) => {
-            const id = input.getAttribute('id');
-            const forLabel = id ? doc.querySelector(`label[for="${id}"]`) : null;
-            const wrapping = input.closest ? input.closest('label') : null;
-            return (forLabel ?? wrapping)?.textContent?.trim() ?? null;
-          })
-          .filter((t: string | null): t is string => !!t);
-      }
-      return null;
-    }
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const elements = Array.from(doc.querySelectorAll('label, input, select, textarea, button, [role]')) as any[];
@@ -149,12 +117,34 @@ async function captureDomElements(page: Page): Promise<CapturedDomElement[]> {
     for (const el of elements) {
       const type = el.getAttribute('type');
       const ariaLabel = el.getAttribute('aria-label');
-      const ariaLabelledByText = resolveAriaLabelledBy(el);
-      const associatedLabelText = resolveAssociatedLabel(el);
+
+      // Inlined from the former resolveAriaLabelledBy(el).
+      let ariaLabelledByText: string | null = null;
+      const labelledByIds = el.getAttribute('aria-labelledby');
+      if (labelledByIds) {
+        const texts = labelledByIds
+          .split(/\s+/)
+          .map((id: string) => doc.getElementById(id)?.textContent?.trim() ?? '')
+          .filter((t: string) => t.length > 0);
+        ariaLabelledByText = texts.length > 0 ? texts.join(' ') : null;
+      }
+
+      // Inlined from the former resolveAssociatedLabel(el).
+      let associatedLabelText: string | null = null;
+      const elId = el.getAttribute('id');
+      if (elId) {
+        const forLabel = doc.querySelector(`label[for="${elId}"]`);
+        if (forLabel?.textContent) associatedLabelText = forLabel.textContent.trim();
+      }
+      if (associatedLabelText === null) {
+        const wrapping = el.closest ? el.closest('label') : null;
+        if (wrapping?.textContent) associatedLabelText = wrapping.textContent.trim();
+      }
+
       const placeholder = el.getAttribute('placeholder');
       const role = el.getAttribute('role');
       const name = el.getAttribute('name');
-      const id = el.getAttribute('id');
+      const id = elId;
       const ownText = el.tagName === 'LABEL' || el.tagName === 'BUTTON' ? (el.textContent?.trim() ?? null) : null;
 
       if (
@@ -167,6 +157,24 @@ async function captureDomElements(page: Page): Promise<CapturedDomElement[]> {
         continue; // dropped entirely -- never written out, not even redacted.
       }
 
+      // Inlined from the former optionsFor(el).
+      let options: string[] | null = null;
+      if (el.tagName === 'SELECT') {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        options = Array.from(el.options as any[]).map((o: any) => String(o.text).trim());
+      } else if ((type === 'radio' || type === 'checkbox') && name) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const group = Array.from(doc.querySelectorAll(`input[name="${name}"]`)) as any[];
+        options = group
+          .map((input: any) => {
+            const inputId = input.getAttribute('id');
+            const forLabel = inputId ? doc.querySelector(`label[for="${inputId}"]`) : null;
+            const wrapping = input.closest ? input.closest('label') : null;
+            return (forLabel ?? wrapping)?.textContent?.trim() ?? null;
+          })
+          .filter((t: string | null): t is string => !!t);
+      }
+
       results.push({
         tag: el.tagName,
         type: type ?? null,
@@ -175,7 +183,7 @@ async function captureDomElements(page: Page): Promise<CapturedDomElement[]> {
         ariaLabelledByText,
         associatedLabelText: associatedLabelText ?? ownText,
         placeholder: placeholder ?? null,
-        options: optionsFor(el),
+        options,
       });
     }
 

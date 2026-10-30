@@ -1,0 +1,17 @@
+-- Adds AWAITING_MANUAL_CONTINUATION to visa_submission_status (0028's own
+-- enum) -- see visaSubmissionStatus.ts's own doc comment for the full
+-- lifecycle this value supports: it marks that automation genuinely,
+-- successfully filled an applicant's Page 3/4 and reached Page 5 (Medical
+-- Insurance), and a human must now complete Page 5/6/7 (insurance consent,
+-- Terms and Conditions, Review Application) before either the next
+-- applicant's automation resumes or the record is swept to AMBIGUOUS after
+-- a stale timeout (that sweep mechanism is a later phase, not implemented
+-- here).
+--
+-- This migration ONLY adds the enum value -- nothing in this file
+-- references it, so it is safe to run inside one transaction on
+-- PostgreSQL 12+ (this project's own local/production version is 16):
+-- PostgreSQL forbids USING a newly-added enum value within the same
+-- transaction that added it, but adding the value alone has no such
+-- restriction.
+ALTER TYPE visa_submission_status ADD VALUE 'AWAITING_MANUAL_CONTINUATION';

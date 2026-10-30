@@ -15,8 +15,17 @@ import type { ProfessionForVisitSaudi } from './genderProfessionMap.js';
  * (visaWorkerLoop.ts). A future real implementation of this interface is
  * Phase 2e/2f's job (see Package 4.4's own planning report) -- out of
  * scope here.
+ *
+ * `AWAITING_MANUAL_CONTINUATION` (added alongside the Page3->Page7 flow
+ * fix): a real adapter reports this -- never SAVED, never AMBIGUOUS --
+ * when it has CONFIRMED that everything it is itself able to do for this
+ * applicant succeeded (Page 3 filled, and Page 4/5 too if those were
+ * actually reached) and has reached a KNOWN, EXPECTED human-handoff point
+ * (see visitSaudiBrowserAutomationAdapter.ts's own doc comment), as
+ * opposed to AMBIGUOUS, which still means "something did not resolve as
+ * expected, a human must investigate," never a clean handoff.
  */
-export type VisaApplicantAutomationOutcome = 'SAVED' | 'ERROR' | 'AMBIGUOUS';
+export type VisaApplicantAutomationOutcome = 'SAVED' | 'ERROR' | 'AMBIGUOUS' | 'AWAITING_MANUAL_CONTINUATION';
 
 export interface VisaApplicantAutomationResult {
   outcome: VisaApplicantAutomationOutcome;

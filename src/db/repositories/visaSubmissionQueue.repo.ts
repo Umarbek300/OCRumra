@@ -1,9 +1,16 @@
 import type { PoolClient } from 'pg';
 import { pool } from '../pool.js';
 import type { VisaBatchApplicantStatus } from '../../visa/types.js';
+import type { VisaSubmissionStatus } from '../../visa/visaSubmissionStatus.js';
 
 export type VisaSubmissionAttemptStatus = 'pending' | 'queued' | 'failed';
-export type VisaSubmissionStatus = 'PENDING' | 'SUBMITTING' | 'SAVED' | 'ERROR' | 'AMBIGUOUS';
+// VisaSubmissionStatus itself is imported from visaSubmissionStatus.ts (the
+// pure, single source of truth for this status model -- see that file's own
+// doc comment) rather than redeclared here, so a new status never needs to
+// be added in two places. Re-exported below so every EXISTING caller of
+// this module (which imports VisaSubmissionStatus FROM here, not from
+// visaSubmissionStatus.ts) keeps working unchanged.
+export type { VisaSubmissionStatus };
 
 export interface VisaSubmissionAttemptRecord {
   id: string;
@@ -416,7 +423,14 @@ export async function countQueueStatusesForBatch(batchId: string): Promise<Recor
     `SELECT status, count(*)::text AS count FROM visa_submission_queue WHERE batch_id = $1 GROUP BY status`,
     [batchId],
   );
-  const counts: Record<VisaSubmissionStatus, number> = { PENDING: 0, SUBMITTING: 0, SAVED: 0, ERROR: 0, AMBIGUOUS: 0 };
+  const counts: Record<VisaSubmissionStatus, number> = {
+    PENDING: 0,
+    SUBMITTING: 0,
+    SAVED: 0,
+    ERROR: 0,
+    AMBIGUOUS: 0,
+    AWAITING_MANUAL_CONTINUATION: 0,
+  };
   for (const row of rows) {
     counts[row.status] = Number(row.count);
   }

@@ -197,6 +197,7 @@ function summarizeVisaSubmissionStatus(
     `Saqlangan (SAVED): ${counts.SAVED}`,
     `Xatolik (ERROR): ${counts.ERROR}`,
     `Noaniq (AMBIGUOUS): ${counts.AMBIGUOUS}`,
+    `Operator davomini kutmoqda (AWAITING_MANUAL_CONTINUATION): ${counts.AWAITING_MANUAL_CONTINUATION ?? 0}`,
     `Hal qilinmagan konfliktlar: ${conflictCount}`,
     `Faol bo'lmagan arizachiga tegishli PENDING: ${inactivePendingCount}`,
   ].join('\n');
@@ -620,7 +621,17 @@ bot.callbackQuery(/^visa_(continue|stop|check):/, async (ctx) => {
           ? "Bu guruh tizimda ro'yxatdan o'tmagan."
           : outcome.kind === 'APPLICANT_NOT_FOUND'
             ? 'Bu ariza topilmadi.'
-            : "⏳ Portalga avtomatik yuborish hali tayyor emas — bu funksiya keyinroq ishga tushiriladi.";
+            : outcome.kind === 'NO_QUEUE_RECORD'
+              ? 'Bu ariza hali navbatga qoyilmagan.'
+              : outcome.kind === 'NOT_AWAITING_MANUAL_CONTINUATION'
+                ? `Bu ariza hozir "operator davomini kutish" holatida emas (joriy holat: ${outcome.currentStatus}) — davom ettirib bo'lmaydi.`
+                : outcome.kind === 'NO_ACTIVE_SESSION'
+                  ? `⚠️ Portal seansi aniqlanmadi, hech narsa o'zgartirilmadi: ${outcome.reason}`
+                  : outcome.kind === 'CONTINUE_FAILED'
+                    ? `⚠️ Xatolik yuz berdi: ${outcome.detail}`
+                    : outcome.nextApplicantPage3Observed
+                      ? "✅ Qayd etildi (holat: Noaniq/AMBIGUOUS) — keyingi arizachi sahifasi portalda aniqlandi, lekin bu haqiqiy saqlash tasdigi emas."
+                      : "✅ Qayd etildi (holat: Noaniq/AMBIGUOUS) — keyingi arizachi sahifasi portalda aniqlanmadi, holatni qo'lda tekshiring.";
     await ctx.answerCallbackQuery({ text, show_alert: true });
     return;
   }

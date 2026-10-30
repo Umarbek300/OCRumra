@@ -83,7 +83,8 @@ const VISITSAUDI_RESUMED_SESSION_ANCHOR_TEXTS: readonly string[] = [
  * decides which anchor set is correct; this function itself makes no
  * fresh/resumed decision of its own.
  */
-async function getConfiguredVisitSaudiSession(anchorTexts: string | readonly string[]): Promise<VisitSaudiSessionAvailability> {
+/** Exported so visaContinueApplicantCommand.ts can reuse the SAME env-gated CDP-connection decision -- never a second, parallel implementation of "is a VisitSaudi session configured." */
+export async function getConfiguredVisitSaudiSession(anchorTexts: string | readonly string[]): Promise<VisitSaudiSessionAvailability> {
   if (!env.VISITSAUDI_CDP_ENDPOINT) {
     return getNoActiveVisitSaudiSession();
   }
@@ -231,27 +232,38 @@ export async function visaStartSubmissionCommand(
   }
 
   // Package 5.46: a RESUMED batch (one or more queue rows already
-  // SUBMITTING/SAVED/ERROR/AMBIGUOUS) must NEVER call createVisitSaudiGroup
-  // again -- startVisitSaudiBatchSubmission.ts's own doc comment already
-  // documents why group creation is a ONE-TIME, caller-owned step ("any
-  // LATER retry for the same batch ... calls runVisaWorkerLoopForBatch
-  // directly -- never this function again, since the group already
-  // exists by then"), but before this package /visa_start_submission was
-  // the ONLY caller and always went through startVisitSaudiBatchSubmission
-  // regardless. On a real retry (e.g. the tunnel dropped mid-batch), the
-  // operator's page is no longer on the "Apply for eVisa" dashboard --
-  // clicking APPLY FOR GROUP again would be a genuine navigation guess,
-  // exactly what this engagement never does. Detecting "already started"
-  // from EXISTING, already-reliable data (no new DB column, no guessed
-  // business value): group creation is PROVEN, by this codebase's own
-  // flow, to happen strictly before any applicant is ever claimed, so any
-  // non-PENDING row for this batch is proof positive the group already
-  // exists. Computed BEFORE getActiveSession (below) so the correct
-  // anchor set -- dashboard-only for a fresh run, the broader resumed set
-  // otherwise -- can be chosen for the ONE session lookup this command
-  // ever makes.
+  // SUBMITTING/SAVED/ERROR/AMBIGUOUS/AWAITING_MANUAL_CONTINUATION) must
+  // NEVER call createVisitSaudiGroup again -- startVisitSaudiBatchSubmission.ts's
+  // own doc comment already documents why group creation is a ONE-TIME,
+  // caller-owned step ("any LATER retry for the same batch ... calls
+  // runVisaWorkerLoopForBatch directly -- never this function again, since
+  // the group already exists by then"), but before this package
+  // /visa_start_submission was the ONLY caller and always went through
+  // startVisitSaudiBatchSubmission regardless. On a real retry (e.g. the
+  // tunnel dropped mid-batch), the operator's page is no longer on the
+  // "Apply for eVisa" dashboard -- clicking APPLY FOR GROUP again would be
+  // a genuine navigation guess, exactly what this engagement never does.
+  // Detecting "already started" from EXISTING, already-reliable data (no
+  // new DB column, no guessed business value): group creation is PROVEN,
+  // by this codebase's own flow, to happen strictly before any applicant
+  // is ever claimed, so any non-PENDING row for this batch is proof
+  // positive the group already exists. AWAITING_MANUAL_CONTINUATION is
+  // included in this check for the SAME reason: it means automation
+  // already filled this applicant's own Page 3/4 (strictly after group
+  // creation), so a batch containing one must never be treated as
+  // "never started" -- see visaSubmissionStatus.ts's own doc comment for
+  // why AWAITING_MANUAL_CONTINUATION deliberately has no transition back
+  // to PENDING, which would otherwise make this exact check blind to it.
+  // Computed BEFORE getActiveSession (below) so the correct anchor set --
+  // dashboard-only for a fresh run, the broader resumed set otherwise --
+  // can be chosen for the ONE session lookup this command ever makes.
   const statusCounts = await deps.countQueueStatuses(batch.id);
-  const batchAlreadyStarted = statusCounts.SUBMITTING > 0 || statusCounts.SAVED > 0 || statusCounts.ERROR > 0 || statusCounts.AMBIGUOUS > 0;
+  const batchAlreadyStarted =
+    statusCounts.SUBMITTING > 0 ||
+    statusCounts.SAVED > 0 ||
+    statusCounts.ERROR > 0 ||
+    statusCounts.AMBIGUOUS > 0 ||
+    statusCounts.AWAITING_MANUAL_CONTINUATION > 0;
 
   const session = await deps.getActiveSession(
     batchAlreadyStarted ? VISITSAUDI_RESUMED_SESSION_ANCHOR_TEXTS : VISITSAUDI_DASHBOARD_ANCHOR_TEXT,

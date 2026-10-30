@@ -82,11 +82,32 @@ export async function confirmGroupCreation(page: Page): Promise<void> {
  * logic, e.g. "26.10-1") stays the single source of truth for this
  * format -- never duplicated here. A real caller is expected to pass
  * `batch.batchName` (VisaBatch's own already-computed field) directly.
+ *
+ * This project's own updated rule: a resolved (non-throwing) click on the
+ * `+` button is NOT, by itself, trusted as proof the group was actually
+ * created -- confirmGroupCreation's own doc comment already flags that
+ * bare "+" as a lower-confidence, non-unique locator. After clicking it,
+ * this function waits for Page 3's own confirmed anchor ("UPLOAD FILE" --
+ * see uploadApplicantPortrait above, the same evidence-verified text used
+ * to drive the per-applicant portrait upload) to become visible. If it
+ * never appears within the bounded timeout, group creation is treated as
+ * UNCONFIRMED and this throws a clear, named error -- the caller
+ * (startVisitSaudiBatchSubmission.ts) propagates this uncaught, so no
+ * batch lock is ever acquired and no applicant is ever claimed against a
+ * group that was never actually created. This can never falsely report a
+ * failure as success, only the reverse (treating a genuinely-created group
+ * as unconfirmed, if "UPLOAD FILE" happens to render unusually slowly) --
+ * the safe direction for this specific risk.
  */
 export async function createVisitSaudiGroup(page: Page, groupName: string): Promise<void> {
   await clickApplyForGroup(page);
   await enterGroupName(page, groupName);
   await confirmGroupCreation(page);
+  await ensureAnchorVisible(
+    page,
+    'UPLOAD FILE',
+    'createVisitSaudiGroup: group creation could not be confirmed (expected Page 3 to appear after clicking "+")',
+  );
 }
 
 /**
@@ -143,6 +164,28 @@ export async function clickNext(page: Page): Promise<void> {
 export async function uploadApplicantPortrait(page: Page, localPortraitFilePath: string): Promise<void> {
   const [fileChooser] = await Promise.all([page.waitForEvent('filechooser'), page.getByText('UPLOAD FILE', { exact: true }).click()]);
   await fileChooser.setFiles(localPortraitFilePath);
+
+  // CONFIRMED, not guessed: fileChooser.element() is Playwright's OWN
+  // reference to the real <input type="file"> that triggered this exact
+  // filechooser event -- never a selector invented by this codebase (see
+  // this function's own doc comment for why no such selector is ever
+  // written directly). setFiles() resolving only proves the browser
+  // ACCEPTED the file selection; it does NOT, by itself, prove the
+  // selected file genuinely carries non-zero bytes at that moment -- this
+  // is exactly the failure mode this file's own doc comment already
+  // documents (uploadApplicantPortraitFromUrl's own note: deleting the
+  // downloaded file too early once produced a silently-0-byte upload).
+  // This checks the real DOM state directly, immediately, rather than
+  // inferring success from setFiles() not throwing.
+  const uploadedFile = await fileChooser.element().evaluate((input: any) => {
+    const file = input.files && input.files.length > 0 ? input.files[0] : null;
+    return { count: input.files ? input.files.length : 0, size: file ? file.size : 0, name: file ? file.name : null };
+  });
+  if (uploadedFile.count !== 1 || uploadedFile.size <= 0) {
+    throw new Error(
+      `uploadApplicantPortrait: setFiles() resolved without throwing, but the real <input> element does not show exactly one non-empty file afterward (count=${uploadedFile.count}, size=${uploadedFile.size}, name=${uploadedFile.name}) -- never proceeding as if the upload succeeded. This still does NOT, and cannot, confirm the real portal's own SERVER accepted the upload -- no such signal has ever been observed on the real VisitSaudi portal.`,
+    );
+  }
 }
 
 /**
@@ -176,22 +219,40 @@ export async function uploadApplicantPortraitFromUrl(page: Page, personalPortrai
 }
 
 /**
- * The `SAVE AND MOVE TO THE NEXT APPLICANT` button -- exact text from this
- * project's own approved workflow decision (applicants 1-9 of 10).
+ * Page 7 ("Review Application")'s own "add another applicant" action
+ * (applicants 1-9 of 10) -- CORRECTED from this file's own earlier
+ * version, which used an invented/assumed label
+ * ("SAVE AND MOVE TO THE NEXT APPLICANT", this project's own earlier
+ * approved-workflow-decision text, never independently verified against
+ * the real portal). The operator's own real Inspect-element capture shows
+ * the real markup is `<span> Save &amp; Add Applicant</span>`, so this is
+ * now matched on that real, confirmed text instead. Exact-matched so it
+ * can never accidentally also match the batch's-last-applicant action
+ * below (a DIFFERENT, shorter confirmed string, "Save", which happens to
+ * also be a substring of this one).
  */
 export async function clickSaveAndMoveToNextApplicant(page: Page): Promise<void> {
-  await page.getByText('SAVE AND MOVE TO THE NEXT APPLICANT', { exact: true }).click();
+  await page.getByText('Save & Add Applicant', { exact: true }).click();
 }
 
 /**
- * The `SAVE` button -- exact text from this project's own approved
- * workflow decision (applicant 10 of 10, the batch's last one).
+ * Page 7's own final-applicant action (applicant 10 of 10, the batch's
+ * last one) -- CORRECTED from this file's own earlier version, which
+ * matched an invented/assumed ALL-CAPS "SAVE" (never independently
+ * verified; Playwright's exact match is case-sensitive, so it would never
+ * have matched the real button at all). The operator's own real
+ * Inspect-element capture shows the real markup is
+ * `<a id="aSave" href="/Visa/Save" class="cta">...<svg aria-hidden="true">...</svg>Save</a>`
+ * -- mixed-case "Save", confirmed via its own real `id` too. Matched on
+ * text (this file's own established convention throughout, resilient to
+ * `id`/class churn) rather than the `id`, with the confirmed `id` kept
+ * here only as corroborating evidence, not as the selector itself.
  * Deliberately exact-matched so it can never accidentally also match
- * `SAVE AND MOVE TO THE NEXT APPLICANT` (which also contains the
- * substring "SAVE").
+ * `Save & Add Applicant` above (which also contains the substring
+ * "Save").
  */
 export async function clickSave(page: Page): Promise<void> {
-  await page.getByText('SAVE', { exact: true }).click();
+  await page.getByText('Save', { exact: true }).click();
 }
 
 // ============================================================================
@@ -260,7 +321,19 @@ export async function answerApplyingOnBehalfOfSomeoneElse(page: Page, answer: 'Y
  */
 export const CONFIRMED_VISIT_SAUDI_FORM_VALUES = {
   passportType: 'Regular Passport',
-  purpose: ['UMRAH', 'LEISURE'],
+  /**
+   * This project's own updated rule: ONLY `UMRAH` is selected. `LEISURE`
+   * is never clicked or selected. Earlier packages clicked BOTH UMRAH and
+   * LEISURE in sequence, assuming a multi-select checkbox group -- but no
+   * evidence anywhere in this codebase ever confirmed that assumption
+   * (the real widget's type -- radio vs. checkbox -- was never observed),
+   * and clicking two options on what might be a single-select (radio)
+   * widget would leave only the LAST one clicked actually selected,
+   * silently discarding the first click. A single, explicit value removes
+   * that ambiguity entirely, regardless of which widget type the real
+   * portal turns out to use.
+   */
+  purpose: 'UMRAH',
   alternateEmailAnswer: 'No',
   alternatePhoneAnswer: 'No',
   hotelName: 'EMAAR ELITE HOTEL MAKKA',
@@ -318,6 +391,21 @@ const ISO_DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
  * from a recovered screenshot ("15/04/1950" -- unambiguous, since 15
  * cannot be a month). Throws on a malformed input rather than writing a
  * partially-wrong date.
+ *
+ * FLAGGED, OPEN GAP (Page3->Page7 flow fix phase): every caller of this
+ * function below still fills its date field via `.fill()`, a direct
+ * value-set. This project's own requirement is that date fields be
+ * selected through the real portal's calendar widget instead -- but no
+ * screenshot or other evidence anywhere in this codebase shows that
+ * widget's actual DOM structure (does it open on focus? on a separate
+ * icon click? does it use <input type="date">, a custom popup, something
+ * else?) once opened. Writing a calendar-interaction helper now would
+ * mean guessing that structure, which this engagement never does.
+ * `.fill()` is therefore deliberately LEFT AS IS here, not replaced with
+ * a guess -- a future package may implement the real calendar-based
+ * helper once real evidence of the open widget is recovered, the same
+ * way every other function in this file was implemented only after its
+ * own evidence arrived.
  */
 function formatIsoDateAsDdMmYyyy(isoDate: string): string {
   const match = ISO_DATE_PATTERN.exec(isoDate);
@@ -461,10 +549,18 @@ async function ensureAnchorVisible(page: Page, anchorText: string, pageDescripti
  * reasoning). Returns whether `anchorText` became visible within
  * `timeoutMs` -- never throws, so a caller can safely branch on the
  * result instead of guessing which outcome to expect.
+ *
+ * `exact` defaults to false (substring, this file's own established
+ * convention for multi-word anchors unlikely to collide, e.g.
+ * "INSURANCE COVERAGE"). Pass `exact: true` for a short, generic anchor
+ * (e.g. Page 7's own "Save") that COULD otherwise false-match unrelated
+ * text elsewhere on the page -- confirmed necessary by this project's own
+ * test suite, which caught exactly this collision against a leftover
+ * decoy "SAVE" button.
  */
-export async function isAnchorVisible(page: Page, anchorText: string, timeoutMs = 3000): Promise<boolean> {
+export async function isAnchorVisible(page: Page, anchorText: string, timeoutMs = 3000, exact = false): Promise<boolean> {
   try {
-    await page.getByText(anchorText, { exact: false }).first().waitFor({ state: 'visible', timeout: timeoutMs });
+    await page.getByText(anchorText, { exact }).first().waitFor({ state: 'visible', timeout: timeoutMs });
     return true;
   } catch {
     return false;
@@ -598,9 +694,13 @@ export interface VisitSaudiTripDetailsFieldsInput {
  *     DD/MM/YYYY pattern as Date of Birth (this page uses the identical
  *     date-input styling, same reasoning as fillApplicantPersonalInfoFields's
  *     own doc comment).
- *   - `Additional Purpose of Visit *` (checkbox group) -- clicks exactly
- *     `LEISURE` and `UMRAH` (never `SELECT ALL`, `EVENT`, or `FAMILY &
- *     RELATIVES`), per the approved purpose constant.
+ *   - `Additional Purpose of Visit *` -- clicks ONLY `UMRAH` (never
+ *     `SELECT ALL`, `EVENT`, `FAMILY & RELATIVES`, or `LEISURE`), per this
+ *     project's own updated rule (see CONFIRMED_VISIT_SAUDI_FORM_VALUES's
+ *     own doc comment for why LEISURE was removed). The real widget's
+ *     type (radio vs. checkbox vs. something else) has never been
+ *     observed -- a single click avoids needing to know, since it is the
+ *     correct action either way.
  *   - `Residence Address in Saudi Arabia` -- `COMMERCIAL ACCOMMODATION`
  *     (a direct, confirmed consequence of being given a hotel name to
  *     fill at all; the screenshot shows the Hotel field appearing under
@@ -640,39 +740,38 @@ export interface VisitSaudiTripDetailsFieldsInput {
  *     optional field blank. Nothing is typed into it.
  *
  * Package 5.39 -- the Hotel field's autocomplete SUGGESTION selection is
- * now a GENERAL, BEST-EFFORT attempt (fillHotelNameAndSelectSuggestion,
+ * a GENERAL, BEST-EFFORT attempt (fillHotelNameAndSelectSuggestion,
  * above), not a guess: it types the hotel name via real keystroke events,
  * then looks for ANY visible element whose own text contains every word
  * of the expected hotel name (matching even the real, longer,
  * address-qualified suggestion text a recovered screenshot showed), and
- * clicks ONLY that. It can therefore never select a WRONG hotel. If no
- * such element ever appears (the real widget's exact suggestion markup
- * remains genuinely unobserved -- it may render asynchronously, outside
- * normal text matching, or not at all in this scenario), nothing further
- * happens and the typed text is simply left as-is -- never worse than
- * every earlier package's own behavior, and this is NOT treated as an
- * error: whether a real suggestion was clicked cannot be verified further
- * without having actually observed the real portal's open-dropdown
- * state, so this function does not claim more certainty than it has.
+ * clicks ONLY that. It can therefore never select a WRONG hotel.
  *
- * This function fills every evidence-backed item above, makes the
- * best-effort hotel-suggestion attempt, THEN -- per Package 5.40 -- only
- * once every field above is genuinely filled, clicks Page 4's own
- * confirmed `Next >` button (clickNext, above) to advance toward Page 5.
- * Unlike the hotel-suggestion attempt, this click is NOT a best-effort
- * guess: the button itself is confirmed to exist on this page, so if it
- * cannot be found/clicked, that is treated as a genuine failure and
- * propagates uncaught -- the SAME established UNEXPECTED_ERROR path as
- * every other confirmed-element action in this file. Nothing in this
- * function throws for an UNCONFIRMED reason anymore (the Communication
- * Preference and Hotel-autocomplete items that used to block it are both
- * resolved as of Packages 5.38/5.39) -- mirroring the same trajectory
- * fillApplicantPersonalInfoFields's own Gender/Marital/DOB gap already
- * went through.
+ * This project's own updated rule (closing a real risk the earlier
+ * Package 5.40 behavior left open): if no such element ever appears
+ * within the bounded wait, the hotel selection is UNCONFIRMED, and this
+ * function now deliberately STOPS here -- it never clicks Page 4's `Next
+ * >` button, never advances to Page 5, and reports
+ * `advancedToNextPage: false`. Typing a hotel NAME is not the same as
+ * confirming the real portal actually resolved it to one specific real
+ * hotel; advancing past an unconfirmed hotel field risks submitting an
+ * application against the wrong (or no) address, so the safe behavior is
+ * to leave the real portal exactly on Page 4, untouched beyond the
+ * already-filled fields, for a human to inspect and correct.
+ *
+ * Only when `hotelSuggestionSelected` is true does this function proceed
+ * to click Page 4's own confirmed `Next >` button (clickNext, above) --
+ * per Package 5.40, that click itself is NOT a best-effort guess (the
+ * button is confirmed to exist on this page), so a failure to find/click
+ * it in THAT branch is treated as a genuine failure and propagates
+ * uncaught, the same established UNEXPECTED_ERROR path as every other
+ * confirmed-element action in this file.
  */
 export interface FillApplicantTripDetailsFieldsResult {
   /** Whether fillHotelNameAndSelectSuggestion actually found and clicked a matching suggestion (see its own doc comment) -- false means the real widget's suggestion never became a matchable, visible text element within the bounded wait, and the typed text was simply left as-is. Exposed so a caller/test can observe this without it being treated as an error either way. */
   hotelSuggestionSelected: boolean;
+  /** Whether this function actually clicked Page 4's `Next >` button. Always exactly equal to hotelSuggestionSelected -- false means this function deliberately stopped on Page 4 without advancing, per this project's own rule that an unconfirmed hotel selection must never proceed to the next step. Exposed separately (rather than letting a caller infer it from hotelSuggestionSelected) so a caller never has to re-derive this safety-relevant fact from an unrelated field. */
+  advancedToNextPage: boolean;
 }
 
 export async function fillApplicantTripDetailsFields(page: Page, input: VisitSaudiTripDetailsFieldsInput): Promise<FillApplicantTripDetailsFieldsResult> {
@@ -686,9 +785,19 @@ export async function fillApplicantTripDetailsFields(page: Page, input: VisitSau
   await page.getByLabel('Expected Date of Arrival', { exact: false }).fill(formatIsoDateAsDdMmYyyy(input.expectedDateOfArrival));
   await page.getByLabel('Expected Date of Departure', { exact: false }).fill(formatIsoDateAsDdMmYyyy(input.expectedDateOfDeparture));
 
-  for (const purposeOption of CONFIRMED_VISIT_SAUDI_FORM_VALUES.purpose) {
-    await page.getByText(purposeOption, { exact: true }).click();
-  }
+  // This project's own updated rule: ONLY UMRAH is clicked -- see
+  // CONFIRMED_VISIT_SAUDI_FORM_VALUES's own doc comment for why LEISURE
+  // was removed. No post-click verification is attempted here: the real
+  // widget's type (radio/checkbox/other) has never been observed, and
+  // calling a checkbox/radio-only API (e.g. .isChecked()) against an
+  // element that turns out to be a plain styled <button> -- the same
+  // convention every other click in this file already relies on -- would
+  // itself throw for an unrelated reason. This is an openly-flagged
+  // limitation, not a silent gap: whether UMRAH was genuinely selected on
+  // the real portal is left for a human to confirm, same as every other
+  // unverified click this file already makes (clickApplyForGroup,
+  // confirmGroupCreation, etc.).
+  await page.getByText(CONFIRMED_VISIT_SAUDI_FORM_VALUES.purpose, { exact: true }).click();
 
   await page.getByText('COMMERCIAL ACCOMMODATION', { exact: true }).click();
   const hotelSuggestionSelected = await fillHotelNameAndSelectSuggestion(page, CONFIRMED_VISIT_SAUDI_FORM_VALUES.hotelName);
@@ -710,12 +819,21 @@ export async function fillApplicantTripDetailsFields(page: Page, input: VisitSau
   // require a new, separately-approved data source; leaving it blank
   // (its own confirmed-safe default) is correct either way.
 
-  // Only once every field above is genuinely filled -- per Package 5.40,
-  // see this function's own doc comment for why this click is treated as
-  // a real, confirmed action rather than a best-effort attempt.
+  // This project's own updated rule: an unconfirmed hotel selection must
+  // never advance past this page -- see this function's own doc comment
+  // above. Every other field is already filled either way; only the
+  // Next click itself is gated.
+  if (!hotelSuggestionSelected) {
+    return { hotelSuggestionSelected: false, advancedToNextPage: false };
+  }
+
+  // Only once every field above is genuinely filled, AND the hotel
+  // selection is confirmed -- per Package 5.40, see this function's own
+  // doc comment for why this click is treated as a real, confirmed
+  // action rather than a best-effort attempt.
   await clickNext(page);
 
-  return { hotelSuggestionSelected };
+  return { hotelSuggestionSelected: true, advancedToNextPage: true };
 }
 
 /**
@@ -728,10 +846,57 @@ export async function fillApplicantTripDetailsFields(page: Page, input: VisitSau
  * Never selects or even looks at any insurance COMPANY card -- per this
  * project's own approved rule, only this one consent checkbox is ever
  * clicked on this page.
+ *
+ * UPDATED RULE: the operator explicitly authorized automated insurance
+ * consent -- twice, each time after being told in plain terms that this
+ * checkbox is actually a per-applicant fee acceptance ("...with a fee of
+ * (95.00 SAR)", confirmed from the real portal's own markup) and not a
+ * generic "I agree" control. visitSaudiBrowserAutomationAdapter.ts's own
+ * submitApplicant flow now calls this function for real on Page 5 -- see
+ * that file's own doc comment for the exact authorized behavior. This
+ * remains separate from, and must never be extended to cover, `PAY FOR
+ * GROUP` or `AGREE & COMPLETE PAYMENT`, which stay permanently off-limits
+ * to automation.
  */
+/**
+ * Page 6's own confirmed arrival anchor -- see confirmTermsAndConditions's
+ * own doc comment for why this checkbox's own text doubles as the anchor.
+ */
+export const TERMS_AND_CONDITIONS_ANCHOR = 'I have read and agree all the above terms and conditions';
+
 export async function confirmInsuranceConsent(page: Page): Promise<void> {
   await ensureAnchorVisible(page, 'INSURANCE COVERAGE', 'confirmInsuranceConsent');
   await page.getByText('BY CHECKING THIS BOX I AGREE TO THE INSURANCE COVERAGE LISTED ABOVE', { exact: false }).click();
+}
+
+/**
+ * Page 6 ("Terms and Conditions")'s own confirmed consent checkbox:
+ * real markup is `<label for="chkSelectDeselectAll" ...>I have read and
+ * agree all the above terms and conditions.</label>` (the real portal's
+ * own `id`, confirmed via the operator's own Inspect-element capture --
+ * not an invented selector). Matched on its own text, same convention as
+ * confirmInsuranceConsent, so this does not depend on that `id` staying
+ * stable. This is also used as Page 6's own arrival anchor
+ * (TERMS_AND_CONDITIONS_ANCHOR below) -- no separate heading text has
+ * ever been observed for this page, but this checkbox's own text is
+ * itself unique and confirmed, so it serves both roles honestly.
+ *
+ * OPEN, EXPLICITLY FLAGGED GAP: it is not yet confirmed whether Page 6
+ * has any OTHER required checkbox beside this one (the real id,
+ * "chkSelectDeselectAll", suggests it might only be a "select/deselect
+ * all" control for further individual items never yet observed). This
+ * function clicks ONLY this one confirmed checkbox, exactly like
+ * confirmInsuranceConsent clicks only its own one confirmed checkbox --
+ * it never guesses at unconfirmed additional controls. If unconfirmed
+ * additional requirements exist on the real portal, the honest
+ * consequence is that the subsequent Next click may not actually advance
+ * -- which visitSaudiBrowserAutomationAdapter.ts's own safe page-check
+ * for Page 7 (never yet confirmed either) will correctly surface as
+ * AMBIGUOUS, never silently guessed as success.
+ */
+export async function confirmTermsAndConditions(page: Page): Promise<void> {
+  await ensureAnchorVisible(page, TERMS_AND_CONDITIONS_ANCHOR, 'confirmTermsAndConditions');
+  await page.getByText(TERMS_AND_CONDITIONS_ANCHOR, { exact: false }).click();
 }
 
 /**

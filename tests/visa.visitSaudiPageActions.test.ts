@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { after, before, test } from 'node:test';
@@ -102,7 +104,7 @@ test('confirmGroupCreation clicks the element whose exact text is "+"', async ()
   assert.equal(await page.evaluate(() => (globalThis as unknown as { __plusClicked?: boolean }).__plusClicked), true);
 });
 
-test('Package 5.27: createVisitSaudiGroup chains clickApplyForGroup -> enterGroupName -> confirmGroupCreation in order, using the given group name verbatim', async () => {
+test('Package 5.27: createVisitSaudiGroup chains clickApplyForGroup -> enterGroupName -> confirmGroupCreation in order, using the given group name verbatim, then confirms creation by waiting for Page 3\'s own anchor', async () => {
   await page.setContent(`
     <div id="dashboard">
       <button onclick="window.__step = 'applyForGroup'; document.getElementById('dashboard').style.display='none'; document.getElementById('groupForm').style.display='block';">APPLY FOR GROUP</button>
@@ -110,7 +112,10 @@ test('Package 5.27: createVisitSaudiGroup chains clickApplyForGroup -> enterGrou
     <div id="groupForm" style="display:none">
       <label for="groupName">Group Name*</label>
       <input id="groupName" type="text" />
-      <button onclick="window.__confirmedName = document.getElementById('groupName').value; window.__step = 'confirmed';">+</button>
+      <button onclick="window.__confirmedName = document.getElementById('groupName').value; window.__step = 'confirmed'; document.getElementById('groupForm').style.display='none'; document.getElementById('page3').style.display='block';">+</button>
+    </div>
+    <div id="page3" style="display:none">
+      <button id="uploadBtn">UPLOAD FILE</button>
     </div>
   `);
 
@@ -120,6 +125,24 @@ test('Package 5.27: createVisitSaudiGroup chains clickApplyForGroup -> enterGrou
 
   assert.equal(await page.evaluate(() => (globalThis as unknown as { __step?: string }).__step), 'confirmed');
   assert.equal(await page.evaluate(() => (globalThis as unknown as { __confirmedName?: string }).__confirmedName), '26.10-1');
+});
+
+test('Package [new]: createVisitSaudiGroup throws a clear, named error when group creation cannot be confirmed (Page 3\'s own anchor never appears after clicking "+")', async () => {
+  await page.setContent(`
+    <div id="dashboard">
+      <button onclick="window.__step = 'applyForGroup'; document.getElementById('dashboard').style.display='none'; document.getElementById('groupForm').style.display='block';">APPLY FOR GROUP</button>
+    </div>
+    <div id="groupForm" style="display:none">
+      <label for="groupName">Group Name*</label>
+      <input id="groupName" type="text" />
+      <button onclick="window.__step = 'confirmed';">+</button>
+    </div>
+  `);
+
+  await assert.rejects(
+    () => createVisitSaudiGroup(page, '26.10-1'),
+    /createVisitSaudiGroup: group creation could not be confirmed/,
+  );
 });
 
 test('clickPrevious and clickNext each click their own exact-text button, never the other', async () => {
@@ -154,6 +177,28 @@ test('uploadApplicantPortrait triggers the "UPLOAD FILE" control and supplies th
   assert.equal(uploadedName, 'visitSaudiTestPortrait.jpg');
 });
 
+test('Portrait-upload confirmation: uploadApplicantPortrait throws when the real <input> element shows a 0-byte file afterward, instead of silently treating setFiles() not throwing as success', async () => {
+  const emptyFileDir = mkdtempSync(path.join(tmpdir(), 'visitsaudi-empty-portrait-'));
+  const emptyFilePath = path.join(emptyFileDir, 'empty.jpg');
+  writeFileSync(emptyFilePath, Buffer.alloc(0));
+
+  await page.setContent(`
+    <button id="uploadBtn">UPLOAD FILE</button>
+    <input type="file" id="fileInput" style="display:none" />
+    <script>
+      document.getElementById('uploadBtn').addEventListener('click', () => {
+        document.getElementById('fileInput').click();
+      });
+    </script>
+  `);
+
+  await assert.rejects(
+    uploadApplicantPortrait(page, emptyFilePath),
+    /does not show exactly one non-empty file afterward/,
+    'a genuinely 0-byte file must never be treated as a successful upload',
+  );
+});
+
 test('Package 5.27: uploadApplicantPortraitFromUrl downloads the given URL and uploads the SAME bytes via the native filechooser', async () => {
   await page.setContent(`
     <button id="uploadBtn">UPLOAD FILE</button>
@@ -184,10 +229,10 @@ test('Package 5.27: uploadApplicantPortraitFromUrl downloads the given URL and u
   await cleanupDownloadedTempFile(downloadedPath);
 });
 
-test('clickSaveAndMoveToNextApplicant and clickSave each click their OWN exact button, never confused by "SAVE" being a substring of the other', async () => {
+test('clickSaveAndMoveToNextApplicant and clickSave each click their OWN exact, real-portal-confirmed button text ("Save & Add Applicant" / "Save"), never confused by "Save" being a substring of the other', async () => {
   await page.setContent(`
-    <button onclick="window.__action = 'save-and-next'">SAVE AND MOVE TO THE NEXT APPLICANT</button>
-    <button onclick="window.__action = 'save'">SAVE</button>
+    <span onclick="window.__action = 'save-and-next'"> Save &amp; Add Applicant</span>
+    <a id="aSave" href="/Visa/Save" onclick="window.__action = 'save'; return false;">Save</a>
   `);
   await clickSaveAndMoveToNextApplicant(page);
   assert.equal(await page.evaluate(() => (globalThis as unknown as { __action?: string }).__action), 'save-and-next');
@@ -333,7 +378,7 @@ test('Package 5.36: fillApplicantPersonalInfoFields throws a clear, named error 
 test('Package 5.33: CONFIRMED_VISIT_SAUDI_FORM_VALUES holds exactly the recovered approved-rule constants, nothing rounded or re-worded', () => {
   assert.deepEqual(CONFIRMED_VISIT_SAUDI_FORM_VALUES, {
     passportType: 'Regular Passport',
-    purpose: ['UMRAH', 'LEISURE'],
+    purpose: 'UMRAH',
     alternateEmailAnswer: 'No',
     alternatePhoneAnswer: 'No',
     hotelName: 'EMAAR ELITE HOTEL MAKKA',
@@ -394,6 +439,12 @@ async function setTripDetailsFixture(): Promise<void> {
     <script>
       window.__purposeLog = [];
       window.__commPrefLog = [];
+      // page.setContent() does not create a fresh global object -- a
+      // previous test's own __nav click (e.g. clickPrevious/clickNext's
+      // own test) would otherwise leak into this fixture's initial
+      // state, which matters now that a test here asserts __nav stays
+      // undefined (Next never clicked).
+      window.__nav = undefined;
     </script>
   `);
 }
@@ -420,11 +471,11 @@ function buildTripDetailsFieldsInput() {
   };
 }
 
-test('Package 5.39: fillApplicantTripDetailsFields fills every evidence-backed field, answers BOTH Communication Preference questions correctly (email NO, phone NO, never swapped), selects ONLY LEISURE+UMRAH (never SELECT ALL/EVENT/FAMILY), deliberately leaves Primary Contact Number untouched, and no longer throws -- against a fixture with no suggestion mechanism at all, hotelSuggestionSelected correctly comes back false and the typed hotel name is simply left in place', async () => {
+test('Package [new]: fillApplicantTripDetailsFields fills every evidence-backed field, answers BOTH Communication Preference questions correctly (email NO, phone NO, never swapped), selects ONLY UMRAH (never SELECT ALL/EVENT/FAMILY/LEISURE -- this project\'s own updated rule), deliberately leaves Primary Contact Number untouched -- against a fixture with no suggestion mechanism at all, hotelSuggestionSelected correctly comes back false, the typed hotel name is simply left in place, and this project\'s own updated rule means Next is NEVER clicked (the function stops on Page 4 rather than advance on an unconfirmed hotel selection)', async () => {
   await setTripDetailsFixture();
 
   const result = await fillApplicantTripDetailsFields(page, buildTripDetailsFieldsInput());
-  assert.deepEqual(result, { hotelSuggestionSelected: false });
+  assert.deepEqual(result, { hotelSuggestionSelected: false, advancedToNextPage: false });
 
   const values = await page.evaluate(() => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -457,9 +508,9 @@ test('Package 5.39: fillApplicantTripDetailsFields fills every evidence-backed f
 
   const purposeLog = await page.evaluate(() => (globalThis as unknown as { __purposeLog: string[] }).__purposeLog);
   assert.deepEqual(
-    [...purposeLog].sort(),
-    ['LEISURE', 'UMRAH'],
-    'ONLY LEISURE and UMRAH may be clicked (click order is not significant) -- never SELECT ALL, EVENT, or FAMILY & RELATIVES',
+    purposeLog,
+    ['UMRAH'],
+    'ONLY UMRAH may be clicked -- never SELECT ALL, EVENT, FAMILY & RELATIVES, or LEISURE (this project\'s own updated rule)',
   );
 
   const commPrefLog = await page.evaluate(() => (globalThis as unknown as { __commPrefLog: string[] }).__commPrefLog);
@@ -473,7 +524,26 @@ test('Package 5.39: fillApplicantTripDetailsFields fills every evidence-backed f
   assert.equal(residenceChoice, 'COMMERCIAL ACCOMMODATION');
 
   const nav = await page.evaluate(() => (globalThis as unknown as { __nav?: string }).__nav);
-  assert.equal(nav, 'next', 'Next must be clicked ONLY once every field above has already been filled (it is this function\'s own final step)');
+  assert.equal(nav, undefined, 'Next must NEVER be clicked when the hotel autocomplete suggestion was never found/selected');
+});
+
+test('Package [new]: fillApplicantTripDetailsFields clicks Page 4\'s Next button when (and only when) the hotel autocomplete suggestion is genuinely found and selected', async () => {
+  await setTripDetailsFixture();
+  // Add a real, matching suggestion element -- same convention as
+  // fillHotelNameAndSelectSuggestion's own dedicated tests.
+  await page.evaluate(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- runs in the browser; this project's own tsconfig has no "dom" lib.
+    const doc = (globalThis as any).document;
+    const suggestion = doc.createElement('div');
+    suggestion.textContent = 'Emaar Elite Hotel, Ajyad Street, Makkah';
+    doc.body.appendChild(suggestion);
+  });
+
+  const result = await fillApplicantTripDetailsFields(page, buildTripDetailsFieldsInput());
+  assert.deepEqual(result, { hotelSuggestionSelected: true, advancedToNextPage: true });
+
+  const nav = await page.evaluate(() => (globalThis as unknown as { __nav?: string }).__nav);
+  assert.equal(nav, 'next', 'Next must be clicked once the hotel selection is confirmed and every field above has already been filled');
 });
 
 test('Package 5.40: clickNext matches the real, Title-Case "Next >" button (case-insensitively, anchored to the start of its text) and never the ALL-CAPS "PREVIOUS" button beside it', async () => {

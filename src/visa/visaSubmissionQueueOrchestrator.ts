@@ -75,7 +75,7 @@ export async function claimApplicantForSubmission(
 export async function finalizeApplicantSubmission(
   store: VisaSubmissionQueueStore,
   recordId: string,
-  outcome: 'SAVED' | 'ERROR' | 'AMBIGUOUS',
+  outcome: 'SAVED' | 'ERROR' | 'AMBIGUOUS' | 'AWAITING_MANUAL_CONTINUATION',
   nowMs: number,
 ): Promise<RequestTransitionResult> {
   return requestTransition(store, recordId, 'SUBMITTING', outcome, nowMs);

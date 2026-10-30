@@ -12,7 +12,7 @@
  * not wired into the DB in this phase (no migration, no new column).
  */
 
-export const VISA_SUBMISSION_STATUSES = ['PENDING', 'SUBMITTING', 'SAVED', 'ERROR', 'AMBIGUOUS'] as const;
+export const VISA_SUBMISSION_STATUSES = ['PENDING', 'SUBMITTING', 'SAVED', 'ERROR', 'AMBIGUOUS', 'AWAITING_MANUAL_CONTINUATION'] as const;
 export type VisaSubmissionStatus = (typeof VISA_SUBMISSION_STATUSES)[number];
 
 export function isVisaSubmissionStatus(value: string): value is VisaSubmissionStatus {
@@ -41,11 +41,42 @@ export function isVisaSubmissionStatus(value: string): value is VisaSubmissionSt
  *    "PORTALDA TEKSHIRISH" flow) is Phase 2c's job, not this one's --
  *    modeling that resolution path here would be reaching ahead of this
  *    phase's own scope, so AMBIGUOUS has NO outgoing transition in this
- *    table yet.
+ *    table yet. AMBIGUOUS is deliberately never used for an ordinary,
+ *    expected operator pause either (see AWAITING_MANUAL_CONTINUATION
+ *    below) -- it means "outcome unknown," never "waiting on a known,
+ *    expected next step."
+ *  - AWAITING_MANUAL_CONTINUATION: the automation genuinely, successfully
+ *    filled this applicant's own Page 3 (Personal Information) and Page 4
+ *    (Passport/Traveler) and reached Page 5 (Medical Insurance) -- a KNOWN,
+ *    EXPECTED checkpoint (never a crash, timeout, or unexpected state).
+ *    From here, a human must complete Page 5/6/7 (insurance consent, Terms
+ *    and Conditions, Review Application -- none of these are ever
+ *    automated) and then either continue to the next applicant or finish
+ *    the batch. SUBMITTING -> AWAITING_MANUAL_CONTINUATION is therefore a
+ *    SEPARATE outcome from SAVED/ERROR/AMBIGUOUS, not a replacement for any
+ *    of them -- which of the four applies is still decided entirely by
+ *    what the automation itself actually observed, never guessed.
+ *    AWAITING_MANUAL_CONTINUATION has exactly two outgoing transitions:
+ *    -> SUBMITTING (an operator-triggered re-claim to automate the NEXT
+ *    applicant's own Page 3/4, once this applicant's manual Page 5/6/7
+ *    steps are done) and -> AMBIGUOUS (only via a future stale-timeout
+ *    sweep -- not implemented in this phase -- for when an operator never
+ *    responds; see this status's own future design report). It deliberately
+ *    has NO transition to PENDING: re-deriving "this applicant needs
+ *    automation again" by resetting to PENDING would make it
+ *    indistinguishable from an applicant that was never attempted at all,
+ *    and -- critically -- would make visaStartSubmissionCommand.ts's own
+ *    batchAlreadyStarted check (which treats an all-PENDING batch as
+ *    "never started") wrongly conclude a batch with an
+ *    AWAITING_MANUAL_CONTINUATION applicant had never been touched,
+ *    risking a duplicate createVisitSaudiGroup/group-creation attempt --
+ *    see that file's own updated check, which now also counts
+ *    AWAITING_MANUAL_CONTINUATION as "already started."
  */
 const ALLOWED_TRANSITIONS: Readonly<Record<VisaSubmissionStatus, readonly VisaSubmissionStatus[]>> = {
   PENDING: ['SUBMITTING'],
-  SUBMITTING: ['SAVED', 'ERROR', 'AMBIGUOUS'],
+  SUBMITTING: ['SAVED', 'ERROR', 'AMBIGUOUS', 'AWAITING_MANUAL_CONTINUATION'],
+  AWAITING_MANUAL_CONTINUATION: ['SUBMITTING', 'AMBIGUOUS'],
   SAVED: [],
   ERROR: [],
   AMBIGUOUS: [],
@@ -89,6 +120,16 @@ export function canTransition(from: string, to: string): CanTransitionResult {
  * not be more wrong. Which value (if any) 2c should actually show for
  * AMBIGUOUS is an OPEN QUESTION for the operator to decide (see this
  * module's own report) -- never silently guessed here.
+ *
+ * AWAITING_MANUAL_CONTINUATION gets the SAME 'NO_SAFE_SHEET_MAPPING'
+ * treatment as AMBIGUOUS, for an analogous reason: showing it as the
+ * Sheet's own PENDING would hide that the automation already did real,
+ * meaningful work (Page 3/4 filled) and is now waiting on a human, not
+ * simply "not started yet" -- and none of PENDING/SAVED/ERROR is an
+ * honest description of "waiting on an operator to finish Page 5/6/7."
+ * Which value (if any) should actually be shown for this status on the
+ * Sheet is left as the SAME kind of open, operator-facing question
+ * AMBIGUOUS's own doc comment already raises -- never silently guessed.
  */
 export type SheetSubmissionStatusValue = 'PENDING' | 'SAVED' | 'ERROR';
 
@@ -102,6 +143,7 @@ export function mapSubmissionStatusToSheetValue(status: VisaSubmissionStatus): S
     case 'ERROR':
       return 'ERROR';
     case 'AMBIGUOUS':
+    case 'AWAITING_MANUAL_CONTINUATION':
       return 'NO_SAFE_SHEET_MAPPING';
   }
 }

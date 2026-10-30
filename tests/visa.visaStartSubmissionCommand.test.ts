@@ -290,7 +290,7 @@ async function setResumedApplicantFixture(): Promise<void> {
   `);
 }
 
-test('visaStartSubmissionCommand: STARTED -- with a real (injected, local) session and a real queued applicant, the full chain runs end-to-end, the applicant reaches SAVED in the real DB, and operatorSummaryText is populated', async () => {
+test('visaStartSubmissionCommand: STARTED -- with a real (injected, local) session and a real queued applicant, the full chain runs end-to-end, the applicant reaches AMBIGUOUS in the real DB (this project\'s own updated rule -- a resolved SAVE click is never, by itself, proof of a real save), and operatorSummaryText is populated', async () => {
   const { groupId, chatId } = await createGroup();
   try {
     const { batchId, passportIdentityId } = await createActiveApplicant(groupId);
@@ -324,11 +324,11 @@ test('visaStartSubmissionCommand: STARTED -- with a real (injected, local) sessi
 
     assert.equal(outcome.kind, 'STARTED');
     if (outcome.kind !== 'STARTED') throw new Error('unreachable');
-    assert.match(outcome.operatorSummaryText, /1-o'rin: SAVED/);
+    assert.match(outcome.operatorSummaryText, /1-o'rin: AMBIGUOUS/);
 
     const { rows } = await pool.query<{ status: string }>('SELECT status FROM visa_submission_queue WHERE batch_id = $1', [batchId]);
     assert.equal(rows.length, 1);
-    assert.equal(rows[0]?.status, 'SAVED');
+    assert.equal(rows[0]?.status, 'AMBIGUOUS');
   } finally {
     await cleanupAll([groupId]);
   }
@@ -451,7 +451,84 @@ test('visaStartSubmissionCommand: RESUMED batch -- when one queue row is already
     );
     assert.equal(rows.length, 2);
     assert.equal(rows[0]?.status, 'SAVED', 'the already-SAVED row from the prior run must remain untouched');
-    assert.equal(rows[1]?.status, 'SAVED', 'the remaining PENDING applicant must now reach SAVED too');
+    // This project's own updated rule: a freshly-resolved SAVE click is
+    // reported AMBIGUOUS, never SAVED (no reliable save-confirmation
+    // signal exists yet) -- so the SECOND applicant, genuinely processed
+    // by the real adapter during THIS run, reaches AMBIGUOUS, not SAVED.
+    assert.equal(rows[1]?.status, 'AMBIGUOUS', 'the remaining PENDING applicant must now be processed and reach AMBIGUOUS');
+  } finally {
+    await cleanupAll([groupId]);
+  }
+});
+
+test('visaStartSubmissionCommand: a batch with an AWAITING_MANUAL_CONTINUATION row (automation already filled Page 3/4 for one applicant, now waiting on a human) is correctly treated as already-started -- group creation is never attempted again', async () => {
+  const { groupId, chatId } = await createGroup();
+  try {
+    const { batchId } = await createActiveApplicant(groupId);
+    await createActiveApplicant(groupId); // second applicant in the SAME batch
+    await queueBatch(batchId, 'operator:setup');
+
+    const {
+      rows: [firstQueueRow, secondQueueRow],
+    } = await pool.query<{ id: string }>(
+      `SELECT q.id FROM visa_submission_queue q
+       JOIN visa_batch_applicants a ON a.id = q.visa_batch_applicant_id
+       WHERE q.batch_id = $1
+       ORDER BY a.position_in_batch ASC`,
+      [batchId],
+    );
+    assert.ok(firstQueueRow && secondQueueRow, 'expected exactly two queue rows after queueBatch');
+    // Package 5.?? Step 1: AWAITING_MANUAL_CONTINUATION, set directly via
+    // SQL -- same convention as the sibling RESUMED-batch test above -- no
+    // code path produces this status yet (the continuation command and
+    // the automation's own Page-5 handoff are later, separate phases).
+    await pool.query(`UPDATE visa_submission_queue SET status = 'AWAITING_MANUAL_CONTINUATION' WHERE id = $1`, [firstQueueRow.id]);
+
+    await setResumedApplicantFixture();
+
+    const fakePreflight = async (_groupId: string, passportIdentityId: string): Promise<VisitSaudiPreflightResult> => ({
+      passportIdentityId,
+      sheetRowNumber: null,
+      ready: true,
+      errors: [],
+      draft: buildDraft(portraitServerUrl),
+      expectedDateOfArrival: '2026-12-01',
+      expectedDateOfDeparture: '2026-12-10',
+      maritalStatus: 'SINGLE',
+      countryOfBirth: 'UZBEKISTAN',
+      cityOfBirth: 'Tashkent',
+      countryOfResidence: 'UZBEKISTAN',
+      cityOfResidence: 'Tashkent',
+      profession: 'WORKER',
+    });
+
+    const outcome = await visaStartSubmissionCommand(
+      { telegramChatId: chatId, authorStatus: 'administrator', requestedBy: 'operator:x' },
+      {
+        ...defaultDependencies,
+        getActiveSession: async () => ({ available: true, page, release: async () => undefined }),
+        checkPreflight: fakePreflight,
+      },
+    );
+
+    assert.equal(outcome.kind, 'STARTED');
+
+    const eventLog = await page.evaluate(() => (globalThis as unknown as { __eventLog: string[] }).__eventLog);
+    assert.ok(
+      !eventLog.includes('applyForGroup') && !eventLog.includes('confirmGroup'),
+      `a batch with an AWAITING_MANUAL_CONTINUATION row must never attempt group creation again -- eventLog was: ${JSON.stringify(eventLog)}`,
+    );
+
+    const { rows } = await pool.query<{ id: string; status: string }>(
+      `SELECT q.id, q.status FROM visa_submission_queue q
+       JOIN visa_batch_applicants a ON a.id = q.visa_batch_applicant_id
+       WHERE q.batch_id = $1
+       ORDER BY a.position_in_batch ASC`,
+      [batchId],
+    );
+    assert.equal(rows.length, 2);
+    assert.equal(rows[0]?.status, 'AWAITING_MANUAL_CONTINUATION', 'the AWAITING_MANUAL_CONTINUATION row must remain untouched -- this phase never processes it');
+    assert.equal(rows[1]?.status, 'AMBIGUOUS', 'the remaining PENDING applicant must still be processed normally');
   } finally {
     await cleanupAll([groupId]);
   }

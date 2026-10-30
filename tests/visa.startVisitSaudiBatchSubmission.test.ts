@@ -12,12 +12,17 @@ import type { VisitSaudiApplicationDraft } from '../src/visa/types.js';
 import type { VisitSaudiPreflightResult } from '../src/visa/visitSaudiPreflight.js';
 
 /**
- * Package 5.33, extended 5.36: proves startVisitSaudiBatchSubmission's
+ * Package 5.33, extended 5.36, updated for the Page3->Page7 flow fix and
+ * the Page3->Page4 trigger fix: proves startVisitSaudiBatchSubmission's
  * own wiring -- createVisitSaudiGroup (REAL page-action, REAL Playwright
  * page) runs ONCE, BEFORE runVisaWorkerLoopForBatch (REAL, UNCHANGED)
- * ever claims or processes a single applicant, and (now that Page 3 is
- * fully implemented) both applicants genuinely complete through to
- * SAVED. Both halves run against a hand-built LOCAL fixture page, same
+ * ever claims or processes a single applicant. SAVE is never clicked
+ * immediately after Page 3 (see visitSaudiBrowserAutomationAdapter.ts's
+ * own doc comment); Page 3's own "Next" IS clicked for real, but this
+ * fixture has no Page 4 markup, so both applicants end AMBIGUOUS (never
+ * SAVED, never AWAITING_MANUAL_CONTINUATION -- that would require Page 4
+ * to genuinely appear). Both halves run against a hand-built LOCAL
+ * fixture page, same
  * local-simulation convention as every other VisitSaudi test in this
  * project -- this does NOT, and cannot, prove anything about the real
  * VisitSaudi portal. No real portal, no production DB -- only the
@@ -125,6 +130,7 @@ async function setBatchFixture(): Promise<void> {
 
       <button onclick="window.__eventLog.push('save-and-next')">SAVE AND MOVE TO THE NEXT APPLICANT</button>
       <button onclick="window.__eventLog.push('save')">SAVE</button>
+      <button onclick="window.__eventLog.push('page3-next')">Next &gt;</button>
     </div>
     <script>
       window.__eventLog = [];
@@ -188,20 +194,25 @@ test('Package 5.33: startVisitSaudiBatchSubmission creates the group ONCE, stric
   );
 
   // The worker loop itself ran, exactly as Package 5.28 already proved it
-  // does -- now, per Package 5.36, both applicants actually complete and
-  // reach SAVED.
+  // does -- per the Page3->Page7 flow fix, neither applicant's SAVE
+  // button is ever clicked; per the Page3->Page4 trigger fix, Page 3's
+  // own "Next" IS clicked for real, but since this fixture has no Page 4
+  // markup, both end AMBIGUOUS (the click resolved, Page 4 never appeared).
   assert.equal(result.lockOutcome, 'acquired');
   assert.deepEqual(result.batchValidation, { outcome: 'ok' });
+  const ambiguousDetail =
+    'Page 3\'s forward action was clicked, but Page 4 ("Passport Type") never became visible afterward -- portal page state is unconfirmed';
   assert.deepEqual(result.applicantOutcomes, [
-    { recordId: recordA.id, outcome: 'SAVED' },
-    { recordId: recordB.id, outcome: 'SAVED' },
+    { recordId: recordA.id, outcome: 'AMBIGUOUS', detail: ambiguousDetail },
+    { recordId: recordB.id, outcome: 'AMBIGUOUS', detail: ambiguousDetail },
   ]);
 
   // Package 5.42: the result also carries a ready, Telegram-ready operator
-  // summary -- no detail for either applicant here (no Page 4 fixture, so
-  // neither the hotel-autocomplete nor Page-5/Insurance caveat applies),
-  // so both lines stay exactly as plain as they always implicitly were.
-  assert.equal(result.operatorSummaryText, "VisitSaudi topshirish natijasi -- Batch: 26.10-1\n1-o'rin: SAVED\n2-o'rin: SAVED");
+  // summary, now showing both applicants' AMBIGUOUS detail.
+  assert.equal(
+    result.operatorSummaryText,
+    `VisitSaudi topshirish natijasi -- Batch: 26.10-1\n1-o'rin: AMBIGUOUS\n   ${ambiguousDetail}\n2-o'rin: AMBIGUOUS\n   ${ambiguousDetail}`,
+  );
 
   const eventLog = await page.evaluate(() => (globalThis as unknown as { __eventLog: string[] }).__eventLog);
 
@@ -214,8 +225,14 @@ test('Package 5.33: startVisitSaudiBatchSubmission creates the group ONCE, stric
   );
   assert.ok(!eventLog.includes('applyForGroup', 1), 'the group must never be created a second time within one batch submission');
 
-  // identity-a (position 1 of 2, not last) -> SAVE AND MOVE TO THE NEXT
-  // APPLICANT; identity-b (position 2 of 2, last) -> plain SAVE.
+  // Page3->Page7 flow fix: SAVE / SAVE AND MOVE TO THE NEXT APPLICANT
+  // must NEVER be clicked here -- that action belongs on Page 7, not
+  // immediately after Page 3.
   const saveEvents = eventLog.filter((e) => e === 'save-and-next' || e === 'save');
-  assert.deepEqual(saveEvents, ['save-and-next', 'save']);
+  assert.deepEqual(saveEvents, [], 'SAVE/SAVE AND MOVE TO THE NEXT APPLICANT must never be clicked immediately after Page 3');
+
+  // Page3->Page4 trigger fix: Page 3's own "Next" must have been clicked
+  // once per applicant.
+  const nextEvents = eventLog.filter((e) => e === 'page3-next');
+  assert.deepEqual(nextEvents, ['page3-next', 'page3-next']);
 });

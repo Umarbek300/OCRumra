@@ -7,6 +7,9 @@ const ALLOWED: ReadonlyArray<[string, string]> = [
   ['SUBMITTING', 'SAVED'],
   ['SUBMITTING', 'ERROR'],
   ['SUBMITTING', 'AMBIGUOUS'],
+  ['SUBMITTING', 'AWAITING_MANUAL_CONTINUATION'],
+  ['AWAITING_MANUAL_CONTINUATION', 'SUBMITTING'],
+  ['AWAITING_MANUAL_CONTINUATION', 'AMBIGUOUS'],
 ];
 
 for (const [from, to] of ALLOWED) {
@@ -31,6 +34,14 @@ const FORBIDDEN: ReadonlyArray<[string, string]> = [
   ['AMBIGUOUS', 'PENDING'], // never auto-resubmitted
   ['AMBIGUOUS', 'SAVED'],
   ['AMBIGUOUS', 'SUBMITTING'],
+  ['AWAITING_MANUAL_CONTINUATION', 'PENDING'], // deliberately no path back to PENDING -- see visaSubmissionStatus.ts's own doc comment (would make this applicant indistinguishable from a never-attempted one, and blind to visaStartSubmissionCommand.ts's own batchAlreadyStarted check)
+  ['AWAITING_MANUAL_CONTINUATION', 'SAVED'],
+  ['AWAITING_MANUAL_CONTINUATION', 'ERROR'],
+  ['AWAITING_MANUAL_CONTINUATION', 'AWAITING_MANUAL_CONTINUATION'],
+  ['PENDING', 'AWAITING_MANUAL_CONTINUATION'],
+  ['SAVED', 'AWAITING_MANUAL_CONTINUATION'],
+  ['ERROR', 'AWAITING_MANUAL_CONTINUATION'],
+  ['AMBIGUOUS', 'AWAITING_MANUAL_CONTINUATION'],
 ];
 
 for (const [from, to] of FORBIDDEN) {
@@ -74,4 +85,8 @@ test('mapSubmissionStatusToSheetValue: SAVED and ERROR map directly', () => {
 
 test('mapSubmissionStatusToSheetValue: AMBIGUOUS has deliberately NO safe mapping -- never guessed as PENDING/SAVED/ERROR', () => {
   assert.equal(mapSubmissionStatusToSheetValue('AMBIGUOUS'), 'NO_SAFE_SHEET_MAPPING');
+});
+
+test('mapSubmissionStatusToSheetValue: AWAITING_MANUAL_CONTINUATION has deliberately NO safe mapping either -- same reasoning as AMBIGUOUS, never guessed as PENDING/SAVED/ERROR', () => {
+  assert.equal(mapSubmissionStatusToSheetValue('AWAITING_MANUAL_CONTINUATION'), 'NO_SAFE_SHEET_MAPPING');
 });

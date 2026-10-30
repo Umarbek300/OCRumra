@@ -91,6 +91,8 @@ export type VisaWorkerLoopApplicantOutcome =
   | { recordId: string; outcome: 'SAVED'; detail?: string }
   | { recordId: string; outcome: 'ERROR'; detail?: string }
   | { recordId: string; outcome: 'AMBIGUOUS'; detail?: string }
+  /** Package [Page3->Page7 flow fix]: the automation adapter confirmed everything it is itself able to do for this applicant succeeded and has reached a KNOWN, EXPECTED human-handoff point (see visitSaudiBrowserAutomationAdapter.ts's own doc comment) -- never auto-resubmitted; an operator continues manually. */
+  | { recordId: string; outcome: 'AWAITING_MANUAL_CONTINUATION'; detail?: string }
   /** claimApplicantForSubmission rejected the claim -- e.g. already SAVED/ERROR/AMBIGUOUS/SUBMITTING, or the record does not exist. Automation is NEVER called for a record the worker could not claim. */
   | { recordId: string; outcome: 'SKIPPED_NOT_CLAIMABLE'; reason: string }
   /** deps.queueStore.getRecord(recordId) found no record at all for the given recordId. Automation is NEVER called. */
@@ -208,7 +210,7 @@ async function processOneApplicant(
     return { recordId: applicant.recordId, outcome: 'SKIPPED_PREFLIGHT_FAILED', reason: preflight.errors[0].reason };
   }
 
-  let automationResult: { outcome: 'SAVED' | 'ERROR' | 'AMBIGUOUS'; detail?: string };
+  let automationResult: { outcome: 'SAVED' | 'ERROR' | 'AMBIGUOUS' | 'AWAITING_MANUAL_CONTINUATION'; detail?: string };
   try {
     automationResult = await deps.automation.submitApplicant({
       recordId: applicant.recordId,
