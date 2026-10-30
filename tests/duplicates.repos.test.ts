@@ -837,10 +837,20 @@ test('recoverStaleOperatorCommands requeues a command stuck in processing past t
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query('SET LOCAL session_replication_role = replica');
-      await client.query(`UPDATE passport_operator_commands SET updated_at = now() - interval '20 minutes' WHERE id = $1`, [
-        command.id,
-      ]);
+      // ocrumra_test_role is not a superuser, so SET (LOCAL) session_replication_role
+      // is denied here (that GUC's context is 'superuser' in Postgres, unconditionally).
+      // ALTER TABLE ... DISABLE/ENABLE TRIGGER needs only table ownership (which this
+      // role already has, having created the table itself), achieves the exact same
+      // trigger-bypass effect, and is scoped by the inner try/finally below so the
+      // trigger is always re-enabled before COMMIT, even if the UPDATE throws.
+      await client.query('ALTER TABLE passport_operator_commands DISABLE TRIGGER passport_operator_commands_set_updated_at');
+      try {
+        await client.query(`UPDATE passport_operator_commands SET updated_at = now() - interval '20 minutes' WHERE id = $1`, [
+          command.id,
+        ]);
+      } finally {
+        await client.query('ALTER TABLE passport_operator_commands ENABLE TRIGGER passport_operator_commands_set_updated_at');
+      }
       await client.query('COMMIT');
     } catch (error) {
       await client.query('ROLLBACK');

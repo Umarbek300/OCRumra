@@ -1,3 +1,4 @@
+import type { PoolClient } from 'pg';
 import { pool } from '../pool.js';
 
 export type PassportIdentityStatus = 'active' | 'archived_source_deleted' | 'merged';
@@ -111,6 +112,33 @@ export async function createPassportIdentity(
   splitOriginIdentityId: string | null = null,
 ): Promise<PassportIdentityRecord | null> {
   const { rows } = await pool.query<PassportIdentityRow>(
+    `INSERT INTO passport_identity (passport_number_normalized, date_of_birth, mrz_checksum_valid, split_origin_identity_id)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (passport_number_normalized, date_of_birth) WHERE split_origin_identity_id IS NULL DO NOTHING
+     RETURNING ${SELECT_COLUMNS}`,
+    [passportNumberNormalized, dateOfBirth, mrzChecksumValid, splitOriginIdentityId],
+  );
+  const row = rows[0];
+  return row ? mapRow(row) : null;
+}
+
+/**
+ * Same INSERT as createPassportIdentity, but runs on a caller-supplied
+ * transaction client so the identity row and whatever the caller writes
+ * next (e.g. its own identity_created audit event) commit or roll back
+ * together -- same convention as updateActiveAssignmentsStatusWithClient
+ * (visaBatches.repo.ts) and insertReconciliationJobWithClient
+ * (sheetReconciliation.repo.ts). createPassportIdentity itself is
+ * untouched; every existing caller keeps using it exactly as before.
+ */
+export async function createPassportIdentityWithClient(
+  client: PoolClient,
+  passportNumberNormalized: string,
+  dateOfBirth: string,
+  mrzChecksumValid: boolean | null = null,
+  splitOriginIdentityId: string | null = null,
+): Promise<PassportIdentityRecord | null> {
+  const { rows } = await client.query<PassportIdentityRow>(
     `INSERT INTO passport_identity (passport_number_normalized, date_of_birth, mrz_checksum_valid, split_origin_identity_id)
      VALUES ($1, $2, $3, $4)
      ON CONFLICT (passport_number_normalized, date_of_birth) WHERE split_origin_identity_id IS NULL DO NOTHING

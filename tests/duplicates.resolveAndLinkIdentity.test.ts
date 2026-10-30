@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import { pool } from '../src/db/pool.js';
 import { resolveAndLinkIdentity } from '../src/duplicates/resolveAndLinkIdentity.js';
 import { findPassportIdentityByKey } from '../src/db/repositories/passportIdentity.repo.js';
 import { findPassportMessageLinkByTelegramMessageId } from '../src/db/repositories/passportMessageLinks.repo.js';
-import { findDuplicateReviewByCandidateMessageId } from '../src/db/repositories/duplicateReviews.repo.js';
+import { findDuplicateReviewByCandidateMessageId, resolveDuplicateReview } from '../src/db/repositories/duplicateReviews.repo.js';
 import { listEventsForIdentity } from '../src/db/repositories/passportIdentityEvents.repo.js';
 
 let idCounter = 0;
@@ -375,6 +376,231 @@ test('resolveAndLinkIdentity does not create a duplicate review row when re-run 
       messageB.telegramMessageId,
     ]);
     assert.equal(rows.length, 1, 'reprocessing must never create a second review row for the same message');
+  } finally {
+    await cleanupAll([groupId], [agentA, agentB], [{ passportNumber, dob }]);
+  }
+});
+
+// ---------------------------------------------------------------------
+// Package 0: identity_created transaction-atomicity + REVIEW stale-retry
+// ---------------------------------------------------------------------
+
+test('resolveAndLinkIdentity: two parallel callers racing to create the SAME new identity (different groups) never produce a duplicate identity_created event', async () => {
+  const groupA = await createGroup();
+  const groupB = await createGroup();
+  const agentId = await createAgent();
+  const messageA = await createMessage(groupA, agentId);
+  const messageB = await createMessage(groupB, agentId);
+  const passportNumber = uniquePassportNumber();
+  const dob = '1990-01-01';
+
+  try {
+    const [outcomeA, outcomeB] = await Promise.all([
+      resolveAndLinkIdentity({
+        telegramMessageId: messageA.telegramMessageId,
+        groupId: groupA,
+        agentId,
+        passportNumber: { value: passportNumber, confidence: 'high' },
+        dateOfBirth: { value: dob, confidence: 'high' },
+      }),
+      resolveAndLinkIdentity({
+        telegramMessageId: messageB.telegramMessageId,
+        groupId: groupB,
+        agentId,
+        passportNumber: { value: passportNumber, confidence: 'high' },
+        dateOfBirth: { value: dob, confidence: 'high' },
+      }),
+    ]);
+
+    assert.equal(outcomeA.kind, 'LINKED');
+    assert.equal(outcomeB.kind, 'LINKED');
+    if (outcomeA.kind !== 'LINKED' || outcomeB.kind !== 'LINKED') throw new Error('unreachable');
+    assert.equal(outcomeA.identityId, outcomeB.identityId, 'both callers must converge on the SAME identity');
+
+    const { rows: identityRows } = await pool.query(
+      `SELECT id FROM passport_identity WHERE passport_number_normalized = $1 AND date_of_birth = $2`,
+      [passportNumber, dob],
+    );
+    assert.equal(identityRows.length, 1, 'exactly one passport_identity row must exist, regardless of which caller won the race');
+
+    const events = await listEventsForIdentity(outcomeA.identityId);
+    const createdEvents = events.filter((e) => e.eventType === 'identity_created');
+    assert.equal(createdEvents.length, 1, 'identity_created must be written exactly once, never by the losing caller');
+
+    const linkedEvents = events.filter((e) => e.eventType === 'message_linked_canonical');
+    assert.equal(linkedEvents.length, 2, 'each message still gets its own message_linked_canonical event');
+  } finally {
+    await cleanupAll([groupA, groupB], [agentId], [{ passportNumber, dob }]);
+  }
+});
+
+test('resolveAndLinkIdentity: an identity_created INSERT failure rolls back the identity row too -- no orphan identity, no event, no link', async () => {
+  const realGroupId = await createGroup();
+  const agentId = await createAgent();
+  const message = await createMessage(realGroupId, agentId);
+  const passportNumber = uniquePassportNumber();
+  const dob = '1990-01-01';
+  // A syntactically valid but non-existent group id -- deliberately
+  // chosen to violate passport_identity_events.group_id's FK to groups(id)
+  // INSIDE findOrCreateIdentity's own transaction, forcing a real rollback
+  // without any mock/dependency-injection (same technique already used by
+  // "the database enforces uniqueness of personal_photo_token across rows"
+  // in passportOcrResult.repo.test.ts).
+  const nonExistentGroupId = randomUUID();
+
+  try {
+    await assert.rejects(
+      () =>
+        resolveAndLinkIdentity({
+          telegramMessageId: message.telegramMessageId,
+          groupId: nonExistentGroupId,
+          agentId,
+          passportNumber: { value: passportNumber, confidence: 'high' },
+          dateOfBirth: { value: dob, confidence: 'high' },
+        }),
+      /violates foreign key constraint/,
+    );
+
+    const identity = await findPassportIdentityByKey(passportNumber, dob);
+    assert.equal(identity, null, 'the identity row must be rolled back along with the failed event write -- never left orphaned');
+
+    const link = await findPassportMessageLinkByTelegramMessageId(message.telegramMessageId);
+    assert.equal(link, null, 'a failed identity+event transaction must never reach link creation');
+  } finally {
+    await cleanupAll([realGroupId], [agentId], [{ passportNumber, dob }]);
+  }
+});
+
+test('resolveAndLinkIdentity: identity_created is written only once, never again when a later message resolves to the same pre-existing identity', async () => {
+  const groupA = await createGroup();
+  const groupB = await createGroup();
+  const agentId = await createAgent();
+  const messageA = await createMessage(groupA, agentId);
+  const messageB = await createMessage(groupB, agentId);
+  const passportNumber = uniquePassportNumber();
+  const dob = '1990-01-01';
+
+  try {
+    const outcomeA = await resolveAndLinkIdentity({
+      telegramMessageId: messageA.telegramMessageId,
+      groupId: groupA,
+      agentId,
+      passportNumber: { value: passportNumber, confidence: 'high' },
+      dateOfBirth: { value: dob, confidence: 'high' },
+    });
+    assert.equal(outcomeA.kind, 'LINKED');
+    if (outcomeA.kind !== 'LINKED') throw new Error('unreachable');
+
+    await resolveAndLinkIdentity({
+      telegramMessageId: messageB.telegramMessageId,
+      groupId: groupB,
+      agentId,
+      passportNumber: { value: passportNumber, confidence: 'high' },
+      dateOfBirth: { value: dob, confidence: 'high' },
+    });
+
+    const events = await listEventsForIdentity(outcomeA.identityId);
+    const createdEvents = events.filter((e) => e.eventType === 'identity_created');
+    assert.equal(
+      createdEvents.length,
+      1,
+      'the second message resolves via NEW_GROUP_RECORD, never re-entering NEW_IDENTITY -- identity_created must not repeat',
+    );
+  } finally {
+    await cleanupAll([groupA, groupB], [agentId], [{ passportNumber, dob }]);
+  }
+});
+
+test('resolveAndLinkIdentity: identity+identity_created commit even when the SUBSEQUENT link creation fails (safely recoverable on retry)', async () => {
+  const groupId = await createGroup();
+  const message = await createMessage(groupId, null);
+  const passportNumber = uniquePassportNumber();
+  const dob = '1990-01-01';
+  // Deliberately non-existent agent id -- recordPassportIdentityEvent's own
+  // input never includes agentId, so the identity+identity_created
+  // transaction is unaffected and commits; only the LATER, separate
+  // createPassportMessageLink call (which does use agentId) fails its own
+  // FK, isolating exactly the "identity+event committed, link failed" case.
+  const nonExistentAgentId = randomUUID();
+
+  try {
+    await assert.rejects(
+      () =>
+        resolveAndLinkIdentity({
+          telegramMessageId: message.telegramMessageId,
+          groupId,
+          agentId: nonExistentAgentId,
+          passportNumber: { value: passportNumber, confidence: 'high' },
+          dateOfBirth: { value: dob, confidence: 'high' },
+        }),
+      /violates foreign key constraint/,
+    );
+
+    const identity = await findPassportIdentityByKey(passportNumber, dob);
+    assert.ok(identity, 'the identity+identity_created transaction must already have committed before the link step ran');
+
+    const events = await listEventsForIdentity(identity.id);
+    assert.ok(
+      events.some((e) => e.eventType === 'identity_created'),
+      'identity_created must be committed despite the later link failure',
+    );
+
+    const link = await findPassportMessageLinkByTelegramMessageId(message.telegramMessageId);
+    assert.equal(link, null, 'the link itself must not exist after its own creation failed');
+  } finally {
+    await cleanupAll([groupId], [], [{ passportNumber, dob }]);
+  }
+});
+
+test('resolveAndLinkIdentity: a stale-job retry must never re-open an ALREADY-RESOLVED review', async () => {
+  const groupId = await createGroup();
+  const agentA = await createAgent();
+  const agentB = await createAgent();
+  const messageA = await createMessage(groupId, agentA);
+  const messageB = await createMessage(groupId, agentB);
+  const passportNumber = uniquePassportNumber();
+  const dob = '1990-01-01';
+
+  try {
+    await resolveAndLinkIdentity({
+      telegramMessageId: messageA.telegramMessageId,
+      groupId,
+      agentId: agentA,
+      passportNumber: { value: passportNumber, confidence: 'high' },
+      dateOfBirth: { value: dob, confidence: 'high' },
+    });
+
+    const input = {
+      telegramMessageId: messageB.telegramMessageId,
+      groupId,
+      agentId: agentB,
+      passportNumber: { value: passportNumber, confidence: 'high' as const },
+      dateOfBirth: { value: dob, confidence: 'high' as const },
+    };
+    const first = await resolveAndLinkIdentity(input);
+    assert.deepEqual(first, { kind: 'REVIEW' });
+
+    const pendingReview = await findDuplicateReviewByCandidateMessageId(messageB.telegramMessageId);
+    assert.ok(pendingReview);
+    const resolved = await resolveDuplicateReview(pendingReview.id, 'confirmed_distinct', 'test-operator');
+    assert.ok(resolved, 'resolving the pending review must succeed');
+
+    // Simulates performPassportOcr's own "OCR result already exists" retry
+    // path (performPassportOcr.ts:160-173) calling resolveAndLinkIdentity
+    // again for the SAME message -- e.g. after a stale passport_processing
+    // job recovery -- long after the review was already decided.
+    const second = await resolveAndLinkIdentity(input);
+    assert.deepEqual(second, { kind: 'REVIEW' }, 'the retry must still report REVIEW (never silently proceed to link/merge), but without reopening it');
+
+    const { rows } = await pool.query('SELECT id, status FROM duplicate_reviews WHERE candidate_telegram_message_id = $1', [
+      messageB.telegramMessageId,
+    ]);
+    assert.equal(rows.length, 1, 'a stale retry must never create a second review row for an already-resolved candidate');
+    assert.equal(rows[0]?.status, 'confirmed_distinct', 'the existing resolution must remain untouched');
+
+    const events = await listEventsForIdentity(pendingReview.passportIdentityId);
+    const reviewFlaggedEvents = events.filter((e) => e.eventType === 'review_flagged');
+    assert.equal(reviewFlaggedEvents.length, 1, 'a stale retry must never write a second review_flagged event');
   } finally {
     await cleanupAll([groupId], [agentA, agentB], [{ passportNumber, dob }]);
   }

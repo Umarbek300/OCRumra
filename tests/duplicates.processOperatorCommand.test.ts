@@ -26,6 +26,7 @@ import { findPassportOcrResultByTelegramMessageId } from '../src/db/repositories
 import { findTelegramMessageById } from '../src/db/repositories/telegramMessages.repo.js';
 import { findReconciliationJobsForIdentityGroup } from '../src/db/repositories/sheetReconciliation.repo.js';
 import { createVisaBatch, createVisaBatchAssignment, findActiveAssignment } from '../src/db/repositories/visaBatches.repo.js';
+import { claimForSubmission, createQueueForBatch, createSubmissionAttempt } from '../src/db/repositories/visaSubmissionQueue.repo.js';
 
 let idCounter = 0;
 function uniqueChatId(): number {
@@ -124,10 +125,81 @@ async function getVisaAssignmentStatus(assignmentId: string): Promise<string | n
   return rows[0]?.status ?? null;
 }
 
+/**
+ * Like createVisaAssignment above, but ALSO creates the assignment's own
+ * visa_submission_queue row (and, when queueStatus is 'SUBMITTING', claims
+ * it) -- the Package 5.6 conflict-detection tests below need an assignment
+ * with a REAL queue row in a specific status, not just a bare
+ * visa_batch_applicants row.
+ */
+async function createVisaAssignmentWithQueue(
+  groupId: string,
+  identityId: string,
+  queueStatus: 'PENDING' | 'SUBMITTING',
+): Promise<{ assignmentId: string; queueId: string }> {
+  const batch = await createVisaBatch({ groupId, portal: 'visitsaudi', batchNumber: 1, batchName: 'test-batch-1' });
+  const result = await createVisaBatchAssignment({
+    batchId: batch.id,
+    groupId,
+    passportIdentityId: identityId,
+    portal: 'visitsaudi',
+    positionInBatch: 1,
+  });
+  assert.equal(result.outcome, 'inserted');
+  if (result.outcome !== 'inserted') throw new Error('unreachable');
+
+  const attempt = await createSubmissionAttempt(batch.id, 'operator:test');
+  const created = await createQueueForBatch(batch.id, attempt.id);
+  const queueRow = created?.[0];
+  assert.ok(queueRow);
+
+  if (queueStatus === 'SUBMITTING') {
+    const claimed = await claimForSubmission(queueRow.id);
+    assert.ok(claimed);
+  }
+
+  return { assignmentId: result.assignment.id, queueId: queueRow.id };
+}
+
+async function getQueueStatusAndConflict(queueId: string): Promise<{ status: string; conflictDetectedAt: string | null }> {
+  const { rows } = await pool.query<{ status: string; conflict_detected_at: string | null }>(
+    `SELECT status, conflict_detected_at FROM visa_submission_queue WHERE id = $1`,
+    [queueId],
+  );
+  return { status: rows[0]?.status ?? '', conflictDetectedAt: rows[0]?.conflict_detected_at ?? null };
+}
+
+async function countConflictAlerts(queueId: string): Promise<number> {
+  const { rows } = await pool.query<{ count: string }>(
+    `SELECT count(*)::text AS count FROM visa_operator_alerts WHERE visa_submission_queue_id = $1 AND alert_type = 'conflict'`,
+    [queueId],
+  );
+  return Number(rows[0]?.count ?? '0');
+}
+
 async function cleanupAll(groupIds: string[], agentIds: string[], identityIds: string[]): Promise<void> {
   // Visa cleanup first -- visa_batch_applicants/visa_batches FK-reference
   // groups(id), which is deleted further down in this same function.
+  // visa_submission_queue (and what it's own FK-referenced by) must be
+  // cleared BEFORE visa_batch_applicants -- Package 5.6's own tests are the
+  // first in this file to create queue rows at all.
   for (const groupId of groupIds) {
+    await pool.query(
+      `DELETE FROM visa_submission_reviews WHERE visa_submission_queue_id IN (
+         SELECT id FROM visa_submission_queue WHERE group_id = $1
+       )`,
+      [groupId],
+    );
+    await pool.query(
+      `DELETE FROM visa_operator_alerts WHERE visa_submission_queue_id IN (
+         SELECT id FROM visa_submission_queue WHERE group_id = $1
+       )`,
+      [groupId],
+    );
+    await pool.query(`DELETE FROM visa_submission_queue WHERE group_id = $1`, [groupId]);
+    await pool.query(`DELETE FROM visa_submission_attempts WHERE batch_id IN (SELECT id FROM visa_batches WHERE group_id = $1)`, [
+      groupId,
+    ]);
     await pool.query(`DELETE FROM visa_batch_applicants WHERE group_id = $1`, [groupId]);
     await pool.query(`DELETE FROM visa_batches WHERE group_id = $1`, [groupId]);
   }
@@ -938,6 +1010,243 @@ test('move_to_group with a remaining duplicate promoted as replacement ALSO reti
 
     const canonicalInSource = await findActiveCanonicalLink(identity.id, fromGroupId);
     assert.equal(canonicalInSource?.id, remainingLink.id, 'the remaining duplicate still correctly becomes fromGroup\'s new canonical');
+  } finally {
+    await cleanupAll([fromGroupId, toGroupId], [agentId], [identity.id]);
+  }
+});
+
+// Package 5.6: cancel_passport/remove_from_group/move_to_group must now
+// detect (and alert on) a SUBMITTING conflict exactly like
+// cancelWithConflictCheck already does for the direct /visa_stop_applicant
+// path, and must leave a PENDING queue row completely untouched.
+
+test('cancel_passport retires a PENDING assignment without touching the queue row, and without raising any conflict alert', async () => {
+  const groupId = await createGroup();
+  const agentId = await createAgent();
+  const messageId = await createMessage(groupId, agentId);
+  await createOcrResult(messageId);
+  const identity = await createPassportIdentity(uniquePassportNumber(), '1990-01-01');
+  assert.ok(identity);
+  await createPassportMessageLink({
+    passportIdentityId: identity.id,
+    telegramMessageId: messageId,
+    groupId,
+    agentId,
+    role: 'canonical',
+    matchConfidenceTier: 'new_identity',
+  });
+  const { assignmentId, queueId } = await createVisaAssignmentWithQueue(groupId, identity.id, 'PENDING');
+
+  try {
+    const command = await createCancelOrRemoveCommand({
+      commandType: 'cancel_passport',
+      passportIdentityId: identity.id,
+      groupId,
+      telegramMessageId: messageId,
+      operatorId: 'operator-1',
+    });
+    const { deps } = fakeDeps();
+    await processPassportOperatorCommand(command.id, deps);
+
+    assert.equal(await getVisaAssignmentStatus(assignmentId), 'cancelled');
+    const queue = await getQueueStatusAndConflict(queueId);
+    assert.equal(queue.status, 'PENDING', 'the queue row itself must be left untouched');
+    assert.equal(queue.conflictDetectedAt, null);
+    assert.equal(await countConflictAlerts(queueId), 0);
+  } finally {
+    await cleanupAll([groupId], [agentId], [identity.id]);
+  }
+});
+
+test('cancel_passport retires a SUBMITTING assignment and raises exactly one conflict alert', async () => {
+  const groupId = await createGroup();
+  const agentId = await createAgent();
+  const messageId = await createMessage(groupId, agentId);
+  await createOcrResult(messageId);
+  const identity = await createPassportIdentity(uniquePassportNumber(), '1990-01-01');
+  assert.ok(identity);
+  await createPassportMessageLink({
+    passportIdentityId: identity.id,
+    telegramMessageId: messageId,
+    groupId,
+    agentId,
+    role: 'canonical',
+    matchConfidenceTier: 'new_identity',
+  });
+  const { assignmentId, queueId } = await createVisaAssignmentWithQueue(groupId, identity.id, 'SUBMITTING');
+
+  try {
+    const command = await createCancelOrRemoveCommand({
+      commandType: 'cancel_passport',
+      passportIdentityId: identity.id,
+      groupId,
+      telegramMessageId: messageId,
+      operatorId: 'operator-1',
+    });
+    const { deps } = fakeDeps();
+    await processPassportOperatorCommand(command.id, deps);
+
+    assert.equal(await getVisaAssignmentStatus(assignmentId), 'cancelled', 'cancellation proceeds regardless of the conflict');
+    const queue = await getQueueStatusAndConflict(queueId);
+    assert.equal(queue.status, 'SUBMITTING', 'an in-flight submission must never be reset');
+    assert.ok(queue.conflictDetectedAt, 'conflict_detected_at must be set');
+    assert.equal(await countConflictAlerts(queueId), 1, 'exactly one durable conflict alert must be recorded');
+  } finally {
+    await cleanupAll([groupId], [agentId], [identity.id]);
+  }
+});
+
+test('remove_from_group retires a PENDING assignment without touching the queue row, and without raising any conflict alert', async () => {
+  const groupId = await createGroup();
+  const agentId = await createAgent();
+  const messageId = await createMessage(groupId, agentId);
+  await createOcrResult(messageId);
+  const identity = await createPassportIdentity(uniquePassportNumber(), '1990-01-01');
+  assert.ok(identity);
+  await createPassportMessageLink({
+    passportIdentityId: identity.id,
+    telegramMessageId: messageId,
+    groupId,
+    agentId,
+    role: 'canonical',
+    matchConfidenceTier: 'new_identity',
+  });
+  const { assignmentId, queueId } = await createVisaAssignmentWithQueue(groupId, identity.id, 'PENDING');
+
+  try {
+    const command = await createCancelOrRemoveCommand({
+      commandType: 'remove_from_group',
+      passportIdentityId: identity.id,
+      groupId,
+      telegramMessageId: messageId,
+      operatorId: 'operator-1',
+    });
+    const { deps } = fakeDeps();
+    await processPassportOperatorCommand(command.id, deps);
+
+    assert.equal(await getVisaAssignmentStatus(assignmentId), 'removed');
+    const queue = await getQueueStatusAndConflict(queueId);
+    assert.equal(queue.status, 'PENDING');
+    assert.equal(queue.conflictDetectedAt, null);
+    assert.equal(await countConflictAlerts(queueId), 0);
+  } finally {
+    await cleanupAll([groupId], [agentId], [identity.id]);
+  }
+});
+
+test('remove_from_group retires a SUBMITTING assignment and raises exactly one conflict alert', async () => {
+  const groupId = await createGroup();
+  const agentId = await createAgent();
+  const messageId = await createMessage(groupId, agentId);
+  await createOcrResult(messageId);
+  const identity = await createPassportIdentity(uniquePassportNumber(), '1990-01-01');
+  assert.ok(identity);
+  await createPassportMessageLink({
+    passportIdentityId: identity.id,
+    telegramMessageId: messageId,
+    groupId,
+    agentId,
+    role: 'canonical',
+    matchConfidenceTier: 'new_identity',
+  });
+  const { assignmentId, queueId } = await createVisaAssignmentWithQueue(groupId, identity.id, 'SUBMITTING');
+
+  try {
+    const command = await createCancelOrRemoveCommand({
+      commandType: 'remove_from_group',
+      passportIdentityId: identity.id,
+      groupId,
+      telegramMessageId: messageId,
+      operatorId: 'operator-1',
+    });
+    const { deps } = fakeDeps();
+    await processPassportOperatorCommand(command.id, deps);
+
+    assert.equal(await getVisaAssignmentStatus(assignmentId), 'removed');
+    const queue = await getQueueStatusAndConflict(queueId);
+    assert.equal(queue.status, 'SUBMITTING');
+    assert.ok(queue.conflictDetectedAt);
+    assert.equal(await countConflictAlerts(queueId), 1);
+  } finally {
+    await cleanupAll([groupId], [agentId], [identity.id]);
+  }
+});
+
+test('move_to_group retires a PENDING origin-group assignment without touching the queue row, and without raising any conflict alert', async () => {
+  const fromGroupId = await createGroup();
+  const toGroupId = await createGroup();
+  const agentId = await createAgent();
+  const messageId = await createMessage(fromGroupId, agentId);
+  await createOcrResult(messageId);
+  const identity = await createPassportIdentity(uniquePassportNumber(), '1990-01-01');
+  assert.ok(identity);
+  const link = await createPassportMessageLink({
+    passportIdentityId: identity.id,
+    telegramMessageId: messageId,
+    groupId: fromGroupId,
+    agentId,
+    role: 'canonical',
+    matchConfidenceTier: 'new_identity',
+  });
+  assert.ok(link);
+  const { assignmentId, queueId } = await createVisaAssignmentWithQueue(fromGroupId, identity.id, 'PENDING');
+
+  try {
+    const command = await createMoveToGroupCommand({
+      passportIdentityId: identity.id,
+      fromGroupId,
+      toGroupId,
+      telegramMessageId: messageId,
+      operatorId: 'operator-1',
+    });
+    const { deps } = fakeDeps();
+    await processPassportOperatorCommand(command.id, deps);
+
+    assert.equal(await getVisaAssignmentStatus(assignmentId), 'removed');
+    const queue = await getQueueStatusAndConflict(queueId);
+    assert.equal(queue.status, 'PENDING');
+    assert.equal(queue.conflictDetectedAt, null);
+    assert.equal(await countConflictAlerts(queueId), 0);
+  } finally {
+    await cleanupAll([fromGroupId, toGroupId], [agentId], [identity.id]);
+  }
+});
+
+test('move_to_group retires a SUBMITTING origin-group assignment and raises exactly one conflict alert', async () => {
+  const fromGroupId = await createGroup();
+  const toGroupId = await createGroup();
+  const agentId = await createAgent();
+  const messageId = await createMessage(fromGroupId, agentId);
+  await createOcrResult(messageId);
+  const identity = await createPassportIdentity(uniquePassportNumber(), '1990-01-01');
+  assert.ok(identity);
+  const link = await createPassportMessageLink({
+    passportIdentityId: identity.id,
+    telegramMessageId: messageId,
+    groupId: fromGroupId,
+    agentId,
+    role: 'canonical',
+    matchConfidenceTier: 'new_identity',
+  });
+  assert.ok(link);
+  const { assignmentId, queueId } = await createVisaAssignmentWithQueue(fromGroupId, identity.id, 'SUBMITTING');
+
+  try {
+    const command = await createMoveToGroupCommand({
+      passportIdentityId: identity.id,
+      fromGroupId,
+      toGroupId,
+      telegramMessageId: messageId,
+      operatorId: 'operator-1',
+    });
+    const { deps } = fakeDeps();
+    await processPassportOperatorCommand(command.id, deps);
+
+    assert.equal(await getVisaAssignmentStatus(assignmentId), 'removed', 'the move proceeds regardless of the conflict');
+    const queue = await getQueueStatusAndConflict(queueId);
+    assert.equal(queue.status, 'SUBMITTING', 'an in-flight submission must never be reset by a move');
+    assert.ok(queue.conflictDetectedAt);
+    assert.equal(await countConflictAlerts(queueId), 1);
   } finally {
     await cleanupAll([fromGroupId, toGroupId], [agentId], [identity.id]);
   }

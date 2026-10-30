@@ -1,5 +1,6 @@
+import { pool } from '../db/pool.js';
 import {
-  createPassportIdentity,
+  createPassportIdentityWithClient,
   findPassportIdentityByKey,
   type PassportIdentityRecord,
 } from '../db/repositories/passportIdentity.repo.js';
@@ -11,7 +12,7 @@ import {
   type PassportLinkRole,
 } from '../db/repositories/passportMessageLinks.repo.js';
 import { createDuplicateReview, findDuplicateReviewByCandidateMessageId } from '../db/repositories/duplicateReviews.repo.js';
-import { recordPassportIdentityEvent } from '../db/repositories/passportIdentityEvents.repo.js';
+import { recordPassportIdentityEvent, recordPassportIdentityEventWithClient } from '../db/repositories/passportIdentityEvents.repo.js';
 import type { OcrConfidenceLevel, PassportOcrResultRecord } from '../db/repositories/passportOcrResult.repo.js';
 import { normalizePassportNumber } from './normalizePassportNumber.js';
 import { resolvePassportIdentity } from './resolvePassportIdentity.js';
@@ -52,8 +53,19 @@ export async function resolveAndLinkIdentity(input: ResolveAndLinkIdentityInput)
     return { kind: 'ALREADY_RESOLVED', role: existingLink.role };
   }
 
+  // Any existing review for this candidate -- pending OR already resolved --
+  // must short-circuit here. A resolved review's OWN status (confirmed_duplicate/
+  // confirmed_distinct) is not 'pending' any more, so checking only for
+  // 'pending' would let a later reprocessing of this same message (e.g. a
+  // retry that finds passport_ocr_results already saved, see
+  // performPassportOcr.ts) fall through and open a SECOND duplicate_reviews
+  // row for an already-decided candidate -- idx_duplicate_reviews_one_pending_per_candidate
+  // only guards against a second row while one is still 'pending', it does
+  // NOT guard against re-opening one that was already resolved. Re-opening a
+  // resolved review is, by design, now only possible through a separate,
+  // explicit operator action -- never through this reprocessing path.
   const existingReview = await findDuplicateReviewByCandidateMessageId(input.telegramMessageId);
-  if (existingReview && existingReview.status === 'pending') {
+  if (existingReview) {
     return { kind: 'REVIEW' };
   }
 
@@ -76,14 +88,12 @@ export async function resolveAndLinkIdentity(input: ResolveAndLinkIdentityInput)
   );
 
   if (decision.outcome === 'NEW_IDENTITY') {
-    const identity = await findOrCreateIdentity(normalizedPassportNumber, input.dateOfBirth.value);
-    await recordPassportIdentityEvent({
-      passportIdentityId: identity.id,
-      eventType: 'identity_created',
-      groupId: input.groupId,
-      relatedTelegramMessageId: input.telegramMessageId,
-      actor: 'system',
-    });
+    const identity = await findOrCreateIdentity(
+      normalizedPassportNumber,
+      input.dateOfBirth.value,
+      input.groupId,
+      input.telegramMessageId,
+    );
     const link = await createPassportMessageLink({
       passportIdentityId: identity.id,
       telegramMessageId: input.telegramMessageId,
@@ -165,12 +175,56 @@ export async function resolveAndLinkIdentity(input: ResolveAndLinkIdentityInput)
   return { kind: 'REVIEW' };
 }
 
-/** Race-safe find-or-create, same pattern as ensureGroupSheet.ts's handling of groups.google_sheet_id. */
-async function findOrCreateIdentity(normalizedPassportNumber: string, dateOfBirth: string): Promise<PassportIdentityRecord> {
-  const created = await createPassportIdentity(normalizedPassportNumber, dateOfBirth);
+/**
+ * Race-safe find-or-create, same pattern as ensureGroupSheet.ts's handling
+ * of groups.google_sheet_id -- except the identity row and its
+ * identity_created audit event are now written atomically, in one
+ * transaction: a crash or error between them must never leave the identity
+ * committed with no record of how it got there (a permanently missing
+ * event), and a losing concurrent caller must never write a second,
+ * incorrect identity_created event for the winner's row (a duplicate
+ * event for an identity it did not create).
+ *
+ * `created` (non-null) is THIS call's own, atomic signal that its own
+ * INSERT (via createPassportIdentityWithClient, inside the same
+ * transaction) is what produced the row -- a losing caller's INSERT
+ * always returns null here (ON CONFLICT DO NOTHING), so it never
+ * (re)writes the event; it only ever falls through to the plain,
+ * post-transaction findPassportIdentityByKey read below to pick up the
+ * winner's row.
+ */
+async function findOrCreateIdentity(
+  normalizedPassportNumber: string,
+  dateOfBirth: string,
+  groupId: string,
+  relatedTelegramMessageId: string,
+): Promise<PassportIdentityRecord> {
+  const client = await pool.connect();
+  let created: PassportIdentityRecord | null;
+  try {
+    await client.query('BEGIN');
+    created = await createPassportIdentityWithClient(client, normalizedPassportNumber, dateOfBirth);
+    if (created) {
+      await recordPassportIdentityEventWithClient(client, {
+        passportIdentityId: created.id,
+        eventType: 'identity_created',
+        groupId,
+        relatedTelegramMessageId,
+        actor: 'system',
+      });
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+
   if (created) {
     return created;
   }
+
   const winner = await findPassportIdentityByKey(normalizedPassportNumber, dateOfBirth);
   if (!winner) {
     throw new Error(

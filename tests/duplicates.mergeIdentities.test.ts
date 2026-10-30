@@ -12,6 +12,8 @@ import { listEventsForIdentity } from '../src/db/repositories/passportIdentityEv
 import { findReconciliationJobsForIdentityGroup } from '../src/db/repositories/sheetReconciliation.repo.js';
 import { mergeIdentitiesTransaction } from '../src/duplicates/applyIdentityStateChange.js';
 import { mergeIdentities, type MergeIdentitiesDependencies } from '../src/duplicates/mergeIdentities.js';
+import { createVisaBatch, createVisaBatchAssignment } from '../src/db/repositories/visaBatches.repo.js';
+import { claimForSubmission, createQueueForBatch, createSubmissionAttempt } from '../src/db/repositories/visaSubmissionQueue.repo.js';
 
 let idCounter = 0;
 function uniqueChatId(): number {
@@ -95,6 +97,24 @@ async function createOcrResult(
 }
 
 async function cleanupAll(groupIds: string[], agentIds: string[], identityIds: string[]): Promise<void> {
+  // Visa cleanup first -- visa_submission_queue (and what FK-references it)
+  // must be cleared before visa_batch_applicants, which must be cleared
+  // before groups. Package 5.6's own tests are the first in this file to
+  // create any visa fixtures at all.
+  for (const groupId of groupIds) {
+    await pool.query(
+      `DELETE FROM visa_operator_alerts WHERE visa_submission_queue_id IN (
+         SELECT id FROM visa_submission_queue WHERE group_id = $1
+       )`,
+      [groupId],
+    );
+    await pool.query(`DELETE FROM visa_submission_queue WHERE group_id = $1`, [groupId]);
+    await pool.query(`DELETE FROM visa_submission_attempts WHERE batch_id IN (SELECT id FROM visa_batches WHERE group_id = $1)`, [
+      groupId,
+    ]);
+    await pool.query(`DELETE FROM visa_batch_applicants WHERE group_id = $1`, [groupId]);
+    await pool.query(`DELETE FROM visa_batches WHERE group_id = $1`, [groupId]);
+  }
   for (const identityId of identityIds) {
     await pool.query(`DELETE FROM sheet_reconciliation_jobs WHERE passport_identity_id = $1`, [identityId]);
     await pool.query(`DELETE FROM passport_message_links WHERE passport_identity_id = $1`, [identityId]);
@@ -114,6 +134,57 @@ async function cleanupAll(groupIds: string[], agentIds: string[], identityIds: s
   for (const identityId of identityIds) {
     await pool.query(`DELETE FROM passport_identity WHERE id = $1`, [identityId]);
   }
+}
+
+/** Creates one active visa_batch_applicants assignment AND its visa_submission_queue row (optionally claimed into SUBMITTING) for (groupId, identityId) -- the Package 5.6 merge-retirement tests below need a real queue row, not just a bare assignment. */
+async function createVisaAssignmentWithQueue(
+  groupId: string,
+  identityId: string,
+  queueStatus: 'PENDING' | 'SUBMITTING',
+): Promise<{ assignmentId: string; queueId: string }> {
+  const batch = await createVisaBatch({ groupId, portal: 'visitsaudi', batchNumber: 1, batchName: 'test-batch-1' });
+  const result = await createVisaBatchAssignment({
+    batchId: batch.id,
+    groupId,
+    passportIdentityId: identityId,
+    portal: 'visitsaudi',
+    positionInBatch: 1,
+  });
+  assert.equal(result.outcome, 'inserted');
+  if (result.outcome !== 'inserted') throw new Error('unreachable');
+
+  const attempt = await createSubmissionAttempt(batch.id, 'operator:test');
+  const created = await createQueueForBatch(batch.id, attempt.id);
+  const queueRow = created?.[0];
+  assert.ok(queueRow);
+
+  if (queueStatus === 'SUBMITTING') {
+    const claimed = await claimForSubmission(queueRow.id);
+    assert.ok(claimed);
+  }
+
+  return { assignmentId: result.assignment.id, queueId: queueRow.id };
+}
+
+async function getVisaAssignmentStatus(assignmentId: string): Promise<string | null> {
+  const { rows } = await pool.query<{ status: string }>(`SELECT status FROM visa_batch_applicants WHERE id = $1`, [assignmentId]);
+  return rows[0]?.status ?? null;
+}
+
+async function getQueueStatusAndConflict(queueId: string): Promise<{ status: string; conflictDetectedAt: string | null }> {
+  const { rows } = await pool.query<{ status: string; conflict_detected_at: string | null }>(
+    `SELECT status, conflict_detected_at FROM visa_submission_queue WHERE id = $1`,
+    [queueId],
+  );
+  return { status: rows[0]?.status ?? '', conflictDetectedAt: rows[0]?.conflict_detected_at ?? null };
+}
+
+async function countConflictAlerts(queueId: string): Promise<number> {
+  const { rows } = await pool.query<{ count: string }>(
+    `SELECT count(*)::text AS count FROM visa_operator_alerts WHERE visa_submission_queue_id = $1 AND alert_type = 'conflict'`,
+    [queueId],
+  );
+  return Number(rows[0]?.count ?? '0');
 }
 
 function fakeDeps(overrides: Partial<MergeIdentitiesDependencies> = {}): { deps: MergeIdentitiesDependencies } {
@@ -487,5 +558,125 @@ test('mergeIdentities writes exactly ONE identity_merged event, on the survivor'
     assert.equal(jobsA.length + jobsB.length, 0, 'no same-group conflict -- no reconciliation job, and exactly one merge event regardless');
   } finally {
     await cleanupAll([groupA, groupB], [agentId], [identityA.id, identityB.id]);
+  }
+});
+
+// Package 5.6: mergeIdentitiesTransaction must now also retire the LOSER
+// identity's active visa assignments, across EVERY group it holds one in
+// (not just the group its canonical link happens to be in), detecting and
+// alerting on a SUBMITTING conflict exactly like cancelWithConflictCheck
+// already does -- without ever letting a conflict abort the merge itself.
+
+test(
+  'mergeIdentitiesTransaction retires the LOSER identity\'s active visa assignments across every group it holds one in -- ' +
+    'PENDING left untouched (no alert), SUBMITTING flagged as a conflict (one alert) -- and the merge itself still succeeds',
+  async () => {
+    const groupA = await createGroup();
+    const groupB = await createGroup();
+    const groupC = await createGroup();
+    const agentId = await createAgent();
+    const weakMessage = await createMessage(groupA, agentId);
+    const strongMessage = await createMessage(groupB, agentId);
+    await createOcrResult(weakMessage, 'medium', 'medium');
+    await createOcrResult(strongMessage, 'high', 'high');
+
+    const weakIdentity = await createPassportIdentity(uniquePassportNumber(), '1990-01-01');
+    const strongIdentity = await createPassportIdentity(uniquePassportNumber(), '1990-02-02');
+    assert.ok(weakIdentity);
+    assert.ok(strongIdentity);
+    await createPassportMessageLink({
+      passportIdentityId: weakIdentity.id,
+      telegramMessageId: weakMessage,
+      groupId: groupA,
+      agentId,
+      role: 'canonical',
+      matchConfidenceTier: 'review',
+      resolvedBy: 'operator',
+    });
+    await createPassportMessageLink({
+      passportIdentityId: strongIdentity.id,
+      telegramMessageId: strongMessage,
+      groupId: groupB,
+      agentId,
+      role: 'canonical',
+      matchConfidenceTier: 'new_identity',
+    });
+
+    // The LOSER-to-be (weakIdentity) holds active visa assignments in TWO
+    // DIFFERENT groups -- groupA (its own link's group) and groupC (a group
+    // it has no passport_message_link in at all, proving the new
+    // retirement call is driven purely by passport_identity_id, never by
+    // link data).
+    const { assignmentId: assignmentA, queueId: queueA } = await createVisaAssignmentWithQueue(groupA, weakIdentity.id, 'PENDING');
+    const { assignmentId: assignmentC, queueId: queueC } = await createVisaAssignmentWithQueue(groupC, weakIdentity.id, 'SUBMITTING');
+
+    try {
+      const { deps } = fakeDeps();
+      const result = await mergeIdentities(weakIdentity.id, strongIdentity.id, 'operator-1', deps);
+      assert.equal(result.loserId, weakIdentity.id, 'this test is only meaningful if weakIdentity is indeed selected as the loser');
+
+      const loser = await findPassportIdentityById(weakIdentity.id);
+      assert.equal(loser?.status, 'merged');
+
+      assert.equal(await getVisaAssignmentStatus(assignmentA), 'removed');
+      const queueAState = await getQueueStatusAndConflict(queueA);
+      assert.equal(queueAState.status, 'PENDING', 'a PENDING queue row must be left untouched by retirement');
+      assert.equal(queueAState.conflictDetectedAt, null);
+      assert.equal(await countConflictAlerts(queueA), 0);
+
+      assert.equal(await getVisaAssignmentStatus(assignmentC), 'removed', 'retirement proceeds regardless of the conflict');
+      const queueCState = await getQueueStatusAndConflict(queueC);
+      assert.equal(queueCState.status, 'SUBMITTING', 'an in-flight submission must never be reset by a merge');
+      assert.ok(queueCState.conflictDetectedAt);
+      assert.equal(await countConflictAlerts(queueC), 1, 'exactly one durable conflict alert must be recorded');
+
+      // The merge's own, already-audited behavior is unaffected by the new
+      // retirement step.
+      const survivorEvents = await listEventsForIdentity(strongIdentity.id);
+      assert.equal(survivorEvents.filter((e) => e.eventType === 'identity_merged').length, 1);
+    } finally {
+      await cleanupAll([groupA, groupB, groupC], [agentId], [weakIdentity.id, strongIdentity.id]);
+    }
+  },
+);
+
+test('mergeIdentitiesTransaction: a real SQL error (bad reconciliation-job FK) rolls back the WHOLE merge, including the loser\'s visa assignment retirement', async () => {
+  const groupId = await createGroup();
+  const agentId = await createAgent();
+  const survivorIdentity = await createPassportIdentity(uniquePassportNumber(), '1990-01-01');
+  const loserIdentity = await createPassportIdentity(uniquePassportNumber(), '1990-02-02');
+  assert.ok(survivorIdentity);
+  assert.ok(loserIdentity);
+  const { assignmentId, queueId } = await createVisaAssignmentWithQueue(groupId, loserIdentity.id, 'PENDING');
+
+  try {
+    await assert.rejects(() =>
+      mergeIdentitiesTransaction({
+        survivorId: survivorIdentity.id,
+        loserId: loserIdentity.id,
+        linkPlans: [],
+        // A telegram_message_id that does not exist -- sheet_reconciliation_jobs'
+        // own FK (migrations/0022_create_sheet_reconciliation_jobs.sql)
+        // rejects this, forcing a genuine SQL error AFTER the new
+        // retirement call (see mergeIdentitiesTransaction's own statement
+        // order) but before COMMIT -- without touching any production
+        // code to force it.
+        staleSheetRows: [{ groupId, telegramMessageId: '00000000-0000-0000-0000-000000000000' }],
+        operatorId: 'operator-1',
+      }),
+    );
+
+    const loserAfter = await findPassportIdentityById(loserIdentity.id);
+    assert.notEqual(loserAfter?.status, 'merged', 'the ENTIRE transaction must have rolled back, not just the failing statement');
+
+    assert.equal(
+      await getVisaAssignmentStatus(assignmentId),
+      'active',
+      'the visa assignment retirement (which succeeded earlier in the SAME transaction) must also be rolled back',
+    );
+    const queueState = await getQueueStatusAndConflict(queueId);
+    assert.equal(queueState.status, 'PENDING');
+  } finally {
+    await cleanupAll([groupId], [agentId], [survivorIdentity.id, loserIdentity.id]);
   }
 });

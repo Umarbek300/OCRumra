@@ -2,7 +2,7 @@ import { pool } from '../db/pool.js';
 import type { PassportLinkStatus } from '../db/repositories/passportMessageLinks.repo.js';
 import type { PassportIdentityEventType } from '../db/repositories/passportIdentityEvents.repo.js';
 import { insertReconciliationJobWithClient } from '../db/repositories/sheetReconciliation.repo.js';
-import { updateActiveAssignmentsStatusWithClient } from '../db/repositories/visaBatches.repo.js';
+import { retireAllActiveAssignmentsForIdentityWithClient, updateActiveAssignmentsStatusWithClient } from '../db/repositories/visaBatches.repo.js';
 
 export interface RetireAndPromoteInput {
   oldCanonicalLinkId: string;
@@ -241,6 +241,20 @@ export interface MergeIdentitiesInput {
  * Also enqueues one sheet_reconciliation_jobs row per staleSheetRows entry
  * IN THIS SAME transaction — the caller no longer makes any direct Sheets
  * call at all for the merge's conflict-resolution cleanup.
+ *
+ * Package 5.6 (Package 5.5's own audit + its "M1: retire" business
+ * decision): also retires every ACTIVE visa assignment the LOSER identity
+ * holds, across every group, via retireAllActiveAssignmentsForIdentityWithClient
+ * -- in this SAME transaction, so a crash right after COMMIT can never
+ * leave a merged-away (now defunct) identity still "active" in a visa
+ * batch. A detected conflict (the loser's submission was SUBMITTING) is
+ * recorded as a durable operator alert but NEVER aborts the merge itself
+ * -- identity consolidation and an unrelated, in-flight visa submission
+ * are deliberately independent concerns, exactly as cancelWithConflictCheck
+ * already treats them for a plain cancellation. The survivor never
+ * automatically gets a new assignment; an operator who wants the survivor
+ * batched in that group runs /visa_assign explicitly afterward, the same
+ * discipline MOVE_TO_GROUP's own hook already follows.
  */
 export async function mergeIdentitiesTransaction(input: MergeIdentitiesInput): Promise<void> {
   const client = await pool.connect();
@@ -263,6 +277,8 @@ export async function mergeIdentitiesTransaction(input: MergeIdentitiesInput): P
       input.loserId,
       input.survivorId,
     ]);
+
+    await retireAllActiveAssignmentsForIdentityWithClient(client, input.loserId, 'removed');
 
     const { rows: mergeEventRows } = await client.query<{ id: string }>(
       `INSERT INTO passport_identity_events (passport_identity_id, event_type, actor, operator_id, detail)

@@ -526,15 +526,33 @@ test('a reconciliation job abandoned mid-processing is recovered and successfull
     const jobId = jobs[0]!.id;
 
     await claimReconciliationJob(jobId); // -> processing, simulating a worker that then crashed before finishing
+    // ocrumra_test_role is not a superuser, so SET (LOCAL) session_replication_role
+    // is denied (that GUC's context is 'superuser' in Postgres, unconditionally).
+    // ALTER TABLE ... DISABLE/ENABLE TRIGGER achieves the same set_updated_at
+    // bypass needing only table ownership (already held), and the inner
+    // try/finally guarantees the trigger is always re-enabled before COMMIT,
+    // even if the UPDATE throws. The outer catch/ROLLBACK (added here) also
+    // ensures that if anything still throws, this connection is handed back
+    // to the pool clean rather than mid-transaction -- a dirty connection
+    // left in the pool would otherwise poison the NEXT, unrelated query that
+    // happens to reuse it (which is exactly how this previously surfaced as
+    // an unrelated "current transaction is aborted" failure in cleanup).
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query('SET LOCAL session_replication_role = replica');
-      await client.query(`UPDATE sheet_reconciliation_jobs SET updated_at = now() - ($2 * interval '1 minute') WHERE id = $1`, [
-        jobId,
-        STALE_RECONCILIATION_TIMEOUT_MINUTES + 1,
-      ]);
+      await client.query('ALTER TABLE sheet_reconciliation_jobs DISABLE TRIGGER sheet_reconciliation_jobs_set_updated_at');
+      try {
+        await client.query(`UPDATE sheet_reconciliation_jobs SET updated_at = now() - ($2 * interval '1 minute') WHERE id = $1`, [
+          jobId,
+          STALE_RECONCILIATION_TIMEOUT_MINUTES + 1,
+        ]);
+      } finally {
+        await client.query('ALTER TABLE sheet_reconciliation_jobs ENABLE TRIGGER sheet_reconciliation_jobs_set_updated_at');
+      }
       await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
     } finally {
       client.release();
     }

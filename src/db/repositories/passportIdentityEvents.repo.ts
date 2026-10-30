@@ -1,3 +1,4 @@
+import type { PoolClient } from 'pg';
 import { pool } from '../pool.js';
 
 export type PassportIdentityEventType =
@@ -101,6 +102,41 @@ export async function recordPassportIdentityEvent(
   const row = rows[0];
   if (!row) {
     throw new Error('recordPassportIdentityEvent: insert unexpectedly returned no row');
+  }
+  return mapRow(row);
+}
+
+/**
+ * Same INSERT as recordPassportIdentityEvent, but runs on a caller-supplied
+ * transaction client -- for the one case (identity creation) where this
+ * event must commit or roll back atomically together with the row it
+ * describes. See resolveAndLinkIdentity.ts's findOrCreateIdentity.
+ * recordPassportIdentityEvent itself is untouched; every other event type
+ * keeps using it exactly as before.
+ */
+export async function recordPassportIdentityEventWithClient(
+  client: PoolClient,
+  input: RecordPassportIdentityEventInput,
+): Promise<PassportIdentityEventRecord> {
+  const boundedDetail = input.detail ? input.detail.slice(0, MAX_DETAIL_LENGTH) : null;
+  const { rows } = await client.query<PassportIdentityEventRow>(
+    `INSERT INTO passport_identity_events (
+       passport_identity_id, event_type, group_id, related_telegram_message_id, actor, operator_id, detail
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7)
+     RETURNING ${SELECT_COLUMNS}`,
+    [
+      input.passportIdentityId,
+      input.eventType,
+      input.groupId ?? null,
+      input.relatedTelegramMessageId ?? null,
+      input.actor,
+      input.operatorId ?? null,
+      boundedDetail,
+    ],
+  );
+  const row = rows[0];
+  if (!row) {
+    throw new Error('recordPassportIdentityEventWithClient: insert unexpectedly returned no row');
   }
   return mapRow(row);
 }
