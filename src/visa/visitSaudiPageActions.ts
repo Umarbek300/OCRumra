@@ -292,11 +292,21 @@ export const CONFIRMED_APPLYING_ON_BEHALF_OF_SOMEONE_ELSE_ANSWER = 'YES' as cons
  * 'YES'/'NO' answer (CONFIRMED_APPLYING_ON_BEHALF_OF_SOMEONE_ELSE_ANSWER,
  * unchanged) to the real, confirmed DOM text -- nothing about the
  * business answer itself changes, only how it is matched on screen.
+ *
+ * SECOND real-run finding: a page-wide exact-text search for "Yes" hit a
+ * Playwright strict-mode violation (correctly refusing to click either
+ * one rather than guessing) -- the real page ALSO has an unrelated
+ * `<button id="btnExtend" ...>Yes</button>` elsewhere. Playwright's own
+ * error output named the fix: the real "applying on behalf" label lives
+ * inside `#formPersonalInfo` (confirmed by that same error's own
+ * `locator('#formPersonalInfo').getByText('Yes')` resolution hint, not
+ * invented), so the search is scoped to that real, confirmed container,
+ * never page-wide.
  */
 const DOM_LABEL_FOR_ON_BEHALF_ANSWER: Record<'YES' | 'NO', string> = { YES: 'Yes', NO: 'No' };
 
 export async function answerApplyingOnBehalfOfSomeoneElse(page: Page, answer: 'YES' | 'NO'): Promise<void> {
-  await page.getByText(DOM_LABEL_FOR_ON_BEHALF_ANSWER[answer], { exact: true }).click();
+  await page.locator('#formPersonalInfo').getByText(DOM_LABEL_FOR_ON_BEHALF_ANSWER[answer], { exact: true }).click();
 }
 
 /**

@@ -98,8 +98,10 @@ after(async () => {
 /** Same Page 3 fixture shape as visa.startVisitSaudiBatchSubmission.test.ts's own setBatchFixture -- deliberately not re-derived differently. */
 async function setApplicantFixture(page: import('playwright').Page): Promise<void> {
   await page.setContent(`
-    <button onclick="window.__saveClickLog.push('onBehalf:YES')">Yes</button>
-    <button onclick="window.__saveClickLog.push('onBehalf:NO')">No</button>
+    <div id="formPersonalInfo">
+      <button onclick="window.__saveClickLog.push('onBehalf:YES')">Yes</button>
+      <button onclick="window.__saveClickLog.push('onBehalf:NO')">No</button>
+    </div>
     <button id="uploadBtn">UPLOAD FILE</button>
     <input type="file" id="fileInput" style="display:none" />
 

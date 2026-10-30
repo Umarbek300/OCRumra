@@ -95,8 +95,11 @@ after(async () => {
  */
 async function setApplicantPageFixture(): Promise<void> {
   await page.setContent(`
-    <button onclick="window.__onBehalfClicked = 'YES'">Yes</button>
-    <button onclick="window.__onBehalfClicked = 'NO'">No</button>
+    <div id="formPersonalInfo">
+      <button onclick="window.__onBehalfClicked = 'YES'">Yes</button>
+      <button onclick="window.__onBehalfClicked = 'NO'">No</button>
+    </div>
+    <button id="btnExtend" onclick="window.__btnExtendClicked = true">Yes</button>
 
     <button id="uploadBtn">UPLOAD FILE</button>
     <input type="file" id="fileInput" style="display:none" />
@@ -506,6 +509,9 @@ test('Page3->Page4 trigger fix: submitApplicant answers the on-behalf question, 
 
   const onBehalfClicked = await page.evaluate(() => (globalThis as unknown as { __onBehalfClicked?: string }).__onBehalfClicked);
   assert.equal(onBehalfClicked, 'YES', 'the confirmed YES answer must have been clicked, before anything else');
+
+  const btnExtendClicked = await page.evaluate(() => (globalThis as unknown as { __btnExtendClicked?: boolean }).__btnExtendClicked);
+  assert.equal(btnExtendClicked, undefined, 'the unrelated #btnExtend "Yes" button (a real decoy caught by this project\'s own real-run testing) must never be clicked');
 
   // Byte-level upload correctness is already proven by
   // uploadApplicantPortraitFromUrl's own dedicated test
