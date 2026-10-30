@@ -458,26 +458,30 @@ const CALENDAR_MONTH_ABBREVIATIONS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
  * is stable and is built directly from the same ISO date this function
  * is given, reformatted with a month abbreviation.
  *
- * Opens the widget by clicking the real field (confirmed clickable:
- * `style="cursor: pointer;"`), selects the year by its OPTION LABEL
- * (never the value string, which depends on whatever month happens to
- * be currently selected), then the month the same way, then clicks the
- * day `<a>` matching the confirmed title-suffix pattern. Scoped to
- * whichever such elements are currently VISIBLE, not a guessed
+ * Opens the widget by clicking the real field directly by its confirmed
+ * `id` (confirmed clickable: `style="cursor: pointer;"`) -- NOT by
+ * `getByLabel`: a real automated run proved that association unreliable
+ * for Page 4's own date fields (the click itself resolved without
+ * throwing, but the calendar never appeared -- getByLabel's own
+ * accessible-name matching was never independently confirmed for these
+ * fields, unlike the real, operator-captured `id` each one carries).
+ * Selects the year by its OPTION LABEL (never the value string, which
+ * depends on whatever month happens to be currently selected), then the
+ * month the same way, then clicks the day `<a>` matching the confirmed
+ * title-suffix pattern. The month/year selects and day links are scoped
+ * to whichever such elements are currently VISIBLE, not a guessed
  * container id -- at most one calendar instance is ever open at a time.
  *
- * CONFIRMED directly for `Date of Birth` only. The other four date
- * fields below (Passport Issue/Expiry Date, Expected Date of
- * Arrival/Departure) are INFERRED, not independently confirmed, to use
- * the SAME widget -- same page, same form, same established
- * site-wide-component convention this codebase already relies on
- * elsewhere (e.g. clickNext reused across two distinct Next buttons).
- * If that inference is wrong for any of them, this throws/times out
- * loudly (the day-cell locator simply never resolves) rather than
- * silently writing a wrong date -- the same safe failure mode `.fill()`
- * itself already had.
+ * Real, operator-confirmed `id`s for every one of this file's own five
+ * date fields: `DateOfBirth`, `PassportIssueDate`, `PassportExpiryDate`,
+ * `ExpectedDateOfEntry` (Expected Date of Arrival), `ExpectedDateOfLeave`
+ * (Expected Date of Departure) -- all five independently confirmed to
+ * carry the SAME `is-datepick` widget class and the SAME real calendar
+ * markup (month/year `<select class="datepick-month-year">`, day `<a>`
+ * with the same title pattern) via the operator's own Inspect-element
+ * capture of each, not inferred from Date of Birth alone.
  */
-async function selectDateFromCalendarWidget(page: Page, fieldLabel: string, isoDate: string): Promise<void> {
+async function selectDateFromCalendarWidget(page: Page, fieldId: string, isoDate: string): Promise<void> {
   const match = ISO_DATE_PATTERN.exec(isoDate);
   if (!match) {
     throw new Error(`selectDateFromCalendarWidget: "${isoDate}" is not a valid ISO (YYYY-MM-DD) date`);
@@ -487,7 +491,7 @@ async function selectDateFromCalendarWidget(page: Page, fieldLabel: string, isoD
   const monthIndex = Number(monthStr) - 1;
   const day = Number(dayStr);
 
-  await page.getByLabel(fieldLabel, { exact: false }).click();
+  await page.locator(`#${fieldId}`).click();
   await page.locator('select.datepick-month-year[title="Change the year"]').selectOption({ label: String(year) });
   await page.locator('select.datepick-month-year[title="Change the month"]').selectOption({ label: CALENDAR_MONTH_NAMES[monthIndex] });
   await page.locator(`a[title*="${CALENDAR_MONTH_ABBREVIATIONS[monthIndex]} ${day}, ${year}"]`).click();
@@ -574,7 +578,7 @@ export async function fillApplicantPersonalInfoFields(page: Page, input: VisitSa
   const maritalStatusOption = input.maritalStatus === 'SINGLE' ? 'Single' : 'Married';
   await selectDropdownOptionCaseInsensitive(page.getByLabel('Marital Status', { exact: false }), maritalStatusOption);
 
-  await selectDateFromCalendarWidget(page, 'Date of Birth', input.draft.dateOfBirth);
+  await selectDateFromCalendarWidget(page, 'DateOfBirth', input.draft.dateOfBirth);
 
   await selectDropdownOptionCaseInsensitive(page.getByLabel('Country of Birth', { exact: false }), input.countryOfBirth);
   await page.getByLabel('City of Birth', { exact: false }).fill(input.cityOfBirth);
@@ -848,16 +852,18 @@ export async function fillApplicantTripDetailsFields(page: Page, input: VisitSau
   await selectDropdownOptionCaseInsensitive(page.getByLabel('Passport Type', { exact: false }), CONFIRMED_VISIT_SAUDI_FORM_VALUES.passportType);
   await page.getByLabel('Passport No.', { exact: false }).fill(input.draft.passportNumber);
   await page.getByLabel('Passport Issue Place', { exact: false }).fill(input.countryOfBirth);
-  // CORRECTED (real-run evidence, same finding as Date of Birth above):
-  // these four date fields are INFERRED, not independently confirmed, to
-  // share the SAME readonly calendar-widget convention Date of Birth was
-  // directly proven to use -- see selectDateFromCalendarWidget's own doc
-  // comment for the full reasoning and the confirmed evidence it IS
-  // grounded in.
-  await selectDateFromCalendarWidget(page, 'Passport Issue Date', input.draft.passportIssueDate);
-  await selectDateFromCalendarWidget(page, 'Passport Expiry Date', input.draft.passportExpiryDate);
-  await selectDateFromCalendarWidget(page, 'Expected Date of Arrival', input.expectedDateOfArrival);
-  await selectDateFromCalendarWidget(page, 'Expected Date of Departure', input.expectedDateOfDeparture);
+  // CORRECTED (real-run evidence): the operator's own Inspect-element
+  // capture independently confirms all four of these fields (real ids
+  // PassportIssueDate/PassportExpiryDate/ExpectedDateOfEntry/
+  // ExpectedDateOfLeave) share the SAME real calendar-widget markup
+  // Date of Birth was directly proven to use -- see
+  // selectDateFromCalendarWidget's own doc comment for the full
+  // evidence, including why clicking by real `id` replaced an earlier,
+  // real-run-proven-unreliable getByLabel attempt.
+  await selectDateFromCalendarWidget(page, 'PassportIssueDate', input.draft.passportIssueDate);
+  await selectDateFromCalendarWidget(page, 'PassportExpiryDate', input.draft.passportExpiryDate);
+  await selectDateFromCalendarWidget(page, 'ExpectedDateOfEntry', input.expectedDateOfArrival);
+  await selectDateFromCalendarWidget(page, 'ExpectedDateOfLeave', input.expectedDateOfDeparture);
 
   // This project's own updated rule: ONLY UMRAH is clicked -- see
   // CONFIRMED_VISIT_SAUDI_FORM_VALUES's own doc comment for why LEISURE

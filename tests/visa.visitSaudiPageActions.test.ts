@@ -357,8 +357,8 @@ async function setPersonalInfoFieldsFixture(): Promise<void> {
     <label for="maritalStatus">Marital Status*</label>
     <select id="maritalStatus"><option value="">Select</option><option>Single</option><option>Married</option></select>
 
-    <label for="dateOfBirth">Date of Birth *</label>
-    <input type="text" id="dateOfBirth" readonly style="cursor:pointer" />
+    <label for="DateOfBirth">Date of Birth *</label>
+    <input type="text" id="DateOfBirth" readonly style="cursor:pointer" />
 
     <label for="countryOfBirth">Country of Birth*</label>
     <select id="countryOfBirth"><option value="">Select</option><option>Uzbekistan</option></select>
@@ -376,7 +376,7 @@ async function setPersonalInfoFieldsFixture(): Promise<void> {
     <input type="text" id="residenceCity" />
     <label for="residenceAddress">Address*</label>
     <input type="text" id="residenceAddress" />
-    ${calendarWidgetFixtureHtml(['dateOfBirth'])}
+    ${calendarWidgetFixtureHtml(['DateOfBirth'])}
   `);
 }
 
@@ -419,7 +419,7 @@ test('Package 5.36: fillApplicantPersonalInfoFields fills EVERY Page 3 field, in
       lastName: doc.getElementById('lastName').value,
       gender: doc.getElementById('gender').value,
       maritalStatus: doc.getElementById('maritalStatus').value,
-      dateOfBirth: doc.getElementById('dateOfBirth').value,
+      DateOfBirth: doc.getElementById('DateOfBirth').value,
       countryOfBirth: doc.getElementById('countryOfBirth').value,
       cityOfBirth: doc.getElementById('cityOfBirth').value,
       profession: doc.getElementById('profession').value,
@@ -434,7 +434,7 @@ test('Package 5.36: fillApplicantPersonalInfoFields fills EVERY Page 3 field, in
     lastName: 'Rahimov',
     gender: 'Male',
     maritalStatus: 'Single',
-    dateOfBirth: '05/05/1995',
+    DateOfBirth: '05/05/1995',
     countryOfBirth: 'Uzbekistan',
     cityOfBirth: 'Tashkent',
     profession: 'WORKER',
@@ -476,15 +476,15 @@ async function setTripDetailsFixture(): Promise<void> {
     <input type="text" id="passportNo" />
     <label for="passportIssuePlace">Passport Issue Place (Country or City)*</label>
     <input type="text" id="passportIssuePlace" />
-    <label for="passportIssueDate">Passport Issue Date*</label>
-    <input type="text" id="passportIssueDate" readonly style="cursor:pointer" />
-    <label for="passportExpiryDate">Passport Expiry Date*</label>
-    <input type="text" id="passportExpiryDate" readonly style="cursor:pointer" />
-    <label for="expectedArrival">Expected Date of Arrival*</label>
-    <input type="text" id="expectedArrival" readonly style="cursor:pointer" />
-    <label for="expectedDeparture">Expected Date of Departure*</label>
-    <input type="text" id="expectedDeparture" readonly style="cursor:pointer" />
-    ${calendarWidgetFixtureHtml(['passportIssueDate', 'passportExpiryDate', 'expectedArrival', 'expectedDeparture'])}
+    <label for="PassportIssueDate">Passport Issue Date*</label>
+    <input type="text" id="PassportIssueDate" readonly style="cursor:pointer" />
+    <label for="PassportExpiryDate">Passport Expiry Date*</label>
+    <input type="text" id="PassportExpiryDate" readonly style="cursor:pointer" />
+    <label for="ExpectedDateOfEntry">Expected Date of Arrival*</label>
+    <input type="text" id="ExpectedDateOfEntry" readonly style="cursor:pointer" />
+    <label for="ExpectedDateOfLeave">Expected Date of Departure*</label>
+    <input type="text" id="ExpectedDateOfLeave" readonly style="cursor:pointer" />
+    ${calendarWidgetFixtureHtml(['PassportIssueDate', 'PassportExpiryDate', 'ExpectedDateOfEntry', 'ExpectedDateOfLeave'])}
 
     <p>Additional Purpose of Visit *</p>
     <span id="selectAllLog"></span>
@@ -566,10 +566,10 @@ test('Package [new]: fillApplicantTripDetailsFields fills every evidence-backed 
       passportType: doc.getElementById('passportType').value,
       passportNo: doc.getElementById('passportNo').value,
       passportIssuePlace: doc.getElementById('passportIssuePlace').value,
-      passportIssueDate: doc.getElementById('passportIssueDate').value,
-      passportExpiryDate: doc.getElementById('passportExpiryDate').value,
-      expectedArrival: doc.getElementById('expectedArrival').value,
-      expectedDeparture: doc.getElementById('expectedDeparture').value,
+      PassportIssueDate: doc.getElementById('PassportIssueDate').value,
+      PassportExpiryDate: doc.getElementById('PassportExpiryDate').value,
+      ExpectedDateOfEntry: doc.getElementById('ExpectedDateOfEntry').value,
+      ExpectedDateOfLeave: doc.getElementById('ExpectedDateOfLeave').value,
       hotelName: doc.getElementById('hotelName').value,
       primaryContact: doc.getElementById('primaryContact').value,
       email: doc.getElementById('email').value,
@@ -579,10 +579,10 @@ test('Package [new]: fillApplicantTripDetailsFields fills every evidence-backed 
     passportType: 'Regular Passport',
     passportNo: 'FA8693585',
     passportIssuePlace: 'UZBEKISTAN',
-    passportIssueDate: '12/11/2023',
-    passportExpiryDate: '11/11/2033',
-    expectedArrival: '23/10/2026',
-    expectedDeparture: '28/10/2026',
+    PassportIssueDate: '12/11/2023',
+    PassportExpiryDate: '11/11/2033',
+    ExpectedDateOfEntry: '23/10/2026',
+    ExpectedDateOfLeave: '28/10/2026',
     hotelName: 'EMAAR ELITE HOTEL MAKKA',
     primaryContact: '', // deliberately left untouched -- see this test's own name
     email: 'jamshid@example.test',

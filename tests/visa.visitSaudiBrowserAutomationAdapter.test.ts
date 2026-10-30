@@ -123,8 +123,8 @@ async function setApplicantPageFixture(): Promise<void> {
     <label for="maritalStatus">Marital Status*</label>
     <select id="maritalStatus"><option value="">Select</option><option>Single</option><option>Married</option></select>
 
-    <label for="dateOfBirth">Date of Birth *</label>
-    <input type="text" id="dateOfBirth" readonly style="cursor:pointer" />
+    <label for="DateOfBirth">Date of Birth *</label>
+    <input type="text" id="DateOfBirth" readonly style="cursor:pointer" />
     <div id="calendarPopup" style="display:none">
       <select class="datepick-month-year" title="Change the month"></select>
       <select class="datepick-month-year" title="Change the year"></select>
@@ -170,7 +170,7 @@ async function setApplicantPageFixture(): Promise<void> {
           lastName: byId('lastName'),
           gender: byId('gender'),
           maritalStatus: byId('maritalStatus'),
-          dateOfBirth: byId('dateOfBirth'),
+          DateOfBirth: byId('DateOfBirth'),
           countryOfBirth: byId('countryOfBirth'),
           cityOfBirth: byId('cityOfBirth'),
           profession: byId('profession'),
@@ -260,7 +260,7 @@ async function setApplicantPageFixture(): Promise<void> {
             renderCalendar();
           });
         };
-        window.__wireCalendarField('dateOfBirth');
+        window.__wireCalendarField('DateOfBirth');
       })();
     </script>
   `);
@@ -316,14 +316,14 @@ async function setApplicantPageFixtureWithTripDetailsPage(revealInsuranceOnNext 
       <input type="text" id="passportNo" />
       <label for="passportIssuePlace">Passport Issue Place (Country or City)*</label>
       <input type="text" id="passportIssuePlace" />
-      <label for="passportIssueDate">Passport Issue Date*</label>
-      <input type="text" id="passportIssueDate" readonly style="cursor:pointer" />
-      <label for="passportExpiryDate">Passport Expiry Date*</label>
-      <input type="text" id="passportExpiryDate" readonly style="cursor:pointer" />
-      <label for="expectedArrival">Expected Date of Arrival*</label>
-      <input type="text" id="expectedArrival" readonly style="cursor:pointer" />
-      <label for="expectedDeparture">Expected Date of Departure*</label>
-      <input type="text" id="expectedDeparture" readonly style="cursor:pointer" />
+      <label for="PassportIssueDate">Passport Issue Date*</label>
+      <input type="text" id="PassportIssueDate" readonly style="cursor:pointer" />
+      <label for="PassportExpiryDate">Passport Expiry Date*</label>
+      <input type="text" id="PassportExpiryDate" readonly style="cursor:pointer" />
+      <label for="ExpectedDateOfEntry">Expected Date of Arrival*</label>
+      <input type="text" id="ExpectedDateOfEntry" readonly style="cursor:pointer" />
+      <label for="ExpectedDateOfLeave">Expected Date of Departure*</label>
+      <input type="text" id="ExpectedDateOfLeave" readonly style="cursor:pointer" />
 
       <p>Additional Purpose of Visit *</p>
       <button onclick="window.__purposeLog.push('SELECT ALL')">SELECT ALL</button>
@@ -397,10 +397,10 @@ async function setApplicantPageFixtureWithTripDetailsPage(revealInsuranceOnNext 
       tripDetailsContainer.style.display = 'block';
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const winForCalendar = globalThis as any;
-      winForCalendar.__wireCalendarField('passportIssueDate');
-      winForCalendar.__wireCalendarField('passportExpiryDate');
-      winForCalendar.__wireCalendarField('expectedArrival');
-      winForCalendar.__wireCalendarField('expectedDeparture');
+      winForCalendar.__wireCalendarField('PassportIssueDate');
+      winForCalendar.__wireCalendarField('PassportExpiryDate');
+      winForCalendar.__wireCalendarField('ExpectedDateOfEntry');
+      winForCalendar.__wireCalendarField('ExpectedDateOfLeave');
 
       if (revealInsuranceOnNextArg) {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -621,7 +621,7 @@ test('Page3->Page4 trigger fix: submitApplicant answers the on-behalf question, 
       lastName: doc.getElementById('lastName').value,
       gender: doc.getElementById('gender').value,
       maritalStatus: doc.getElementById('maritalStatus').value,
-      dateOfBirth: doc.getElementById('dateOfBirth').value,
+      DateOfBirth: doc.getElementById('DateOfBirth').value,
       countryOfBirth: doc.getElementById('countryOfBirth').value,
       cityOfBirth: doc.getElementById('cityOfBirth').value,
       profession: doc.getElementById('profession').value,
@@ -636,7 +636,7 @@ test('Page3->Page4 trigger fix: submitApplicant answers the on-behalf question, 
     lastName: 'Applicant',
     gender: 'Male',
     maritalStatus: 'Single',
-    dateOfBirth: '01/01/1990',
+    DateOfBirth: '01/01/1990',
     countryOfBirth: 'UZ',
     cityOfBirth: 'Tashkent',
     profession: 'WORKER',
@@ -860,8 +860,8 @@ test('Page3->Page7 flow fix: when Page 4 ("Passport & Trip Details") genuinely a
       passportType: doc.getElementById('passportType').value,
       passportNo: doc.getElementById('passportNo').value,
       passportIssuePlace: doc.getElementById('passportIssuePlace').value,
-      expectedArrival: doc.getElementById('expectedArrival').value,
-      expectedDeparture: doc.getElementById('expectedDeparture').value,
+      ExpectedDateOfEntry: doc.getElementById('ExpectedDateOfEntry').value,
+      ExpectedDateOfLeave: doc.getElementById('ExpectedDateOfLeave').value,
       hotelName: doc.getElementById('hotelName').value,
       primaryContact: doc.getElementById('primaryContact').value,
       email: doc.getElementById('email').value,
@@ -871,8 +871,8 @@ test('Page3->Page7 flow fix: when Page 4 ("Passport & Trip Details") genuinely a
     passportType: 'Regular Passport',
     passportNo: 'AB1234567',
     passportIssuePlace: 'Uzbekistan',
-    expectedArrival: '23/10/2026',
-    expectedDeparture: '28/10/2026',
+    ExpectedDateOfEntry: '23/10/2026',
+    ExpectedDateOfLeave: '28/10/2026',
     hotelName: 'EMAAR ELITE HOTEL MAKKA',
     primaryContact: '',
     email: 'test@example.com',

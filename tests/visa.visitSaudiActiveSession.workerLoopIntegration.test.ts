@@ -119,8 +119,8 @@ async function setApplicantFixture(page: import('playwright').Page): Promise<voi
     <select id="gender"><option value="">Select</option><option>Male</option><option>Female</option></select>
     <label for="maritalStatus">Marital Status*</label>
     <select id="maritalStatus"><option value="">Select</option><option>Single</option><option>Married</option></select>
-    <label for="dateOfBirth">Date of Birth *</label>
-    <input type="text" id="dateOfBirth" readonly style="cursor:pointer" />
+    <label for="DateOfBirth">Date of Birth *</label>
+    <input type="text" id="DateOfBirth" readonly style="cursor:pointer" />
     <div id="calendarPopup" style="display:none">
       <select class="datepick-month-year" title="Change the month"></select>
       <select class="datepick-month-year" title="Change the year"></select>
@@ -191,7 +191,7 @@ async function setApplicantFixture(page: import('playwright').Page): Promise<voi
               return function() {
                 var mm = String(calMonth + 1).padStart(2, '0');
                 var dd = String(day).padStart(2, '0');
-                document.getElementById('dateOfBirth').value = dd + '/' + mm + '/' + calYear;
+                document.getElementById('DateOfBirth').value = dd + '/' + mm + '/' + calYear;
                 document.getElementById('calendarPopup').style.display = 'none';
               };
             })(j + 1));
@@ -207,7 +207,7 @@ async function setApplicantFixture(page: import('playwright').Page): Promise<voi
           calMonth = Number(parts[0]) - 1; calYear = Number(parts[1]);
           renderCalendar();
         });
-        document.getElementById('dateOfBirth').addEventListener('click', function() {
+        document.getElementById('DateOfBirth').addEventListener('click', function() {
           document.getElementById('calendarPopup').style.display = 'block';
           renderCalendar();
         });
