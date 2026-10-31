@@ -501,26 +501,36 @@ async function selectDateFromCalendarWidget(page: Page, fieldId: string, isoDate
   // window to reveal the year `<select>`, rather than guessing the exact
   // cause -- this still fails loudly (never silently proceeds) if the
   // calendar genuinely never opens after every attempt.
+  // Scoped to [type="text"]: a real automated run hit a Playwright
+  // strict-mode violation here -- the real page carries a SECOND,
+  // hidden <input type="hidden"> sharing the exact same id (confirmed by
+  // Playwright's own error output, not guessed), presumably a
+  // framework-generated form-backing field. The visible, real datepicker
+  // input is always type="text" (confirmed on every one of this file's
+  // own five date fields); the hidden duplicate never is.
+  const field = page.locator(`input#${fieldId}[type="text"]`);
   const yearSelect = page.locator('select.datepick-month-year[title="Change the year"]');
   let opened = false;
-  for (let attempt = 0; attempt < 5 && !opened; attempt += 1) {
-    // Scoped to [type="text"]: a real automated run hit a Playwright
-    // strict-mode violation here -- the real page carries a SECOND,
-    // hidden <input type="hidden"> sharing the exact same id (confirmed
-    // by Playwright's own error output, not guessed), presumably a
-    // framework-generated form-backing field. The visible, real
-    // datepicker input is always type="text" (confirmed on every one of
-    // this file's own five date fields); the hidden duplicate never is.
-    await page.locator(`input#${fieldId}[type="text"]`).click();
+  const attempts = 8;
+  for (let attempt = 0; attempt < attempts && !opened; attempt += 1) {
+    // Real-run evidence: WHICH field fails this way, and after how many
+    // retries, varies run to run (confirmed flaky across multiple real
+    // runs, not one specific field) -- scrolling the field into view and
+    // a short pause before each click are cheap, safe additions that
+    // cannot change WHAT gets clicked, only make the click itself land
+    // more reliably on an already-settled element.
+    await field.scrollIntoViewIfNeeded();
+    await page.waitForTimeout(300);
+    await field.click();
     try {
-      await yearSelect.waitFor({ state: 'visible', timeout: 3000 });
+      await yearSelect.waitFor({ state: 'visible', timeout: 4000 });
       opened = true;
     } catch {
       // not open yet -- loop and try clicking again
     }
   }
   if (!opened) {
-    throw new Error(`selectDateFromCalendarWidget: clicking #${fieldId} never revealed the calendar widget after 5 attempts`);
+    throw new Error(`selectDateFromCalendarWidget: clicking #${fieldId} never revealed the calendar widget after ${attempts} attempts`);
   }
 
   await yearSelect.selectOption({ label: String(year) });
