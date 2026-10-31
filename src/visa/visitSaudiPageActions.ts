@@ -504,7 +504,14 @@ async function selectDateFromCalendarWidget(page: Page, fieldId: string, isoDate
   const yearSelect = page.locator('select.datepick-month-year[title="Change the year"]');
   let opened = false;
   for (let attempt = 0; attempt < 5 && !opened; attempt += 1) {
-    await page.locator(`#${fieldId}`).click();
+    // Scoped to [type="text"]: a real automated run hit a Playwright
+    // strict-mode violation here -- the real page carries a SECOND,
+    // hidden <input type="hidden"> sharing the exact same id (confirmed
+    // by Playwright's own error output, not guessed), presumably a
+    // framework-generated form-backing field. The visible, real
+    // datepicker input is always type="text" (confirmed on every one of
+    // this file's own five date fields); the hidden duplicate never is.
+    await page.locator(`input#${fieldId}[type="text"]`).click();
     try {
       await yearSelect.waitFor({ state: 'visible', timeout: 3000 });
       opened = true;
