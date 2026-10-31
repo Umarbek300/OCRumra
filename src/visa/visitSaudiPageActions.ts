@@ -491,8 +491,32 @@ async function selectDateFromCalendarWidget(page: Page, fieldId: string, isoDate
   const monthIndex = Number(monthStr) - 1;
   const day = Number(dayStr);
 
-  await page.locator(`#${fieldId}`).click();
-  await page.locator('select.datepick-month-year[title="Change the year"]').selectOption({ label: String(year) });
+  // RETRY FIX (real-run evidence): a real automated run showed the first
+  // click sometimes does not open the calendar at all -- confirmed not a
+  // selector/id problem (the operator's own console test against the
+  // real, correct field still failed to open it on that attempt) and not
+  // a page-load-timing problem alone (the field had already been sitting
+  // on screen, interactable, for a while). Retried a bounded number of
+  // times, re-clicking the real field and giving each attempt a short
+  // window to reveal the year `<select>`, rather than guessing the exact
+  // cause -- this still fails loudly (never silently proceeds) if the
+  // calendar genuinely never opens after every attempt.
+  const yearSelect = page.locator('select.datepick-month-year[title="Change the year"]');
+  let opened = false;
+  for (let attempt = 0; attempt < 5 && !opened; attempt += 1) {
+    await page.locator(`#${fieldId}`).click();
+    try {
+      await yearSelect.waitFor({ state: 'visible', timeout: 3000 });
+      opened = true;
+    } catch {
+      // not open yet -- loop and try clicking again
+    }
+  }
+  if (!opened) {
+    throw new Error(`selectDateFromCalendarWidget: clicking #${fieldId} never revealed the calendar widget after 5 attempts`);
+  }
+
+  await yearSelect.selectOption({ label: String(year) });
   await page.locator('select.datepick-month-year[title="Change the month"]').selectOption({ label: CALENDAR_MONTH_NAMES[monthIndex] });
   await page.locator(`a[title*="${CALENDAR_MONTH_ABBREVIATIONS[monthIndex]} ${day}, ${year}"]`).click();
 }
