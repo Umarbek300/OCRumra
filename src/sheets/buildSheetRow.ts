@@ -28,6 +28,26 @@ function fieldValue(field: OcrField): string {
   return field.value ?? '';
 }
 
+const ISO_DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+/**
+ * Converts this pipeline's internal ISO (YYYY-MM-DD) date storage format to
+ * the operator-requested DD.MM.YYYY display format, for the Sheet row and
+ * Telegram confirmation message ONLY — every other consumer (VisitSaudi date
+ * math, duplicate-identity comparisons, the DB columns themselves) keeps
+ * using the raw ISO value untouched; this never writes back to storage.
+ * Passes a non-ISO string through unchanged rather than blanking it, so a
+ * genuinely-present value is never hidden — matching fieldValue's own
+ * "never guess, never hide" convention.
+ */
+export function formatDateForDisplay(isoDate: string | null): string {
+  if (isoDate === null) return '';
+  const match = ISO_DATE_PATTERN.exec(isoDate);
+  if (!match) return isoDate;
+  const [, year, month, day] = match;
+  return `${day}.${month}.${year}`;
+}
+
 const GENDER_LABELS: Record<OcrGenderValue, string> = {
   male: 'Erkak',
   female: 'Ayol',
@@ -64,9 +84,9 @@ export function buildSheetRow(input: BuildSheetRowInput): string[] {
     fieldValue(ocrResult.firstName),
     fieldValue(ocrResult.surname),
     fieldValue(ocrResult.passportNumber),
-    fieldValue(ocrResult.dateOfBirth),
-    fieldValue(ocrResult.passportIssueDate),
-    fieldValue(ocrResult.passportExpiryDate),
+    formatDateForDisplay(ocrResult.dateOfBirth.value),
+    formatDateForDisplay(ocrResult.passportIssueDate.value),
+    formatDateForDisplay(ocrResult.passportExpiryDate.value),
     genderLabel(ocrResult.gender),
     agent?.name ?? '',
     packageText,

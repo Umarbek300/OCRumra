@@ -37,9 +37,9 @@ test('buildConfirmationMessage renders every field when everything was found', (
   assert.match(text, /✅ Passport qabul qilindi/);
   assert.match(text, /👤 Ism Familiya: ANNA ERIKSSON/);
   assert.match(text, /🛂 Passport №: L898902C3/);
-  assert.match(text, /📅 Tug'ilgan sana: 1974-08-12/);
-  assert.match(text, /📅 Berilgan sana: 2004-01-01/);
-  assert.match(text, /📅 Amal qilish sanasi: 2012-04-15/);
+  assert.match(text, /📅 Tug'ilgan sana: 12\.08\.1974/);
+  assert.match(text, /📅 Berilgan sana: 01\.01\.2004/);
+  assert.match(text, /📅 Amal qilish sanasi: 15\.04\.2012/);
   assert.match(text, /⚧ Jins: Ayol/);
   assert.match(text, /👨‍💼 Agent: Jasur Agent/);
   assert.match(text, /📦 Paket: \$1400/);

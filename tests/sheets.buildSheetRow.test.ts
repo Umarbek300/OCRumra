@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { buildSheetRow, SHEET_ROW_COLUMN_COUNT, type BuildSheetRowInput } from '../src/sheets/buildSheetRow.js';
+import { buildSheetRow, formatDateForDisplay, SHEET_ROW_COLUMN_COUNT, type BuildSheetRowInput } from '../src/sheets/buildSheetRow.js';
 
 function ocrResult(overrides: Partial<BuildSheetRowInput['ocrResult']> = {}): BuildSheetRowInput['ocrResult'] {
   return {
@@ -36,9 +36,9 @@ test('buildSheetRow returns exactly the 12 approved columns in order', () => {
     'ANNA',
     'ERIKSSON',
     'L898902C3',
-    '1974-08-12',
-    '2004-01-01',
-    '2012-04-15',
+    '12.08.1974',
+    '01.01.2004',
+    '15.04.2012',
     'Ayol',
     'Jasur Agent',
     '', // Paket
@@ -111,6 +111,19 @@ test('buildSheetRow writes the caller-provided packageText/depositText/balanceTe
   assert.equal(row[9], '$1400');
   assert.equal(row[10], '$200');
   assert.equal(row[11], '$1200');
+});
+
+test('formatDateForDisplay converts ISO YYYY-MM-DD to the operator-requested DD.MM.YYYY', () => {
+  assert.equal(formatDateForDisplay('1967-06-02'), '02.06.1967');
+  assert.equal(formatDateForDisplay('2029-03-04'), '04.03.2029');
+});
+
+test('formatDateForDisplay returns empty string for null, never "null"', () => {
+  assert.equal(formatDateForDisplay(null), '');
+});
+
+test('formatDateForDisplay passes a non-ISO string through unchanged rather than hiding it', () => {
+  assert.equal(formatDateForDisplay('not-a-date'), 'not-a-date');
 });
 
 test('buildSheetRow input shape has no placeOfBirth or printed issuingAuthority field at all', () => {

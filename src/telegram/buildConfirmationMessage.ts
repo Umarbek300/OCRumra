@@ -1,6 +1,6 @@
 import type { Agent } from '../db/repositories/agents.repo.js';
 import type { PassportOcrResultRecord } from '../db/repositories/passportOcrResult.repo.js';
-import { genderLabel } from '../sheets/buildSheetRow.js';
+import { formatDateForDisplay, genderLabel } from '../sheets/buildSheetRow.js';
 
 export interface ConfirmationMessageInput {
   ocrResult: Pick<
@@ -43,17 +43,17 @@ export function buildConfirmationMessage(input: ConfirmationMessageInput): strin
 
   const dateOfBirthLine =
     ocrResult.dateOfBirth.value !== null
-      ? `📅 Tug'ilgan sana: ${ocrResult.dateOfBirth.value}`
+      ? `📅 Tug'ilgan sana: ${formatDateForDisplay(ocrResult.dateOfBirth.value)}`
       : "⚠️ Tug'ilgan sana topilmadi";
 
   const issueDateLine =
     ocrResult.passportIssueDate.value !== null
-      ? `📅 Berilgan sana: ${ocrResult.passportIssueDate.value}`
+      ? `📅 Berilgan sana: ${formatDateForDisplay(ocrResult.passportIssueDate.value)}`
       : '⚠️ Berilgan sana topilmadi';
 
   const expiryDateLine =
     ocrResult.passportExpiryDate.value !== null
-      ? `📅 Amal qilish sanasi: ${ocrResult.passportExpiryDate.value}`
+      ? `📅 Amal qilish sanasi: ${formatDateForDisplay(ocrResult.passportExpiryDate.value)}`
       : '⚠️ Amal qilish sanasi topilmadi';
 
   const gender = genderLabel(ocrResult.gender);
