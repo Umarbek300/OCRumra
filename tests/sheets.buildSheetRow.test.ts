@@ -33,8 +33,8 @@ test('buildSheetRow returns exactly the 12 approved columns in order', () => {
   assert.equal(row.length, SHEET_ROW_COLUMN_COUNT);
   assert.deepEqual(row, [
     '', // №
-    'ANNA',
     'ERIKSSON',
+    'ANNA',
     'L898902C3',
     '12.08.1974',
     '01.01.2004',

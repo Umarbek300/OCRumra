@@ -12,8 +12,8 @@
 /** The approved, user-facing columns, in order — never reordered, never extended without updating buildSheetRow.ts too. */
 export const VISIBLE_COLUMN_HEADERS = [
   '№',
-  'Ism',
   'Familiya',
+  'Ism',
   'Passport №',
   "Tug'ilgan sana",
   'Berilgan sana',

@@ -387,8 +387,8 @@ test('syncPassportRowToSheet never lets package/deposit parsing affect the passp
   await syncPassportRowToSheet('job-1', deps);
 
   assert.ok(capturedRow);
-  assert.equal(capturedRow![1], 'ANNA', 'Ism');
-  assert.equal(capturedRow![2], 'ERIKSSON', 'Familiya');
+  assert.equal(capturedRow![1], 'ERIKSSON', 'Familiya');
+  assert.equal(capturedRow![2], 'ANNA', 'Ism');
   assert.equal(capturedRow![3], 'L898902C3', 'Passport №');
 });
 

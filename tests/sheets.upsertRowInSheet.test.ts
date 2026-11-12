@@ -72,7 +72,7 @@ test('upsertRowInSheet updates the existing row when the telegram_message_id is 
   const call = updateArgs[0] as { rowNumber: number; valuesFromColumnB: string[] };
   assert.equal(call.rowNumber, 3);
   assert.equal(call.valuesFromColumnB.length, 12, '11 visible columns (B..L) + technical id (M)');
-  assert.equal(call.valuesFromColumnB[0], 'ANNA', 'first element is Ism, not №');
+  assert.equal(call.valuesFromColumnB[0], 'ANNA', "first element is SAMPLE_ROW's own column B value, not №");
   assert.equal(call.valuesFromColumnB[call.valuesFromColumnB.length - 1], 'msg-123', 'last element is the technical id');
 });
 

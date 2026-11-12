@@ -64,7 +64,7 @@ export function genderLabel(gender: OcrField<OcrGenderValue>): string {
  * passport photo, and (separately) any package/deposit/balance text already
  * parsed from that same Telegram message's caption. Pure and side-effect
  * free — no Google API call, no DB query. Column order matches the approved
- * 12-column schema exactly: №, Ism, Familiya, Passport №, Tug'ilgan sana,
+ * 12-column schema exactly: №, Familiya, Ism, Passport №, Tug'ilgan sana,
  * Berilgan sana, Amal qilish sanasi, Jins, Agent, Paket, Depozit, Qoldiq.
  *
  * № is always '' here: it is never a stable backend-assigned id, only the
@@ -81,8 +81,8 @@ export function buildSheetRow(input: BuildSheetRowInput): string[] {
   const { ocrResult, agent, packageText, depositText, balanceText } = input;
   return [
     '', // №
-    fieldValue(ocrResult.firstName),
     fieldValue(ocrResult.surname),
+    fieldValue(ocrResult.firstName),
     fieldValue(ocrResult.passportNumber),
     formatDateForDisplay(ocrResult.dateOfBirth.value),
     formatDateForDisplay(ocrResult.passportIssueDate.value),
